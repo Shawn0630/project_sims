@@ -37,7 +37,7 @@ import { SchemaPanel } from './SchemaPanel';
 import { IconGlyph } from './icons';
 
 type Phase = 'design' | 'run' | 'report';
-type LeftTab = 'desc' | 'schema' | 'cases' | 'subs' | 'driver';
+type LeftTab = 'desc' | 'schema' | 'cases' | 'subs';
 
 interface SubmissionRecord {
   problemId: string;
@@ -92,7 +92,6 @@ const LEFT_TABS: { id: LeftTab; label: string }[] = [
   { id: 'schema', label: '数据库设计' },
   { id: 'cases', label: '测试用例' },
   { id: 'subs', label: '提交记录' },
-  { id: 'driver', label: '驾驶员' },
 ];
 
 // ------------------------------------------- shared summary builders -----
@@ -187,6 +186,7 @@ export default function App() {
   const [replayingId, setReplayingId] = useState<string | null>(null);
   const [queueHistory, setQueueHistory] = useState<number[]>([]);
   const [activeTab, setActiveTab] = useState<LeftTab>('desc');
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [bottomOpen, setBottomOpen] = useState(true);
   const [submissions, setSubmissions] = useState<SubmissionRecord[]>(loadSubmissions);
 
@@ -220,7 +220,7 @@ export default function App() {
       }
     }
     const v = await call(scriptedDriver);
-    setAssessorLabel('脚本评审员（离线 fallback）');
+    setAssessorLabel('本地脚本');
     return v;
   };
 
@@ -692,6 +692,9 @@ export default function App() {
           <button className="lc-submit-btn" onClick={onSubmit}>
             提交设计
           </button>
+          <button className="lc-gear-btn" onClick={() => setSettingsOpen(true)} title="设置（AI 评审模型）">
+            ⚙
+          </button>
         </div>
       </header>
 
@@ -765,7 +768,7 @@ export default function App() {
                 schema={schemas[problem.id]!}
                 snapshot={snapshot}
                 onChange={(s) => setSchemas({ ...schemas, [problem.id]: s })}
-                assessorNote={assessorLabel ? `结论由 ${assessorLabel} 给出` : undefined}
+                assessorNote={assessorLabel ? `评审：${assessorLabel}` : undefined}
                 onAssess={async (sch, signals) =>
                   withAssessor((d) =>
                     d.assessSchema({
@@ -824,17 +827,6 @@ export default function App() {
               </div>
             )}
 
-            {activeTab === 'driver' && (
-              <DriverPanel
-                settings={driverSettings}
-                onSettings={setDriverSettings}
-                busy={driverBusy}
-                review={driverReview}
-                error={driverError}
-                canRun={phase !== 'design'}
-                onRun={runDriver}
-              />
-            )}
           </div>
         </aside>
 
@@ -1045,7 +1037,7 @@ export default function App() {
                       <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                         <b>🧑‍⚖️ 评审员点评</b>
                         {assessorLabel && (
-                          <span style={{ color: '#94a3b8', fontSize: 12 }}>由 {assessorLabel} 给出（分数本身由代码判卷）</span>
+                          <span style={{ color: '#94a3b8', fontSize: 12 }}>评审：{assessorLabel}（分数本身由代码判卷）</span>
                         )}
                         {!assessment && (
                           <button
@@ -1131,6 +1123,30 @@ export default function App() {
           )}
         </section>
       </div>
+
+      {/* -------------------- settings: slide-over from the ⚙ gear --- */}
+      {settingsOpen && (
+        <>
+          <div className="settings-backdrop" onClick={() => setSettingsOpen(false)} />
+          <div className="settings-panel" role="dialog" aria-label="设置">
+            <div className="settings-head">
+              <b style={{ fontSize: 15 }}>⚙ 设置</b>
+              <button onClick={() => setSettingsOpen(false)} title="关闭设置">
+                ✕
+              </button>
+            </div>
+            <DriverPanel
+              settings={driverSettings}
+              onSettings={setDriverSettings}
+              busy={driverBusy}
+              review={driverReview}
+              error={driverError}
+              canRun={phase !== 'design'}
+              onRun={runDriver}
+            />
+          </div>
+        </>
+      )}
     </div>
   );
 }

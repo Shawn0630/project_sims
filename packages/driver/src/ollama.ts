@@ -41,7 +41,7 @@ interface OllamaMessage {
  */
 export class OllamaDriver implements Driver {
   readonly kind = 'ollama' as const;
-  readonly label = 'Ollama 本地驾驶员';
+  readonly label = 'Ollama 本地模型';
   private cfg: Required<OllamaConfig>;
 
   constructor(cfg: OllamaConfig = {}) {

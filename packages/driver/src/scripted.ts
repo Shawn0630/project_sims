@@ -24,7 +24,7 @@ import type {
  */
 export class ScriptedDriver implements Driver {
   readonly kind = 'scripted' as const;
-  readonly label = '脚本驾驶员（离线）';
+  readonly label = '本地脚本';
 
   async review(tools: SimulatorTools, ctx: DriverContext): Promise<DriverReview> {
     const transcript: string[] = [];
@@ -131,7 +131,7 @@ export class ScriptedDriver implements Driver {
 
     const passed = caseResults.filter((r) => r.passed).length;
     const summary =
-      `脚本驾驶员完成一轮完整面试模拟：基线 → 峰值 ×3 → 爆帖 → 杀节点 → ${caseResults.length} 个用例（${passed} 个通过）→ Schema 评审 ${schema.score} 分。` +
+      `本地脚本完成一轮完整模拟：基线 → 峰值 ×3 → 爆帖 → 杀节点 → ${caseResults.length} 个用例（${passed} 个通过）→ Schema 评审 ${schema.score} 分。` +
       (findings.length
         ? `共 ${findings.length} 条发现，按严重程度排序见下。`
         : '未发现明显问题：容量、冗余与结构都过关。');

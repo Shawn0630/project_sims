@@ -49,7 +49,7 @@ interface ChatMessage {
  */
 export class OpenAICompatibleDriver implements Driver {
   readonly kind = 'openai' as const;
-  readonly label = '云端 LLM 驾驶员（OpenAI 兼容）';
+  readonly label = '云端 LLM';
   private cfg: Required<OpenAICompatibleConfig>;
 
   constructor(cfg: OpenAICompatibleConfig) {
@@ -64,7 +64,7 @@ export class OpenAICompatibleDriver implements Driver {
   async review(tools: SimulatorTools, ctx: DriverContext): Promise<DriverReview> {
     if (!this.cfg.apiKey) {
       throw new Error(
-        'OpenAICompatibleDriver: 没有配置 API key。请在驾驶员设置里填写（只存浏览器本地），或改用脚本驾驶员 / Ollama。',
+        'OpenAICompatibleDriver: 没有配置 API key。请在右上角 ⚙ 设置里填写（只存浏览器本地），或改用本地脚本 / Ollama 本地模型。',
       );
     }
     const transcript: string[] = [];
