@@ -58,6 +58,8 @@ export function Canvas({
       viewBox="0 0 960 600"
       style={{
         width: '100%',
+        height: '100%',
+        display: 'block',
         background:
           'radial-gradient(circle at 1px 1px, #1e293b 1px, transparent 0) 0 0 / 24px 24px, #0b1220',
         borderRadius: 10,

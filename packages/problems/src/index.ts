@@ -85,6 +85,43 @@ export interface ProblemSchema {
   accessPatterns: AccessPattern[];
 }
 
+// ------------------------------------------------------- workload profile ---
+
+/**
+ * This problem's read/write demand profile — the "interview requirements"
+ * that drive every deep dive. The deep-dive shell (panel framework, labs,
+ * follow-up engine) is shared across problems; what changes per problem is
+ * THIS data: which access patterns exist, how much of the traffic each one
+ * is, which component types it lands on, and what consistency it needs.
+ * Switching problems swaps the profile, so the same component's deep dive
+ * shows a different read/write world (URL shortener: 97/3 short-code reads;
+ * Instagram: feed pulls + fan-out writes).
+ */
+export interface WorkloadPattern {
+  id: string;
+  name: string;
+  kind: 'read' | 'write';
+  description: string;
+  /** Fraction of the problem's total entry traffic (patterns sum to ~1). */
+  share: number;
+  /** Component types this pattern's traffic passes through / lands on. */
+  path: ComponentTypeId[];
+  /** Schema table it ultimately hits, when storage-bound. */
+  table?: string;
+  consistency: 'strong' | 'eventual';
+  /** Baseline magnitude of the terminal load (req/s), aligned with the schema access patterns. */
+  terminalPerSec?: number;
+}
+
+export interface WorkloadProfile {
+  readRatio: number;
+  /** Human-readable consistency requirements for this problem. */
+  consistency: string;
+  /** Average followers for fan-out math on feed problems. */
+  fanoutFollowers?: number;
+  patterns: WorkloadPattern[];
+}
+
 // ---------------------------------------------------------------- problem ---
 
 export interface ProblemScale {
@@ -112,6 +149,8 @@ export interface ProblemDef {
     readHeavy: boolean;
   };
   schema: ProblemSchema;
+  /** This problem's own read/write demand profile — drives every deep dive. */
+  workload: WorkloadProfile;
   testCases: TestCase[];
   /** A decent-but-flawed starting design (the interview "sample answer"). */
   sampleDesign: Design;
@@ -158,6 +197,44 @@ export const INSTAGRAM: ProblemDef = {
     notes: '读:写 ≈ 10:1，晚高峰 ×3，大 V 粉丝量可达 1 亿',
   },
   flags: { mediaHeavy: true, hasFanout: true, publicWriteApi: true, readHeavy: true },
+  workload: {
+    readRatio: 0.9,
+    consistency:
+      'Feed 与计数可最终一致（秒级延迟可接受）；关注关系与照片元数据写入后自己必须立刻可见（read-your-write），走主库或会话一致。',
+    fanoutFollowers: 800,
+    patterns: [
+      {
+        id: 'ig-w-feed', name: 'Feed 拉取（刷首页）', kind: 'read',
+        description: '打开 App 拉关注者照片流：先查关注列表，再批量取照片元数据，读放大最严重的一条路径。',
+        share: 0.5, path: ['client', 'loadbalancer', 'appserver', 'feedservice', 'cache', 'relationaldb'],
+        table: 'follows', consistency: 'eventual', terminalPerSec: 5000,
+      },
+      {
+        id: 'ig-w-profile', name: '看主页（用户 + 照片列表）', kind: 'read',
+        description: '进个人主页：查用户资料 + 按作者倒序拉照片，needsSort，索引与排序成本是考点。',
+        share: 0.25, path: ['client', 'cdn', 'loadbalancer', 'appserver', 'cache', 'relationaldb'],
+        table: 'photos', consistency: 'eventual', terminalPerSec: 3000,
+      },
+      {
+        id: 'ig-w-media', name: '看图（媒体文件）', kind: 'read',
+        description: '照片原图/缩略图字节流：应该被 CDN 与对象存储吃掉，不许打到应用与 DB。',
+        share: 0.15, path: ['client', 'cdn', 'objectstorage'],
+        consistency: 'eventual',
+      },
+      {
+        id: 'ig-w-post', name: '发帖（上传 + 写元数据）', kind: 'write',
+        description: '上传照片本体到对象存储，元数据写 DB，随后触发 Feed fan-out。写占比小但链路最长。',
+        share: 0.05, path: ['client', 'loadbalancer', 'appserver', 'objectstorage', 'relationaldb', 'queue', 'worker'],
+        table: 'photos', consistency: 'strong', terminalPerSec: 400,
+      },
+      {
+        id: 'ig-w-engage', name: '点赞 / 关注（计数写）', kind: 'write',
+        description: '点赞计数与关注关系写入：高频小写，热点照片的计数行是经典热点键问题。',
+        share: 0.05, path: ['client', 'loadbalancer', 'appserver', 'cache', 'relationaldb'],
+        table: 'likes', consistency: 'eventual', terminalPerSec: 2000,
+      },
+    ],
+  },
   schema: {
     tables: [
       {
@@ -391,6 +468,44 @@ export const TWITTER: ProblemDef = {
     notes: '读:写 ≈ 4:1，时间线读取极重，头部用户粉丝过亿',
   },
   flags: { mediaHeavy: false, hasFanout: true, publicWriteApi: true, readHeavy: true },
+  workload: {
+    readRatio: 0.8,
+    consistency:
+      '时间线可最终一致；自己刚发的推必须立刻在自己时间线可见；计数（赞/转）允许近似，严禁负数与重复计。',
+    fanoutFollowers: 5000,
+    patterns: [
+      {
+        id: 'tw-w-timeline', name: '首页时间线拉取', kind: 'read',
+        description: '查关注列表后聚合各作者最新推文：读路径的绝对主力，推拉模式之争就发生在这里。',
+        share: 0.5, path: ['client', 'loadbalancer', 'appserver', 'feedservice', 'cache', 'nosql'],
+        table: 'follows', consistency: 'eventual', terminalPerSec: 6000,
+      },
+      {
+        id: 'tw-w-author', name: '按作者查推文', kind: 'read',
+        description: '进作者主页按时间倒序翻推文：按 author_id 查 + 排序，分片键与查询维度是否一致决定生死。',
+        share: 0.2, path: ['client', 'loadbalancer', 'appserver', 'cache', 'nosql'],
+        table: 'tweets', consistency: 'eventual', terminalPerSec: 4000,
+      },
+      {
+        id: 'tw-w-profile', name: '查用户资料', kind: 'read',
+        description: '按 user_id 主键直查：量级不大，但每条时间线都要批量带出作者资料。',
+        share: 0.1, path: ['client', 'loadbalancer', 'appserver', 'cache', 'relationaldb'],
+        table: 'users', consistency: 'eventual', terminalPerSec: 1000,
+      },
+      {
+        id: 'tw-w-post', name: '发推写入', kind: 'write',
+        description: '推文落库后触发 fan-out：普通用户推给粉丝时间线，大 V（粉丝过亿）必须改拉模式。',
+        share: 0.08, path: ['client', 'loadbalancer', 'appserver', 'queue', 'worker', 'nosql'],
+        table: 'tweets', consistency: 'strong', terminalPerSec: 800,
+      },
+      {
+        id: 'tw-w-engage', name: '点赞 / 转发计数', kind: 'write',
+        description: '计数写直接打在推文行上：热点推文的 like_count 是全站最热的一行。',
+        share: 0.12, path: ['client', 'loadbalancer', 'appserver', 'cache', 'nosql'],
+        table: 'tweets', consistency: 'eventual', terminalPerSec: 3000,
+      },
+    ],
+  },
   schema: {
     tables: [
       {
@@ -594,6 +709,31 @@ export const URL_SHORTENER: ProblemDef = {
     notes: '读:写 ≈ 30:1，跳转是绝对热点路径，P99 要求 < 400ms',
   },
   flags: { mediaHeavy: false, hasFanout: false, publicWriteApi: true, readHeavy: true },
+  workload: {
+    readRatio: 0.97,
+    consistency:
+      '跳转读允许最终一致（缓存旧值几秒可接受）；新建短链必须立刻可跳转（写后读强一致）；点击计数允许异步近似。',
+    patterns: [
+      {
+        id: 'us-w-redirect', name: '短码跳转（302）', kind: 'read',
+        description: '按 short_code 查长链并跳转：占 97% 流量的绝对热点路径，每多一层都是 P99 杀手，必须缓存兜底。',
+        share: 0.9, path: ['client', 'cdn', 'loadbalancer', 'appserver', 'cache', 'relationaldb'],
+        table: 'urls', consistency: 'eventual', terminalPerSec: 5000,
+      },
+      {
+        id: 'us-w-stats', name: '查我的链接 / 点击统计', kind: 'read',
+        description: '按 user_id 查名下链接与计数：量级小但无索引就是全表扫，且不能拖慢跳转路径。',
+        share: 0.07, path: ['client', 'loadbalancer', 'appserver', 'relationaldb'],
+        table: 'urls', consistency: 'strong', terminalPerSec: 100,
+      },
+      {
+        id: 'us-w-create', name: '新建短链接', kind: 'write',
+        description: '生成短码并落库：写极少（约 30/s），但短码生成策略（自增/哈希/随机）决定冲突与可枚举性。',
+        share: 0.03, path: ['client', 'loadbalancer', 'gateway', 'appserver', 'relationaldb'],
+        table: 'urls', consistency: 'strong', terminalPerSec: 30,
+      },
+    ],
+  },
   schema: {
     tables: [
       {

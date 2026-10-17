@@ -1,11 +1,23 @@
 import {
   DRIVER_SYSTEM_PROMPT,
   TOOL_SCHEMAS,
+  buildFollowUpPrompt,
+  buildSchemaPrompt,
+  buildSubmissionPrompt,
   executeToolCall,
+  parseFollowUps,
+  parseSchemaAssessment,
+  parseSubmissionAssessment,
   type Driver,
   type DriverContext,
   type DriverReview,
+  type FollowUpContext,
+  type FollowUpQuestion,
+  type SchemaAssessment,
+  type SchemaAssessmentContext,
   type SimulatorTools,
+  type SubmissionAssessment,
+  type SubmissionAssessmentContext,
 } from './contract';
 
 export interface OpenAICompatibleConfig {
@@ -137,5 +149,52 @@ export class OpenAICompatibleDriver implements Driver {
       })),
       transcript,
     };
+  }
+
+  // ------------------------------------------- qualitative assessment ---
+  // Single-shot JSON completions (no tools): the qualitative layer. The
+  // host app falls back to ScriptedDriver if these throw or mis-shape.
+
+  private async chatJson(system: string, user: string): Promise<unknown> {
+    if (!this.cfg.apiKey) {
+      throw new Error('OpenAICompatibleDriver: 没有配置 API key。');
+    }
+    const res = await fetch(`${this.cfg.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.cfg.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: this.cfg.model,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+        response_format: { type: 'json_object' },
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`OpenAI-compatible API 请求失败：${res.status} ${await res.text()}`);
+    }
+    const data = (await res.json()) as { choices: { message: ChatMessage }[] };
+    const content = data.choices[0]?.message?.content ?? '';
+    const cleaned = content.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+    return JSON.parse(cleaned) as unknown;
+  }
+
+  async assessSubmission(ctx: SubmissionAssessmentContext): Promise<SubmissionAssessment> {
+    const p = buildSubmissionPrompt(ctx);
+    return parseSubmissionAssessment(await this.chatJson(p.system, p.user));
+  }
+
+  async generateFollowUps(ctx: FollowUpContext): Promise<FollowUpQuestion[]> {
+    const p = buildFollowUpPrompt(ctx);
+    return parseFollowUps(await this.chatJson(p.system, p.user));
+  }
+
+  async assessSchema(ctx: SchemaAssessmentContext): Promise<SchemaAssessment> {
+    const p = buildSchemaPrompt(ctx);
+    return parseSchemaAssessment(await this.chatJson(p.system, p.user));
   }
 }

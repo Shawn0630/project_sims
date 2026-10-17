@@ -12,12 +12,22 @@ import type { EventType, TrafficConfig } from '@sds/sim-core';
  * all implement the exact same contract.
  */
 
+export interface CaseMeasuredLike {
+  errorRate: number;
+  p99Ms: number;
+  costPerHour: number;
+  maxStorageQps: number;
+  staleReadRate: number;
+  hottestUtil: number;
+  queueDepthMax: number;
+}
+
 export interface CaseResultLike {
   caseId: string;
   name: string;
   passed: boolean;
   failures: string[];
-  measured: Record<string, number>;
+  measured: CaseMeasuredLike;
 }
 
 export interface SchemaFindingLike {
@@ -29,8 +39,10 @@ export interface SchemaFindingLike {
 export interface SchemaReviewLike {
   score: number;
   coverage: string;
+  coveragePassed?: number;
+  coverageTotal?: number;
   findings: SchemaFindingLike[];
-  perPattern: { pattern: string; path: string; latencyMs: number; verdict: string }[];
+  perPattern: { pattern: string; path: string; latencyMs: number; verdict: string; note?: string }[];
 }
 
 /** The tool surface every driver drives. Implemented in @sds/checker. */
@@ -87,10 +99,116 @@ export interface DriverReview {
 
 export type DriverKind = 'scripted' | 'openai' | 'ollama';
 
+// ------------------------------------------------------ assessment layer ---
+//
+// Division of labour (settled architecture):
+//  - HARD verdicts stay in code (@sds/checker): per-case pass/fail against
+//    P99 / error-rate / cost thresholds, suite score, deterministic rule
+//    signals (structural findings, schema path/latency verdicts). Fair and
+//    reproducible; no LLM involved.
+//  - QUALITATIVE assessment goes through this Driver layer and is produced
+//    by an LLM when one is attached: the post-submission review and score
+//    rationale, deep-dive follow-up questions generated from THIS design,
+//    schema conclusions and improvement suggestions, explanations of the
+//    structural bugs. ScriptedDriver is the offline fallback implementing
+//    the exact same interface from the deterministic signals, so the UI
+//    never contains scripted review copy of its own — it only renders what
+//    a Driver returns.
+
+export type FollowUpLevel = '基础' | '进阶' | '追问' | '故障';
+
+export interface FollowUpQuestion {
+  level: FollowUpLevel;
+  question: string;
+  /** 考点 / reference points, revealed after the user thinks first. */
+  keyPoints: string[];
+}
+
+/**
+ * Everything a follow-up generator may look at. The questions must be about
+ * THIS candidate's design, not a generic question bank: the design graph
+ * (components, wiring, per-component settings), the DB schema choices, this
+ * problem's read/write workload landing on the component, and the judging
+ * signals (which cases failed, which structural rules fired).
+ */
+export interface FollowUpContext {
+  problemName: string;
+  componentType: ComponentTypeId;
+  componentName: string;
+  /** Human-readable settings of this component instance (replicas, shard key, rate limit…). */
+  componentSettingsSummary: string;
+  /** Live metrics line for this component, when the simulation is running. */
+  liveMetricsSummary?: string;
+  /** Component types directly upstream of this node in the user's design. */
+  upstreamTypes: ComponentTypeId[];
+  /** Whole-design summary (components + edges). */
+  designSummary: string;
+  workload: {
+    readRatio: number;
+    consistency: string;
+    /** This problem's patterns whose path includes this component type. */
+    patternsHere: {
+      name: string;
+      kind: 'read' | 'write';
+      share: number;
+      description: string;
+      consistency: 'strong' | 'eventual';
+    }[];
+    /** Fraction (0..1) of the patternsHere traffic that is reads. */
+    readShareHere: number;
+  };
+  /** Schema facts (tables, shard keys, PK generation) for storage components. */
+  schemaSummary?: string;
+  /** Judging signals: failed cases (all, most relevant first)… */
+  failedCases: { id: string; name: string; failures: string[] }[];
+  /** …and structural findings touching this component. */
+  structuralFindings: StructuralFindingLike[];
+}
+
+export interface SubmissionAssessmentContext {
+  problemName: string;
+  designSummary: string;
+  workloadSummary: string;
+  /** Code-judged results — ground truth the rationale must explain, not change. */
+  scorePct: number;
+  passed: number;
+  total: number;
+  cases: CaseResultLike[];
+  structuralFindings: StructuralFindingLike[];
+}
+
+export interface SubmissionAssessment {
+  summary: string;
+  /** Why this score: which cases cost the most and what to fix first. */
+  scoreRationale: string;
+  findings: DriverFinding[];
+}
+
+export interface SchemaAssessmentContext {
+  problemName: string;
+  /** Human-readable schema: tables, keys, indexes, row counts. */
+  schemaSummary: string;
+  /** Deterministic signals from @sds/checker (paths, latencies, findings). */
+  signals: SchemaReviewLike;
+}
+
+export interface SchemaAssessment {
+  conclusion: string;
+  dimensionNotes: { dimension: '需求覆盖' | '延迟风险' | '扩展性'; note: string }[];
+  suggestions: string[];
+}
+
 export interface Driver {
   readonly kind: DriverKind;
   readonly label: string;
+  /** Operate the simulator through tools and review what happened. */
   review(tools: SimulatorTools, ctx: DriverContext): Promise<DriverReview>;
+  /** Qualitative review of a judged submission (score itself is code-judged). */
+  assessSubmission(ctx: SubmissionAssessmentContext): Promise<SubmissionAssessment>;
+  /** Follow-up questions generated from this specific design snapshot. */
+  generateFollowUps(ctx: FollowUpContext): Promise<FollowUpQuestion[]>;
+  /** Qualitative schema conclusions on top of checker's deterministic signals. */
+  assessSchema(ctx: SchemaAssessmentContext): Promise<SchemaAssessment>;
 }
 
 /** OpenAI-style function schemas for the tool interface (LLM drivers). */
@@ -269,3 +387,118 @@ You control the simulator ONLY through the provided tools. Your job:
 5. Finish with a review: for every problem, state WHERE the bottleneck is, WHY it happens (cite the metric you observed), and HOW to fix it. Use highlight() to bind each major finding to its component on the canvas.
 
 Be concrete and numeric. Do not invent metrics. If the design handles a scenario well, say so.`;
+
+// -------------------------------------------- assessment prompt builders ---
+// Shared by the LLM drivers so OpenAI-compatible and Ollama produce the
+// same shapes. Each returns {system, user}; parsers validate defensively
+// and throw on unusable output (the host app then falls back to
+// ScriptedDriver rather than rendering garbage).
+
+export function buildFollowUpPrompt(ctx: FollowUpContext): { system: string; user: string } {
+  return {
+    system:
+      '你是一位资深系统设计面试官，正在对候选人的设计做模块细究（follow-up）。问题必须针对这份具体设计的选择发问——他用了什么组件、怎么连线、参数怎么设、schema 怎么选、哪些用例挂了——不要问与这份设计无关的通用题。只输出 JSON，不要输出其它文字。',
+    user:
+      `题目：${ctx.problemName}\n` +
+      `正在细究的组件：${ctx.componentName}（${ctx.componentType}），参数：${ctx.componentSettingsSummary}\n` +
+      (ctx.liveMetricsSummary ? `该组件当前实时指标：${ctx.liveMetricsSummary}\n` : '') +
+      `上游组件：${ctx.upstreamTypes.join('、') || '（无）'}\n\n` +
+      `候选人的完整设计：\n${ctx.designSummary}\n\n` +
+      `本题读写需求（总量读占比 ${Math.round(ctx.workload.readRatio * 100)}%，一致性要求：${ctx.workload.consistency}）：\n` +
+      `打到这个组件的访问模式：\n${ctx.workload.patternsHere.map((p) => `- ${p.name}（${p.kind === 'read' ? '读' : '写'} · 占总流量 ${Math.round(p.share * 100)}% · ${p.consistency === 'strong' ? '强一致' : '最终一致'}）：${p.description}`).join('\n') || '（无）'}\n\n` +
+      (ctx.schemaSummary ? `数据库 schema：\n${ctx.schemaSummary}\n\n` : '') +
+      `判卷信号——挂掉的用例：\n${ctx.failedCases.map((c) => `- ${c.name}：${c.failures.join('；')}`).join('\n') || '（无）'}\n` +
+      `与这个组件相关的结构缺陷：\n${ctx.structuralFindings.map((f) => `- [${f.severity}] ${f.title}：${f.detail}`).join('\n') || '（无）'}\n\n` +
+      `生成 4-6 个 follow-up 问题，按 基础 → 进阶 → 追问 → 故障 组织，至少一半要直接引用上面这份设计的事实（参数值、挂掉的用例、schema 选择）。每题给 2-4 条考点要点（供候选人自答后对照）。\n` +
+      `输出 JSON：{"questions":[{"level":"基础|进阶|追问|故障","question":"…","keyPoints":["…"]}]}`,
+  };
+}
+
+export function parseFollowUps(json: unknown): FollowUpQuestion[] {
+  const qs = (json as { questions?: unknown })?.questions;
+  if (!Array.isArray(qs)) throw new Error('follow-ups: bad shape');
+  const levels = ['基础', '进阶', '追问', '故障'];
+  const out: FollowUpQuestion[] = [];
+  for (const q of qs) {
+    const o = q as { level?: unknown; question?: unknown; keyPoints?: unknown };
+    if (typeof o.question !== 'string' || !o.question) continue;
+    out.push({
+      level: (levels.includes(String(o.level)) ? String(o.level) : '追问') as FollowUpQuestion['level'],
+      question: o.question,
+      keyPoints: Array.isArray(o.keyPoints) ? o.keyPoints.map(String).slice(0, 5) : [],
+    });
+  }
+  if (!out.length) throw new Error('follow-ups: empty');
+  return out.slice(0, 6);
+}
+
+export function buildSubmissionPrompt(ctx: SubmissionAssessmentContext): { system: string; user: string } {
+  return {
+    system:
+      '你是一位资深系统设计面试官，在给候选人的提交写评审。分数已由代码判卷给出（硬阈值），你的任务是解释分数、指出最关键的缺陷与修复优先级，结论必须引用给定的实测数据，不要编造数字，不要改判分数。只输出 JSON。',
+    user:
+      `题目：${ctx.problemName}\n候选人设计：\n${ctx.designSummary}\n\n本题读写需求：${ctx.workloadSummary}\n\n` +
+      `代码判卷结果：${ctx.passed}/${ctx.total} 通过，得分 ${ctx.scorePct}。逐例：\n` +
+      ctx.cases.map((c) => `- ${c.name}：${c.passed ? '通过' : `未通过 — ${c.failures.join('；')}（实测 ${JSON.stringify(c.measured)}）`}`).join('\n') +
+      `\n\n结构缺陷（确定性规则，可信）：\n${ctx.structuralFindings.map((f) => `- [${f.severity}] ${f.title}：${f.detail}`).join('\n') || '（无）'}\n\n` +
+      `输出 JSON：{"summary":"2-3 句总评","scoreRationale":"为什么是这个分数：失分集中在哪、先修哪个涨分最快","findings":[{"severity":"high|medium|low","title":"…","detail":"…"}]}`,
+  };
+}
+
+export function parseSubmissionAssessment(json: unknown): SubmissionAssessment {
+  const o = json as { summary?: unknown; scoreRationale?: unknown; findings?: unknown };
+  if (typeof o.summary !== 'string') throw new Error('submission assessment: bad shape');
+  const findings: DriverFinding[] = [];
+  if (Array.isArray(o.findings)) {
+    for (const f of o.findings) {
+      const g = f as { severity?: unknown; title?: unknown; detail?: unknown };
+      if (typeof g.title !== 'string') continue;
+      findings.push({
+        severity: (['high', 'medium', 'low'].includes(String(g.severity)) ? String(g.severity) : 'medium') as DriverFinding['severity'],
+        title: g.title,
+        detail: String(g.detail ?? ''),
+      });
+    }
+  }
+  return {
+    summary: o.summary,
+    scoreRationale: typeof o.scoreRationale === 'string' ? o.scoreRationale : '',
+    findings,
+  };
+}
+
+export function buildSchemaPrompt(ctx: SchemaAssessmentContext): { system: string; user: string } {
+  return {
+    system:
+      '你是一位资深系统设计面试官，在评审候选人的数据库设计。代码规则已经给出每条访问模式的路径与延迟估算（可信信号），你的任务是给出结论与改进建议：能否满足需求、延迟从哪来、怎么 scale。引用信号里的具体数字，不要编造。只输出 JSON。',
+    user:
+      `题目：${ctx.problemName}\n候选人的 schema：\n${ctx.schemaSummary}\n\n` +
+      `代码规则信号：得分 ${ctx.signals.score}，${ctx.signals.coverage}\n逐条访问模式：\n` +
+      ctx.signals.perPattern.map((p) => `- ${p.pattern}：${p.path} · 约 ${p.latencyMs}ms · ${p.verdict}${p.note ? `（${p.note}）` : ''}`).join('\n') +
+      `\n规则发现：\n${ctx.signals.findings.map((f) => `- [${f.dimension}/${f.severity}] ${f.text}`).join('\n') || '（无）'}\n\n` +
+      `输出 JSON：{"conclusion":"2-3 句总评","dimensionNotes":[{"dimension":"需求覆盖|延迟风险|扩展性","note":"…"}],"suggestions":["具体可执行的改进，按优先级"]}`,
+  };
+}
+
+export function parseSchemaAssessment(json: unknown): SchemaAssessment {
+  const o = json as { conclusion?: unknown; dimensionNotes?: unknown; suggestions?: unknown };
+  if (typeof o.conclusion !== 'string') throw new Error('schema assessment: bad shape');
+  const dims = ['需求覆盖', '延迟风险', '扩展性'];
+  const dimensionNotes: SchemaAssessment['dimensionNotes'] = [];
+  if (Array.isArray(o.dimensionNotes)) {
+    for (const d of o.dimensionNotes) {
+      const g = d as { dimension?: unknown; note?: unknown };
+      if (dims.includes(String(g.dimension)) && typeof g.note === 'string') {
+        dimensionNotes.push({
+          dimension: String(g.dimension) as SchemaAssessment['dimensionNotes'][number]['dimension'],
+          note: g.note,
+        });
+      }
+    }
+  }
+  return {
+    conclusion: o.conclusion,
+    dimensionNotes,
+    suggestions: Array.isArray(o.suggestions) ? o.suggestions.map(String).slice(0, 6) : [],
+  };
+}

@@ -134,7 +134,15 @@ export function createSimulatorTools(deps: ToolsDeps): SimulatorTools {
           name: a.caseId,
           passed: false,
           failures: [`unknown case ${a.caseId}`],
-          measured: {} as Record<string, number>,
+          measured: {
+            errorRate: 0,
+            p99Ms: 0,
+            costPerHour: 0,
+            maxStorageQps: 0,
+            staleReadRate: 0,
+            hottestUtil: 0,
+            queueDepthMax: 0,
+          },
         };
       }
       const r = runTestCase(problem, deps.getDesign(), tc);

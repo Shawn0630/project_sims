@@ -87,15 +87,31 @@ ollama serve            # 默认 http://localhost:11434
 npm workspaces 单仓多包，包之间只通过公开入口互相依赖，驾驶员与核心零耦合：
 
 ```
-apps/web/                 React + Vite 前端：画布（SVG 标准图示图标 + 请求粒子）、
-                          指标、细究面板、判卷报告、Schema 编辑器、驾驶员面板
+apps/web/                 React + Vite 前端（LeetCode 式布局）：左侧题目页签（描述/Schema/
+                          用例/提交记录/驾驶员）、画布（SVG 标准图示图标 + 请求粒子）、
+                          细究 slide-over、底部结果面板
 packages/sim-core/        模拟引擎：拓扑流量传播、组件行为模型、事件、指标快照
-packages/components/      13 个组件定义：容量/延迟/成本参数、白板图标、实验室映射、追问链
-packages/problems/        3 道题：题面、量级、可编辑 schema、用例套件（可见 + 隐藏）、示例设计
-packages/checker/         结构检查规则、用例判卷 runner、Schema 评审、SimulatorTools 实现
-packages/driver/          Driver contract + 工具 schema + 三个驾驶员实现
-labs/consistent-hashing/  一致性哈希实验室组件（独立页与 DB 细究共用）
+packages/components/      13 个组件定义：容量/延迟/成本参数、白板图标、实验室映射、静态追问链
+                          （仅作 ScriptedDriver 的离线 fallback 内容）
+packages/problems/        3 道题：题面、量级、可编辑 schema、用例套件（可见 + 隐藏）、示例设计，
+                          以及每道题自己的读写需求画像（workload：读写比、访问模式及
+                          QPS 量级、路径、一致性要求）——细究层跨题通用，数字全部由此驱动
+packages/checker/         只做硬判定：结构检查规则、用例判卷 runner（阈值 pass/fail）、
+                          Schema 规则信号（路径/延迟/发现），以及 SimulatorTools 实现
+packages/driver/          Driver contract（操作模拟器 + 全部定性评定接口）+ 三个实现：
+                          脚本驾驶员（离线 fallback）/ OpenAI 兼容（云端优先）/ Ollama
+labs/consistent-hashing/  一致性哈希实验室组件：只在分片 DB / NoSQL / 缓存集群的细究里出现
 ```
+
+### 评定分工（代码判卷 vs LLM 评定）
+
+- **代码判卷（`packages/checker`）**：逐用例 P99 / 错误率 / 成本阈值判定、总分、结构规则与
+  Schema 路径/延迟信号。确定性、可复现，LLM 不改判。
+- **LLM 评定（`packages/driver` 接口）**：提交后的综合评审与分数理由、细究追问的生成
+  （输入 = 设计快照 + 组件参数 + 本题 workload + 判卷信号，针对这份设计现场生成）、
+  Schema 结论与改进建议、结构 bug 的解释。所有评定类 UI 只经 Driver 接口取内容；
+  无 key 时 ScriptedDriver 用同一批确定性信号离线生成同形状的结果，云端 Driver 接上后
+  即由真 LLM 产出。
 
 ### 模拟模型（刻意做成可解释的近似）
 

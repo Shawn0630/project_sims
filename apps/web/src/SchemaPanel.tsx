@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { reviewSchema, type SchemaReviewReport } from '@sds/checker';
+import type { SchemaAssessment } from '@sds/driver';
 import type { ProblemSchema, SchemaTable } from '@sds/problems';
 import type { MetricsSnapshot } from '@sds/sim-core';
 
@@ -9,29 +10,51 @@ interface SchemaPanelProps {
   schema: ProblemSchema;
   snapshot: MetricsSnapshot | null;
   onChange: (schema: ProblemSchema) => void;
+  /**
+   * Qualitative conclusions come from the Driver layer (LLM when attached,
+   * ScriptedDriver offline). This panel only supplies the deterministic
+   * signals (paths / latencies / rule findings from @sds/checker) and
+   * renders what the driver returns — it holds no review copy of its own.
+   */
+  onAssess: (schema: ProblemSchema, signals: SchemaReviewReport) => Promise<SchemaAssessment>;
+  /** Who produced the current conclusions (driver label), for attribution. */
+  assessorNote?: string;
 }
 
-export function SchemaPanel({ schema, snapshot, onChange }: SchemaPanelProps) {
+export function SchemaPanel({ schema, snapshot, onChange, onAssess, assessorNote }: SchemaPanelProps) {
   const [report, setReport] = useState<SchemaReviewReport | null>(null);
+  const [assessment, setAssessment] = useState<SchemaAssessment | null>(null);
+  const [assessing, setAssessing] = useState(false);
 
   const updateTable = (idx: number, table: SchemaTable) => {
     const next = structuredClone(schema);
     next.tables[idx] = table;
     onChange(next);
     setReport(null);
+    setAssessment(null);
   };
 
-  const runReview = () => {
+  const runReview = async () => {
     const loadFactor = snapshot ? Math.min(1.5, snapshot.hottestUtil) : 0;
-    setReport(reviewSchema(schema, { loadFactor }));
+    const signals = reviewSchema(schema, { loadFactor });
+    setReport(signals);
+    setAssessing(true);
+    try {
+      setAssessment(await onAssess(schema, signals));
+    } catch {
+      setAssessment(null);
+    } finally {
+      setAssessing(false);
+    }
   };
 
   return (
     <div>
       <p style={{ color: '#94a3b8', fontSize: 13, marginTop: 0 }}>
         架构之外，数据库本身也要交卷：表结构、分片键、索引决定每条核心查询走什么路径。
-        点「让评审员检查」会按 <b>需求覆盖 / 延迟风险 / 扩展性</b> 三个维度出报告——延迟估算还会接入画布上
-        DB 此刻的真实利用率{ snapshot ? `（当前最热利用率 ${Math.round(snapshot.hottestUtil * 100)}%）` : ''}。
+        点「让评审员检查」：代码规则先算出每条访问模式的路径与延迟（确定性信号），
+        再由评审员（Driver 层，LLM 或离线脚本）按 <b>需求覆盖 / 延迟风险 / 扩展性</b> 给结论与改进建议——
+        延迟估算还会接入画布上 DB 此刻的真实利用率{ snapshot ? `（当前最热利用率 ${Math.round(snapshot.hottestUtil * 100)}%）` : ''}。
       </p>
 
       {schema.tables.map((table, ti) => (
@@ -106,6 +129,7 @@ export function SchemaPanel({ schema, snapshot, onChange }: SchemaPanelProps) {
                 next.tables.splice(ti, 1);
                 onChange(next);
                 setReport(null);
+                setAssessment(null);
               }}
             >
               删表
@@ -200,12 +224,13 @@ export function SchemaPanel({ schema, snapshot, onChange }: SchemaPanelProps) {
             });
             onChange(next);
             setReport(null);
+            setAssessment(null);
           }}
         >
           ＋ 加一张表
         </button>
-        <button className="primary" onClick={runReview}>
-          🔍 让评审员检查这份设计
+        <button className="primary" onClick={runReview} disabled={assessing}>
+          {assessing ? '评审员思考中…' : '🔍 让评审员检查这份设计'}
         </button>
       </div>
 
@@ -240,7 +265,7 @@ export function SchemaPanel({ schema, snapshot, onChange }: SchemaPanelProps) {
             if (!items.length) return null;
             return (
               <div key={dim} style={{ marginTop: 8 }}>
-                <b>{dim}</b>
+                <b>{dim} · 规则信号</b>
                 <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
                   {items.map((f, i) => (
                     <li key={i} style={{ color: f.severity === 'high' ? '#fca5a5' : '#e2e8f0' }}>
@@ -251,6 +276,41 @@ export function SchemaPanel({ schema, snapshot, onChange }: SchemaPanelProps) {
               </div>
             );
           })}
+
+          {/* Qualitative conclusions — produced by the Driver layer. */}
+          <div style={{ marginTop: 12, borderTop: '1px solid #1e293b', paddingTop: 10 }}>
+            <b>🧑‍⚖️ 评审员结论</b>
+            {assessorNote && (
+              <span style={{ color: '#94a3b8', fontSize: 12, marginLeft: 8 }}>{assessorNote}</span>
+            )}
+            {assessing ? (
+              <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>评审员正在看这份设计…</div>
+            ) : assessment ? (
+              <div style={{ fontSize: 13, lineHeight: 1.7, marginTop: 4 }}>
+                <div>{assessment.conclusion}</div>
+                {assessment.dimensionNotes.map((d) => (
+                  <div key={d.dimension} style={{ marginTop: 6 }}>
+                    <b>{d.dimension}</b>
+                    <div style={{ color: '#cbd5e1' }}>{d.note}</div>
+                  </div>
+                ))}
+                {assessment.suggestions.length > 0 && (
+                  <>
+                    <b style={{ display: 'block', marginTop: 8 }}>改进建议（按优先级）</b>
+                    <ul style={{ margin: '4px 0', paddingLeft: 18, color: '#cbd5e1' }}>
+                      {assessment.suggestions.map((s, i) => (
+                        <li key={i}>{s}</li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+              </div>
+            ) : (
+              <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>
+                结论生成失败或未配置评审员——上方规则信号仍然有效。
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>

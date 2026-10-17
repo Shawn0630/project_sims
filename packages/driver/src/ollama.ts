@@ -1,11 +1,23 @@
 import {
   DRIVER_SYSTEM_PROMPT,
   TOOL_SCHEMAS,
+  buildFollowUpPrompt,
+  buildSchemaPrompt,
+  buildSubmissionPrompt,
   executeToolCall,
+  parseFollowUps,
+  parseSchemaAssessment,
+  parseSubmissionAssessment,
   type Driver,
   type DriverContext,
   type DriverReview,
+  type FollowUpContext,
+  type FollowUpQuestion,
+  type SchemaAssessment,
+  type SchemaAssessmentContext,
   type SimulatorTools,
+  type SubmissionAssessment,
+  type SubmissionAssessmentContext,
 } from './contract';
 
 export interface OllamaConfig {
@@ -116,5 +128,48 @@ export class OllamaDriver implements Driver {
       })),
       transcript,
     };
+  }
+
+  // ------------------------------------------- qualitative assessment ---
+
+  private async chatJson(system: string, user: string): Promise<unknown> {
+    let res: Response;
+    try {
+      res = await fetch(`${this.cfg.baseUrl.replace(/\/$/, '')}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: this.cfg.model,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: user },
+          ],
+          format: 'json',
+          stream: false,
+        }),
+      });
+    } catch {
+      throw new Error(`OllamaDriver: 连不上 Ollama（${this.cfg.baseUrl}）。`);
+    }
+    if (!res.ok) {
+      throw new Error(`Ollama 请求失败：${res.status} ${await res.text()}`);
+    }
+    const data = (await res.json()) as { message: OllamaMessage };
+    return JSON.parse(data.message?.content ?? '') as unknown;
+  }
+
+  async assessSubmission(ctx: SubmissionAssessmentContext): Promise<SubmissionAssessment> {
+    const p = buildSubmissionPrompt(ctx);
+    return parseSubmissionAssessment(await this.chatJson(p.system, p.user));
+  }
+
+  async generateFollowUps(ctx: FollowUpContext): Promise<FollowUpQuestion[]> {
+    const p = buildFollowUpPrompt(ctx);
+    return parseFollowUps(await this.chatJson(p.system, p.user));
+  }
+
+  async assessSchema(ctx: SchemaAssessmentContext): Promise<SchemaAssessment> {
+    const p = buildSchemaPrompt(ctx);
+    return parseSchemaAssessment(await this.chatJson(p.system, p.user));
   }
 }
