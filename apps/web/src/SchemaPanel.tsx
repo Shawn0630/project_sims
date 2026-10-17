@@ -1,32 +1,38 @@
 import { useState } from 'react';
-import { reviewSchema, type SchemaReviewReport } from '@sds/checker';
-import type { SchemaAssessment } from '@sds/driver';
-import type { ProblemSchema, SchemaTable } from '@sds/problems';
 import type { MetricsSnapshot } from '@sds/sim-core';
+import type {
+  ProblemSchemaDTO,
+  SchemaAssessmentDTO,
+  SchemaSignalsDTO,
+  SchemaTableDTO,
+} from './api';
 
 const ROW_PRESETS = [100_000, 10_000_000, 1_000_000_000, 50_000_000_000];
 
 interface SchemaPanelProps {
-  schema: ProblemSchema;
+  schema: ProblemSchemaDTO;
   snapshot: MetricsSnapshot | null;
-  onChange: (schema: ProblemSchema) => void;
+  onChange: (schema: ProblemSchemaDTO) => void;
   /**
-   * Qualitative conclusions come from the Driver layer (LLM when attached,
-   * ScriptedDriver offline). This panel only supplies the deterministic
-   * signals (paths / latencies / rule findings from @sds/checker) and
-   * renders what the driver returns — it holds no review copy of its own.
+   * One backend review round-trip: the server computes the deterministic
+   * signals (paths / latencies / rule findings) AND the qualitative
+   * conclusions (LLM call, or scripted fallback) and returns both. This
+   * panel holds no judging or review logic of its own — it only renders.
    */
-  onAssess: (schema: ProblemSchema, signals: SchemaReviewReport) => Promise<SchemaAssessment>;
-  /** Who produced the current conclusions (driver label), for attribution. */
+  onReview: (
+    schema: ProblemSchemaDTO,
+    loadFactor: number,
+  ) => Promise<{ signals: SchemaSignalsDTO; assessment: SchemaAssessmentDTO | null }>;
+  /** Who produced the current conclusions (backend label), for attribution. */
   assessorNote?: string;
 }
 
-export function SchemaPanel({ schema, snapshot, onChange, onAssess, assessorNote }: SchemaPanelProps) {
-  const [report, setReport] = useState<SchemaReviewReport | null>(null);
-  const [assessment, setAssessment] = useState<SchemaAssessment | null>(null);
+export function SchemaPanel({ schema, snapshot, onChange, onReview, assessorNote }: SchemaPanelProps) {
+  const [report, setReport] = useState<SchemaSignalsDTO | null>(null);
+  const [assessment, setAssessment] = useState<SchemaAssessmentDTO | null>(null);
   const [assessing, setAssessing] = useState(false);
 
-  const updateTable = (idx: number, table: SchemaTable) => {
+  const updateTable = (idx: number, table: SchemaTableDTO) => {
     const next = structuredClone(schema);
     next.tables[idx] = table;
     onChange(next);
@@ -36,12 +42,13 @@ export function SchemaPanel({ schema, snapshot, onChange, onAssess, assessorNote
 
   const runReview = async () => {
     const loadFactor = snapshot ? Math.min(1.5, snapshot.hottestUtil) : 0;
-    const signals = reviewSchema(schema, { loadFactor });
-    setReport(signals);
     setAssessing(true);
     try {
-      setAssessment(await onAssess(schema, signals));
+      const { signals, assessment: a } = await onReview(schema, loadFactor);
+      setReport(signals);
+      setAssessment(a);
     } catch {
+      setReport(null);
       setAssessment(null);
     } finally {
       setAssessing(false);
@@ -52,8 +59,8 @@ export function SchemaPanel({ schema, snapshot, onChange, onAssess, assessorNote
     <div>
       <p style={{ color: '#94a3b8', fontSize: 13, marginTop: 0 }}>
         架构之外，数据库本身也要交卷：表结构、分片键、索引决定每条核心查询走什么路径。
-        点「让评审员检查」：代码规则先算出每条访问模式的路径与延迟（确定性信号），
-        再由评审员（Driver 层，LLM 或离线脚本）按 <b>需求覆盖 / 延迟风险 / 扩展性</b> 给结论与改进建议——
+        点「让评审员检查」：后端先用代码规则算出每条访问模式的路径与延迟（确定性信号），
+        再做一次评审调用（LLM 或后端脚本回落）按 <b>需求覆盖 / 延迟风险 / 扩展性</b> 给结论与改进建议——
         延迟估算还会接入画布上 DB 此刻的真实利用率{ snapshot ? `（当前最热利用率 ${Math.round(snapshot.hottestUtil * 100)}%）` : ''}。
       </p>
 
@@ -71,7 +78,7 @@ export function SchemaPanel({ schema, snapshot, onChange, onAssess, assessorNote
               存储引擎
               <select
                 value={table.engine}
-                onChange={(e) => updateTable(ti, { ...table, engine: e.target.value as SchemaTable['engine'] })}
+                onChange={(e) => updateTable(ti, { ...table, engine: e.target.value as SchemaTableDTO['engine'] })}
               >
                 <option value="relational">关系型</option>
                 <option value="nosql">NoSQL</option>
@@ -92,7 +99,7 @@ export function SchemaPanel({ schema, snapshot, onChange, onAssess, assessorNote
               主键生成
               <select
                 value={table.primaryKeyGen}
-                onChange={(e) => updateTable(ti, { ...table, primaryKeyGen: e.target.value as SchemaTable['primaryKeyGen'] })}
+                onChange={(e) => updateTable(ti, { ...table, primaryKeyGen: e.target.value as SchemaTableDTO['primaryKeyGen'] })}
               >
                 <option value="auto">自增</option>
                 <option value="snowflake">雪花</option>
@@ -277,7 +284,7 @@ export function SchemaPanel({ schema, snapshot, onChange, onAssess, assessorNote
             );
           })}
 
-          {/* Qualitative conclusions — produced by the Driver layer. */}
+          {/* Qualitative conclusions — produced by the backend eval call. */}
           <div style={{ marginTop: 12, borderTop: '1px solid #1e293b', paddingTop: 10 }}>
             <b>🧑‍⚖️ 评审员结论</b>
             {assessorNote && (

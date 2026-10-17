@@ -1,7 +1,11 @@
-import type { StructuralFinding, SuiteResult } from '@sds/checker';
-import type { ProblemDef, TestCase } from '@sds/problems';
+import type {
+  ProblemCaseDTO,
+  ProblemPack,
+  StructuralFindingDTO,
+  SuiteResultDTO,
+} from './api';
 
-function thresholdSummary(tc: TestCase): string {
+function thresholdSummary(tc: ProblemCaseDTO): string {
   const t = tc.thresholds;
   const parts: string[] = [];
   if (t.maxErrorRate !== undefined) parts.push(`错误率 < ${(t.maxErrorRate * 100).toFixed(1)}%`);
@@ -19,10 +23,10 @@ export function scoreColor(scorePct: number): string {
 }
 
 interface CaseListProps {
-  problem: ProblemDef;
-  suite: SuiteResult | null;
+  problem: ProblemPack;
+  suite: SuiteResultDTO | null;
   replayingId: string | null;
-  onReplay: (tc: TestCase) => void;
+  onReplay: (tc: ProblemCaseDTO) => void;
   onStopReplay: () => void;
 }
 
@@ -60,9 +64,9 @@ export function CaseList(props: CaseListProps) {
                 <span className="chip">可见用例</span>
               )}
               {tc.hidden && <span className="chip chip-hidden-tag">隐藏 · 已揭示</span>}
-              <b>{tc.name}</b>
+              <b>{r ? r.name : tc.name}</b>
               <span style={{ color: '#94a3b8', fontSize: 12.5 }}>{thresholdSummary(tc)}</span>
-              {r && (
+              {r && !tc.locked && (
                 <button
                   onClick={() =>
                     props.replayingId === tc.id ? props.onStopReplay() : props.onReplay(tc)
@@ -73,7 +77,9 @@ export function CaseList(props: CaseListProps) {
                 </button>
               )}
             </div>
-            <div style={{ color: '#cbd5e1', fontSize: 13, marginTop: 4 }}>{tc.description}</div>
+            {!tc.locked && (
+              <div style={{ color: '#cbd5e1', fontSize: 13, marginTop: 4 }}>{tc.description}</div>
+            )}
             {r && (
               <div style={{ fontSize: 12.5, marginTop: 4, color: '#94a3b8' }}>
                 实测：错误率 {(r.measured.errorRate * 100).toFixed(1)}% · P99 {Math.round(r.measured.p99Ms)}ms ·
@@ -100,7 +106,7 @@ export function CaseList(props: CaseListProps) {
 }
 
 interface StructuralListProps {
-  structural: StructuralFinding[];
+  structural: StructuralFindingDTO[];
   onSelectNode: (id: string) => void;
 }
 
@@ -132,13 +138,13 @@ export function StructuralList(props: StructuralListProps) {
 }
 
 interface ReportPanelProps {
-  problem: ProblemDef;
+  problem: ProblemPack;
   phase: 'design' | 'run' | 'report';
-  suite: SuiteResult | null;
-  structural: StructuralFinding[];
+  suite: SuiteResultDTO | null;
+  structural: StructuralFindingDTO[];
   replayingId: string | null;
   onRunSuite: () => void;
-  onReplay: (tc: TestCase) => void;
+  onReplay: (tc: ProblemCaseDTO) => void;
   onStopReplay: () => void;
   onSelectNode: (id: string) => void;
 }

@@ -1,1 +1,25 @@
-{"dependencies":{"@sds/checker":"0.1.0","@sds/components":"0.1.0","@sds/driver":"0.1.0","@sds/lab-consistent-hashing":"0.1.0","@sds/problems":"0.1.0","@sds/sim-core":"0.1.0","react":"^18.3.1","react-dom":"^18.3.1"},"devDependencies":{"@types/react":"^18.3.3","@types/react-dom":"^18.3.3","@vitejs/plugin-react":"^4.3.4","typescript":"^5.6.3","vite":"^5.4.11"},"name":"@sds/web","private":true,"scripts":{"build":"vite build","dev":"vite","preview":"vite preview"},"type":"module","version":"0.1.0"}
+{
+  "dependencies": {
+    "@sds/components": "0.1.0",
+    "@sds/lab-consistent-hashing": "0.1.0",
+    "@sds/sim-core": "0.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  },
+  "name": "@sds/web",
+  "private": true,
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite",
+    "preview": "vite preview"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}

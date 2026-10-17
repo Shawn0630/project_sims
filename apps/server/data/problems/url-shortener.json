@@ -1,0 +1,392 @@
+{
+  "id": "url-shortener",
+  "name": "Design 短链接",
+  "nameEn": "Design URL Shortener",
+  "difficulty": "简单",
+  "tags": [
+    "缓存",
+    "KV",
+    "重定向"
+  ],
+  "statement": "设计一个短链接服务：把长 URL 压缩成短码，访问短码时 302 跳转到原地址，并统计点击量。",
+  "functionalRequirements": [
+    "生成短链接（同一长链可复用）",
+    "短码跳转，延迟要低",
+    "点击计数与简单统计"
+  ],
+  "scale": {
+    "dau": "1 亿次/日跳转",
+    "readRatio": 0.97,
+    "peakMultiplier": 3,
+    "baselineRps": 800,
+    "budgetCostPerHour": 200,
+    "notes": "读:写 ≈ 30:1，跳转是绝对热点路径，P99 要求 < 400ms"
+  },
+  "flags": {
+    "mediaHeavy": false,
+    "hasFanout": false,
+    "publicWriteApi": true,
+    "readHeavy": true
+  },
+  "workload": {
+    "readRatio": 0.97,
+    "consistency": "跳转读允许最终一致（缓存旧值几秒可接受）；新建短链必须立刻可跳转（写后读强一致）；点击计数允许异步近似。",
+    "patterns": [
+      {
+        "id": "us-w-redirect",
+        "name": "短码跳转（302）",
+        "kind": "read",
+        "description": "按 short_code 查长链并跳转：占 97% 流量的绝对热点路径，每多一层都是 P99 杀手，必须缓存兜底。",
+        "share": 0.9,
+        "path": [
+          "client",
+          "cdn",
+          "loadbalancer",
+          "appserver",
+          "cache",
+          "relationaldb"
+        ],
+        "table": "urls",
+        "consistency": "eventual",
+        "terminalPerSec": 5000
+      },
+      {
+        "id": "us-w-stats",
+        "name": "查我的链接 / 点击统计",
+        "kind": "read",
+        "description": "按 user_id 查名下链接与计数：量级小但无索引就是全表扫，且不能拖慢跳转路径。",
+        "share": 0.07,
+        "path": [
+          "client",
+          "loadbalancer",
+          "appserver",
+          "relationaldb"
+        ],
+        "table": "urls",
+        "consistency": "strong",
+        "terminalPerSec": 100
+      },
+      {
+        "id": "us-w-create",
+        "name": "新建短链接",
+        "kind": "write",
+        "description": "生成短码并落库：写极少（约 30/s），但短码生成策略（自增/哈希/随机）决定冲突与可枚举性。",
+        "share": 0.03,
+        "path": [
+          "client",
+          "loadbalancer",
+          "gateway",
+          "appserver",
+          "relationaldb"
+        ],
+        "table": "urls",
+        "consistency": "strong",
+        "terminalPerSec": 30
+      }
+    ]
+  },
+  "schema": {
+    "tables": [
+      {
+        "name": "urls",
+        "engine": "relational",
+        "rows": 1000000000,
+        "primaryKey": "id",
+        "primaryKeyGen": "auto",
+        "shardKey": null,
+        "fields": [
+          {
+            "name": "id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "short_code",
+            "type": "varchar",
+            "indexed": true
+          },
+          {
+            "name": "long_url",
+            "type": "text",
+            "indexed": false
+          },
+          {
+            "name": "user_id",
+            "type": "bigint",
+            "indexed": false
+          },
+          {
+            "name": "click_count",
+            "type": "bigint",
+            "indexed": false
+          },
+          {
+            "name": "created_at",
+            "type": "timestamp",
+            "indexed": false
+          }
+        ]
+      }
+    ],
+    "accessPatterns": [
+      {
+        "id": "us-p1",
+        "name": "按短码跳转",
+        "table": "urls",
+        "kind": "read",
+        "byField": "short_code",
+        "perSec": 5000
+      },
+      {
+        "id": "us-p2",
+        "name": "按用户查我的链接",
+        "table": "urls",
+        "kind": "read",
+        "byField": "user_id",
+        "perSec": 100
+      },
+      {
+        "id": "us-p3",
+        "name": "点击计数更新",
+        "table": "urls",
+        "kind": "count",
+        "byField": "short_code",
+        "perSec": 5000
+      },
+      {
+        "id": "us-p4",
+        "name": "新建短链接",
+        "table": "urls",
+        "kind": "write",
+        "byField": "short_code",
+        "perSec": 30
+      }
+    ]
+  },
+  "testCases": [
+    {
+      "id": "us-baseline",
+      "name": "基线负载",
+      "description": "日常 800 req/s 跳转流量，P99 要求 < 400ms。",
+      "hidden": false,
+      "weight": 1,
+      "traffic": {
+        "rps": 800,
+        "readRatio": 0.97
+      },
+      "durationTicks": 30,
+      "thresholds": {
+        "maxErrorRate": 0.001,
+        "maxP99Ms": 400,
+        "maxHottestUtil": 0.95
+      },
+      "hint": "跳转路径要短：多一层就多一份延迟。"
+    },
+    {
+      "id": "us-peak",
+      "name": "晚高峰 ×3",
+      "description": "高峰 2,400 req/s。",
+      "hidden": false,
+      "weight": 1,
+      "traffic": {
+        "rps": 2400,
+        "readRatio": 0.97
+      },
+      "durationTicks": 40,
+      "thresholds": {
+        "maxErrorRate": 0.01,
+        "maxP99Ms": 400
+      },
+      "hint": "读多写少的题，扩容重点在读路径与缓存。"
+    },
+    {
+      "id": "us-cost",
+      "name": "成本上限",
+      "description": "基线下成本不超过 $200/h。",
+      "hidden": false,
+      "weight": 1,
+      "traffic": {
+        "rps": 800,
+        "readRatio": 0.97
+      },
+      "durationTicks": 15,
+      "thresholds": {
+        "maxCostPerHour": 200
+      },
+      "hint": "短链接是小题，别堆大炮：贵 DB 副本最容易超支。"
+    },
+    {
+      "id": "us-virallink",
+      "name": "一条链接病毒传播",
+      "description": "隐藏用例：一条短链被大 V 转发，跳转与计数瞬间集中到单个 key。",
+      "hidden": true,
+      "weight": 2,
+      "traffic": {
+        "rps": 2500,
+        "readRatio": 0.97
+      },
+      "durationTicks": 40,
+      "events": [
+        {
+          "atTick": 3,
+          "type": "hot_key",
+          "targetType": "relationaldb",
+          "magnitude": 3,
+          "durationTicks": 30
+        }
+      ],
+      "thresholds": {
+        "maxErrorRate": 0.02,
+        "maxHottestUtil": 1
+      },
+      "exposesRule": "db-scale",
+      "hint": "热点 key 的读应该被缓存完全吸收；计数写要异步聚合，别同步打 DB 行锁。"
+    },
+    {
+      "id": "us-stampede",
+      "name": "热点链接缓存过期",
+      "description": "隐藏用例：最热链接的缓存恰在高峰过期。",
+      "hidden": true,
+      "weight": 2,
+      "traffic": {
+        "rps": 2400,
+        "readRatio": 0.97
+      },
+      "durationTicks": 40,
+      "events": [
+        {
+          "atTick": 3,
+          "type": "cache_stampede",
+          "magnitude": 1,
+          "durationTicks": 30
+        }
+      ],
+      "thresholds": {
+        "maxErrorRate": 0.01,
+        "maxP99Ms": 400
+      },
+      "hint": "缓存开互斥重建，热点 key 可永不过期 + 主动刷新。"
+    },
+    {
+      "id": "us-nodefail",
+      "name": "峰值期节点宕机",
+      "description": "隐藏用例：高峰期一个应用节点宕机。",
+      "hidden": true,
+      "weight": 2,
+      "traffic": {
+        "rps": 2000,
+        "readRatio": 0.97
+      },
+      "durationTicks": 40,
+      "kills": [
+        {
+          "componentType": "appserver",
+          "atTick": 5
+        }
+      ],
+      "thresholds": {
+        "maxErrorRate": 0.02
+      },
+      "exposesRule": "spof",
+      "hint": "应用层至少两个节点。"
+    }
+  ],
+  "sampleDesign": {
+    "nodes": [
+      {
+        "id": "us-client",
+        "type": "client",
+        "x": 60,
+        "y": 300,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1
+        }
+      },
+      {
+        "id": "us-cdn",
+        "type": "cdn",
+        "x": 210,
+        "y": 300,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1
+        }
+      },
+      {
+        "id": "us-lb",
+        "type": "loadbalancer",
+        "x": 360,
+        "y": 300,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1,
+          "lbAlgorithm": "round_robin"
+        }
+      },
+      {
+        "id": "us-app",
+        "type": "appserver",
+        "x": 510,
+        "y": 300,
+        "settings": {
+          "replicas": 2,
+          "capacityScale": 1
+        }
+      },
+      {
+        "id": "us-cache",
+        "type": "cache",
+        "x": 660,
+        "y": 220,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1,
+          "eviction": "LRU",
+          "mutexRebuild": false
+        }
+      },
+      {
+        "id": "us-db",
+        "type": "relationaldb",
+        "x": 810,
+        "y": 220,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1,
+          "readReplicas": 1,
+          "sharded": false,
+          "shardKey": "user_id",
+          "consistency": "eventual"
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "us-client->us-cdn",
+        "from": "us-client",
+        "to": "us-cdn"
+      },
+      {
+        "id": "us-cdn->us-lb",
+        "from": "us-cdn",
+        "to": "us-lb"
+      },
+      {
+        "id": "us-lb->us-app",
+        "from": "us-lb",
+        "to": "us-app"
+      },
+      {
+        "id": "us-app->us-cache",
+        "from": "us-app",
+        "to": "us-cache"
+      },
+      {
+        "id": "us-cache->us-db",
+        "from": "us-cache",
+        "to": "us-db"
+      }
+    ]
+  }
+}

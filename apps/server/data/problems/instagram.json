@@ -1,0 +1,670 @@
+{
+  "id": "instagram",
+  "name": "Design Instagram",
+  "nameEn": "Design Instagram",
+  "difficulty": "中等",
+  "tags": [
+    "Feed 流",
+    "缓存",
+    "fan-out",
+    "媒体存储"
+  ],
+  "statement": "设计一个照片分享应用：用户可以上传照片、关注他人、在首页刷到关注者的照片流，并点赞评论。",
+  "functionalRequirements": [
+    "上传照片，生成多种尺寸",
+    "关注 / 取关用户",
+    "首页 Feed：按时间倒序拉取关注者的照片",
+    "点赞，点赞数实时可见"
+  ],
+  "scale": {
+    "dau": "5 亿 DAU",
+    "readRatio": 0.9,
+    "peakMultiplier": 3,
+    "baselineRps": 1200,
+    "budgetCostPerHour": 900,
+    "notes": "读:写 ≈ 10:1，晚高峰 ×3，大 V 粉丝量可达 1 亿"
+  },
+  "flags": {
+    "mediaHeavy": true,
+    "hasFanout": true,
+    "publicWriteApi": true,
+    "readHeavy": true
+  },
+  "workload": {
+    "readRatio": 0.9,
+    "consistency": "Feed 与计数可最终一致（秒级延迟可接受）；关注关系与照片元数据写入后自己必须立刻可见（read-your-write），走主库或会话一致。",
+    "fanoutFollowers": 800,
+    "patterns": [
+      {
+        "id": "ig-w-feed",
+        "name": "Feed 拉取（刷首页）",
+        "kind": "read",
+        "description": "打开 App 拉关注者照片流：先查关注列表，再批量取照片元数据，读放大最严重的一条路径。",
+        "share": 0.5,
+        "path": [
+          "client",
+          "loadbalancer",
+          "appserver",
+          "feedservice",
+          "cache",
+          "relationaldb"
+        ],
+        "table": "follows",
+        "consistency": "eventual",
+        "terminalPerSec": 5000
+      },
+      {
+        "id": "ig-w-profile",
+        "name": "看主页（用户 + 照片列表）",
+        "kind": "read",
+        "description": "进个人主页：查用户资料 + 按作者倒序拉照片，needsSort，索引与排序成本是考点。",
+        "share": 0.25,
+        "path": [
+          "client",
+          "cdn",
+          "loadbalancer",
+          "appserver",
+          "cache",
+          "relationaldb"
+        ],
+        "table": "photos",
+        "consistency": "eventual",
+        "terminalPerSec": 3000
+      },
+      {
+        "id": "ig-w-media",
+        "name": "看图（媒体文件）",
+        "kind": "read",
+        "description": "照片原图/缩略图字节流：应该被 CDN 与对象存储吃掉，不许打到应用与 DB。",
+        "share": 0.15,
+        "path": [
+          "client",
+          "cdn",
+          "objectstorage"
+        ],
+        "consistency": "eventual"
+      },
+      {
+        "id": "ig-w-post",
+        "name": "发帖（上传 + 写元数据）",
+        "kind": "write",
+        "description": "上传照片本体到对象存储，元数据写 DB，随后触发 Feed fan-out。写占比小但链路最长。",
+        "share": 0.05,
+        "path": [
+          "client",
+          "loadbalancer",
+          "appserver",
+          "objectstorage",
+          "relationaldb",
+          "queue",
+          "worker"
+        ],
+        "table": "photos",
+        "consistency": "strong",
+        "terminalPerSec": 400
+      },
+      {
+        "id": "ig-w-engage",
+        "name": "点赞 / 关注（计数写）",
+        "kind": "write",
+        "description": "点赞计数与关注关系写入：高频小写，热点照片的计数行是经典热点键问题。",
+        "share": 0.05,
+        "path": [
+          "client",
+          "loadbalancer",
+          "appserver",
+          "cache",
+          "relationaldb"
+        ],
+        "table": "likes",
+        "consistency": "eventual",
+        "terminalPerSec": 2000
+      }
+    ]
+  },
+  "schema": {
+    "tables": [
+      {
+        "name": "users",
+        "engine": "relational",
+        "rows": 500000000,
+        "primaryKey": "user_id",
+        "primaryKeyGen": "snowflake",
+        "shardKey": null,
+        "fields": [
+          {
+            "name": "user_id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "username",
+            "type": "varchar",
+            "indexed": true
+          },
+          {
+            "name": "email",
+            "type": "varchar",
+            "indexed": true
+          },
+          {
+            "name": "avatar_blob",
+            "type": "blob",
+            "indexed": false,
+            "blob": true
+          },
+          {
+            "name": "bio",
+            "type": "text",
+            "indexed": false
+          }
+        ]
+      },
+      {
+        "name": "photos",
+        "engine": "relational",
+        "rows": 5000000000,
+        "primaryKey": "photo_id",
+        "primaryKeyGen": "auto",
+        "shardKey": null,
+        "fields": [
+          {
+            "name": "photo_id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "user_id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "url",
+            "type": "varchar",
+            "indexed": false
+          },
+          {
+            "name": "created_at",
+            "type": "timestamp",
+            "indexed": true
+          }
+        ]
+      },
+      {
+        "name": "follows",
+        "engine": "relational",
+        "rows": 10000000000,
+        "primaryKey": "id",
+        "primaryKeyGen": "auto",
+        "shardKey": null,
+        "fields": [
+          {
+            "name": "id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "follower_id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "followee_id",
+            "type": "bigint",
+            "indexed": true
+          }
+        ]
+      },
+      {
+        "name": "likes",
+        "engine": "relational",
+        "rows": 10000000000,
+        "primaryKey": "id",
+        "primaryKeyGen": "auto",
+        "shardKey": null,
+        "fields": [
+          {
+            "name": "id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "photo_id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "user_id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "created_at",
+            "type": "timestamp",
+            "indexed": false
+          }
+        ]
+      }
+    ],
+    "accessPatterns": [
+      {
+        "id": "ig-p1",
+        "name": "查用户资料",
+        "table": "users",
+        "kind": "read",
+        "byField": "user_id",
+        "perSec": 800
+      },
+      {
+        "id": "ig-p2",
+        "name": "按作者查照片（时间倒序）",
+        "table": "photos",
+        "kind": "read",
+        "byField": "user_id",
+        "needsSort": true,
+        "perSec": 3000
+      },
+      {
+        "id": "ig-p3",
+        "name": "Feed 拉取：查关注列表",
+        "table": "follows",
+        "kind": "read",
+        "byField": "follower_id",
+        "perSec": 5000
+      },
+      {
+        "id": "ig-p4",
+        "name": "点赞计数更新",
+        "table": "likes",
+        "kind": "count",
+        "byField": "photo_id",
+        "perSec": 2000
+      },
+      {
+        "id": "ig-p5",
+        "name": "按邮箱查用户",
+        "table": "users",
+        "kind": "read",
+        "byField": "email",
+        "perSec": 50
+      },
+      {
+        "id": "ig-p6",
+        "name": "写入照片元数据",
+        "table": "photos",
+        "kind": "write",
+        "byField": "user_id",
+        "perSec": 400
+      },
+      {
+        "id": "ig-p7",
+        "name": "查某照片的点赞者",
+        "table": "likes",
+        "kind": "read",
+        "byField": "photo_id",
+        "perSec": 600
+      }
+    ]
+  },
+  "testCases": [
+    {
+      "id": "ig-baseline",
+      "name": "基线负载",
+      "description": "日常稳态 1,200 req/s，读:写 = 10:1，持续 30 秒。",
+      "hidden": false,
+      "weight": 1,
+      "traffic": {
+        "rps": 1200,
+        "readRatio": 0.9
+      },
+      "durationTicks": 30,
+      "thresholds": {
+        "maxErrorRate": 0.001,
+        "maxP99Ms": 500,
+        "maxHottestUtil": 0.95
+      },
+      "hint": "基线都过不了，说明某一层容量明显不足，先看利用率最高的组件。"
+    },
+    {
+      "id": "ig-peak",
+      "name": "晚高峰 ×3",
+      "description": "晚高峰流量翻 3 倍，持续 40 秒。",
+      "hidden": false,
+      "weight": 1,
+      "traffic": {
+        "rps": 3600,
+        "readRatio": 0.9
+      },
+      "durationTicks": 40,
+      "thresholds": {
+        "maxErrorRate": 0.01,
+        "maxP99Ms": 1000
+      },
+      "hint": "峰值挂掉通常是最热的那一层先饱和，按利用率从高到低扩。"
+    },
+    {
+      "id": "ig-cost",
+      "name": "成本上限",
+      "description": "在基线负载下，估算成本不得超过题目预算 $900/h。",
+      "hidden": false,
+      "weight": 1,
+      "traffic": {
+        "rps": 1200,
+        "readRatio": 0.9
+      },
+      "durationTicks": 15,
+      "thresholds": {
+        "maxCostPerHour": 900
+      },
+      "hint": "成本超标多半是贵组件（DB）副本堆太多，或该放缓存/对象存储的流量放错了层。"
+    },
+    {
+      "id": "ig-fanout",
+      "name": "大 V 发帖 fan-out",
+      "description": "隐藏用例：一位 1 亿粉丝的大 V 突然发帖，海量粉丝在 1 分钟内涌入拉取。",
+      "hidden": true,
+      "weight": 2,
+      "traffic": {
+        "rps": 1500,
+        "readRatio": 0.9
+      },
+      "durationTicks": 45,
+      "events": [
+        {
+          "atTick": 3,
+          "type": "viral_post",
+          "magnitude": 4,
+          "durationTicks": 40
+        }
+      ],
+      "thresholds": {
+        "maxErrorRate": 0.02,
+        "maxStorageQps": 6000,
+        "maxQueueDepth": 500000
+      },
+      "exposesRule": "sync-fanout",
+      "hint": "同步 fan-out 会把一次发帖放大成写风暴直砸存储。改异步：发帖先进队列，Worker 慢慢扩散（或大 V 改拉模式）。"
+    },
+    {
+      "id": "ig-stampede",
+      "name": "缓存整点雪崩",
+      "description": "隐藏用例：高峰期大批热点 key 在同一时刻过期，回源流量瞬间放大。",
+      "hidden": true,
+      "weight": 2,
+      "traffic": {
+        "rps": 3600,
+        "readRatio": 0.9
+      },
+      "durationTicks": 40,
+      "events": [
+        {
+          "atTick": 3,
+          "type": "cache_stampede",
+          "magnitude": 1,
+          "durationTicks": 30
+        }
+      ],
+      "thresholds": {
+        "maxErrorRate": 0.01,
+        "maxP99Ms": 1000
+      },
+      "exposesRule": "hot-read-no-cache",
+      "hint": "雪崩时命中率从 80%+ 跌到 15%，下游要能扛住回源：缓存开互斥重建、应用层留余量、或给 DB 前再加一层保护。"
+    },
+    {
+      "id": "ig-hotshard",
+      "name": "热点分片",
+      "description": "隐藏用例：写入集中砸向单个 key 区间（热点话题下的照片与点赞）。",
+      "hidden": true,
+      "weight": 2,
+      "traffic": {
+        "rps": 3000,
+        "readRatio": 0.9
+      },
+      "durationTicks": 40,
+      "events": [
+        {
+          "atTick": 3,
+          "type": "hot_key",
+          "targetType": "relationaldb",
+          "magnitude": 4,
+          "durationTicks": 30
+        }
+      ],
+      "thresholds": {
+        "maxErrorRate": 0.02,
+        "maxHottestUtil": 1
+      },
+      "exposesRule": "db-scale",
+      "hint": "未分片的单库扛不住绕过缓存的热点写。按 user_id 分片把热点摊开，或把这类数据迁到 NoSQL。"
+    },
+    {
+      "id": "ig-rwflip",
+      "name": "读写比翻转",
+      "description": "隐藏用例：一场直播活动让写流量暴涨，读写比从 10:1 翻转为 1:9。",
+      "hidden": true,
+      "weight": 1,
+      "traffic": {
+        "rps": 2000,
+        "readRatio": 0.9
+      },
+      "durationTicks": 40,
+      "events": [
+        {
+          "atTick": 3,
+          "type": "rw_flip",
+          "magnitude": 1,
+          "durationTicks": 30
+        }
+      ],
+      "thresholds": {
+        "maxErrorRate": 0.02,
+        "maxP99Ms": 1000
+      },
+      "hint": "为读优化的设计在写洪峰下会原形毕露：写路径的容量、队列缓冲和 DB 写能力要单独核算。"
+    },
+    {
+      "id": "ig-nodefail",
+      "name": "峰值期节点宕机",
+      "description": "隐藏用例：高峰期一个应用服务节点突然宕机。",
+      "hidden": true,
+      "weight": 2,
+      "traffic": {
+        "rps": 3000,
+        "readRatio": 0.9
+      },
+      "durationTicks": 40,
+      "kills": [
+        {
+          "componentType": "appserver",
+          "atTick": 5
+        }
+      ],
+      "thresholds": {
+        "maxErrorRate": 0.02
+      },
+      "exposesRule": "spof",
+      "hint": "只有一个应用节点（或同层无余量）时，一次宕机就是全站错误。同层至少两个节点并留 failover 余量。"
+    },
+    {
+      "id": "ig-stale",
+      "name": "主从延迟读旧数据",
+      "description": "隐藏用例：高并发写入下，从库延迟放大，用户刷到旧数据/丢赞。",
+      "hidden": true,
+      "weight": 1,
+      "traffic": {
+        "rps": 2500,
+        "readRatio": 0.9
+      },
+      "durationTicks": 35,
+      "thresholds": {
+        "maxStaleReadRate": 0.02,
+        "maxErrorRate": 0.01
+      },
+      "hint": "读副本 + 最终一致在高写入下会读到旧数据。关键读改强一致（走主库），或减少副本延迟来源。"
+    }
+  ],
+  "sampleDesign": {
+    "nodes": [
+      {
+        "id": "ig-client",
+        "type": "client",
+        "x": 60,
+        "y": 300,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1
+        }
+      },
+      {
+        "id": "ig-cdn",
+        "type": "cdn",
+        "x": 200,
+        "y": 150,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1
+        }
+      },
+      {
+        "id": "ig-gateway",
+        "type": "gateway",
+        "x": 200,
+        "y": 440,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1,
+          "rateLimitPerSec": 0
+        }
+      },
+      {
+        "id": "ig-lb",
+        "type": "loadbalancer",
+        "x": 340,
+        "y": 300,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1,
+          "lbAlgorithm": "round_robin"
+        }
+      },
+      {
+        "id": "ig-app",
+        "type": "appserver",
+        "x": 490,
+        "y": 300,
+        "settings": {
+          "replicas": 3,
+          "capacityScale": 1
+        }
+      },
+      {
+        "id": "ig-cache",
+        "type": "cache",
+        "x": 640,
+        "y": 170,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1,
+          "eviction": "LRU",
+          "mutexRebuild": false
+        }
+      },
+      {
+        "id": "ig-db",
+        "type": "relationaldb",
+        "x": 810,
+        "y": 170,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1,
+          "readReplicas": 2,
+          "sharded": false,
+          "shardKey": "user_id",
+          "consistency": "eventual"
+        }
+      },
+      {
+        "id": "ig-feed",
+        "type": "feedservice",
+        "x": 640,
+        "y": 330,
+        "settings": {
+          "replicas": 2,
+          "capacityScale": 1
+        }
+      },
+      {
+        "id": "ig-nosql",
+        "type": "nosql",
+        "x": 810,
+        "y": 330,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1,
+          "readReplicas": 0,
+          "sharded": true,
+          "shardKey": "created_at",
+          "consistency": "eventual"
+        }
+      },
+      {
+        "id": "ig-obj",
+        "type": "objectstorage",
+        "x": 640,
+        "y": 480,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "ig-client->ig-cdn",
+        "from": "ig-client",
+        "to": "ig-cdn"
+      },
+      {
+        "id": "ig-cdn->ig-gateway",
+        "from": "ig-cdn",
+        "to": "ig-gateway"
+      },
+      {
+        "id": "ig-gateway->ig-lb",
+        "from": "ig-gateway",
+        "to": "ig-lb"
+      },
+      {
+        "id": "ig-lb->ig-app",
+        "from": "ig-lb",
+        "to": "ig-app"
+      },
+      {
+        "id": "ig-app->ig-cache",
+        "from": "ig-app",
+        "to": "ig-cache"
+      },
+      {
+        "id": "ig-cache->ig-db",
+        "from": "ig-cache",
+        "to": "ig-db"
+      },
+      {
+        "id": "ig-app->ig-feed",
+        "from": "ig-app",
+        "to": "ig-feed"
+      },
+      {
+        "id": "ig-feed->ig-nosql",
+        "from": "ig-feed",
+        "to": "ig-nosql"
+      },
+      {
+        "id": "ig-app->ig-obj",
+        "from": "ig-app",
+        "to": "ig-obj"
+      }
+    ]
+  }
+}

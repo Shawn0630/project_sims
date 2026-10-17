@@ -1,25 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { COMPONENTS, componentDef, type ComponentTypeId } from '@sds/components';
-import {
-  checkStructure,
-  createSimulatorTools,
-  runSuite,
-  type SchemaReviewReport,
-  type SuiteResult,
-} from '@sds/checker';
-import {
-  ScriptedDriver,
-  createDriver,
-  type Driver,
-  type DriverContext,
-  type DriverReview,
-  type DriverSettings,
-  type FollowUpContext,
-  type FollowUpQuestion,
-  type SchemaReviewLike,
-  type SubmissionAssessment,
-} from '@sds/driver';
-import { PROBLEMS, problemById, type ProblemDef, type ProblemSchema, type TestCase } from '@sds/problems';
 import {
   SimulationEngine,
   defaultSettings,
@@ -29,9 +9,27 @@ import {
   type NodeSettings,
   type TrafficConfig,
 } from '@sds/sim-core';
+import {
+  API_URL,
+  evaluateOnServer,
+  fetchHealth,
+  fetchProblems,
+  judgeOnServer,
+  type FollowUpContextDTO,
+  type FollowUpQuestionDTO,
+  type HealthDTO,
+  type JudgeResponseDTO,
+  type ProblemCaseDTO,
+  type ProblemPack,
+  type ProblemSchemaDTO,
+  type SchemaAssessmentDTO,
+  type StructuralFindingDTO,
+  type SubmissionAssessmentDTO,
+  type SuiteResultDTO,
+} from './api';
 import { Canvas } from './Canvas';
 import { DeepDive } from './DeepDive';
-import { DriverPanel } from './DriverPanel';
+import { SettingsPanel } from './SettingsPanel';
 import { CaseList, StructuralList, scoreColor } from './ReportPanel';
 import { SchemaPanel } from './SchemaPanel';
 import { IconGlyph } from './icons';
@@ -47,29 +45,7 @@ interface SubmissionRecord {
   total: number;
 }
 
-const SETTINGS_KEY = 'sds-driver-settings-v1';
 const SUBMISSIONS_KEY = 'sds-submissions-v1';
-
-function loadDriverSettings(): DriverSettings {
-  try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) return JSON.parse(raw) as DriverSettings;
-  } catch {
-    /* ignore */
-  }
-  return {
-    kind: 'scripted',
-    openai: {
-      apiKey: import.meta.env.VITE_OPENAI_API_KEY ?? '',
-      baseUrl: import.meta.env.VITE_OPENAI_BASE_URL ?? 'https://api.openai.com/v1',
-      model: import.meta.env.VITE_OPENAI_MODEL ?? 'gpt-4o-mini',
-    },
-    ollama: {
-      baseUrl: import.meta.env.VITE_OLLAMA_BASE_URL ?? 'http://localhost:11434',
-      model: import.meta.env.VITE_OLLAMA_MODEL ?? 'qwen3:30b',
-    },
-  };
-}
 
 function loadSubmissions(): SubmissionRecord[] {
   try {
@@ -95,9 +71,11 @@ const LEFT_TABS: { id: LeftTab; label: string }[] = [
 ];
 
 // ------------------------------------------- shared summary builders -----
-// One design snapshot, three consumers: the operator review, the follow-up
-// generator and the submission assessor all read the same rendering of the
-// user's design so every Driver sees identical facts.
+// One design snapshot, several consumers: the submission assessment and the
+// follow-up generator both read the same rendering of the user's design, so
+// every backend evaluation sees identical facts. These builders only format
+// runtime data (the user's own design/schema + the fetched pack) — they hold
+// no problem logic.
 
 function nodeSettingsLine(n: Design['nodes'][number]): string {
   return (
@@ -119,7 +97,7 @@ function buildDesignSummary(design: Design): string {
   );
 }
 
-function schemaSummaryOf(schema: ProblemSchema): string {
+function schemaSummaryOf(schema: ProblemSchemaDTO): string {
   return schema.tables
     .map(
       (t) =>
@@ -132,7 +110,7 @@ function schemaSummaryOf(schema: ProblemSchema): string {
     .join('\n');
 }
 
-function workloadSummaryOf(problem: ProblemDef): string {
+function workloadSummaryOf(problem: ProblemPack): string {
   const w = problem.workload;
   return (
     `读:写 = ${Math.round(w.readRatio * 100)}:${Math.round((1 - w.readRatio) * 100)}；一致性要求：${w.consistency}；` +
@@ -142,27 +120,11 @@ function workloadSummaryOf(problem: ProblemDef): string {
   );
 }
 
-/** Checker signals → the contract shape the Driver assessment consumes. */
-function toSchemaSignals(report: SchemaReviewReport): SchemaReviewLike {
-  return {
-    score: report.score,
-    coverage: report.coverage,
-    coveragePassed: report.coveragePassed,
-    coverageTotal: report.coverageTotal,
-    findings: report.findings,
-    perPattern: report.perPattern.map((p) => ({
-      pattern: p.name,
-      path: p.path,
-      latencyMs: p.latencyMs,
-      verdict: p.verdict,
-      note: p.note,
-    })),
-  };
-}
-
-export default function App() {
-  const [problemId, setProblemId] = useState('instagram');
-  const problem = problemById(problemId);
+function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmConfigured: boolean }) {
+  const [problemId, setProblemId] = useState(
+    () => problems.find((p) => p.id === 'instagram')?.id ?? problems[0]!.id,
+  );
+  const problem = problems.find((p) => p.id === problemId) ?? problems[0]!;
   const [phase, setPhase] = useState<Phase>('design');
   const [design, setDesign] = useState<Design>(() => structuredClone(problem.sampleDesign));
   const [traffic, setTraffic] = useState<TrafficConfig>({
@@ -175,14 +137,12 @@ export default function App() {
   const [connectMode, setConnectMode] = useState(false);
   const [connectFrom, setConnectFrom] = useState<string | null>(null);
   const [highlights, setHighlights] = useState<Map<string, string>>(new Map());
-  const [suite, setSuite] = useState<SuiteResult | null>(null);
-  const [schemas, setSchemas] = useState<Record<string, ProblemSchema>>(() =>
-    Object.fromEntries(PROBLEMS.map((p) => [p.id, structuredClone(p.schema)])),
+  const [suite, setSuite] = useState<SuiteResultDTO | null>(null);
+  const [schemas, setSchemas] = useState<Record<string, ProblemSchemaDTO>>(() =>
+    Object.fromEntries(problems.map((p) => [p.id, structuredClone(p.schema)])),
   );
-  const [driverSettings, setDriverSettings] = useState<DriverSettings>(loadDriverSettings);
-  const [driverReview, setDriverReview] = useState<DriverReview | null>(null);
-  const [driverBusy, setDriverBusy] = useState(false);
-  const [driverError, setDriverError] = useState<string | null>(null);
+  const [structural, setStructural] = useState<StructuralFindingDTO[]>([]);
+  const [judgeError, setJudgeError] = useState<string | null>(null);
   const [replayingId, setReplayingId] = useState<string | null>(null);
   const [queueHistory, setQueueHistory] = useState<number[]>([]);
   const [activeTab, setActiveTab] = useState<LeftTab>('desc');
@@ -191,38 +151,16 @@ export default function App() {
   const [submissions, setSubmissions] = useState<SubmissionRecord[]>(loadSubmissions);
 
   // --------------------------------------- qualitative assessment layer ---
-  // Hard verdicts come from @sds/checker (code). EVERYTHING qualitative —
-  // submission review, deep-dive follow-ups, schema conclusions — comes
-  // from the Driver layer via withAssessor: the configured driver (cloud
-  // LLM first per the user's choice) or ScriptedDriver as offline fallback.
-  const scriptedDriver = useMemo(() => new ScriptedDriver(), []);
-  const activeDriver = useMemo<Driver>(() => {
-    try {
-      return createDriver(driverSettings);
-    } catch {
-      return scriptedDriver;
-    }
-  }, [driverSettings, scriptedDriver]);
+  // Hard verdicts are computed by the BACKEND (code judging). EVERYTHING
+  // qualitative — submission review, deep-dive follow-ups, schema
+  // conclusions — comes from ONE backend evaluation call per request: the
+  // server calls the configured LLM (or its scripted fallback) and returns
+  // structured data; this app only assembles context and renders results.
   const [assessorLabel, setAssessorLabel] = useState('');
-  const [followUps, setFollowUps] = useState<FollowUpQuestion[] | null>(null);
-  const [assessment, setAssessment] = useState<SubmissionAssessment | null>(null);
+  const [followUps, setFollowUps] = useState<FollowUpQuestionDTO[] | null>(null);
+  const [assessment, setAssessment] = useState<SubmissionAssessmentDTO | null>(null);
   const [assessmentBusy, setAssessmentBusy] = useState(false);
   const [submitStamp, setSubmitStamp] = useState(0);
-
-  const withAssessor = async <T,>(call: (d: Driver) => Promise<T>): Promise<T> => {
-    if (activeDriver.kind !== 'scripted') {
-      try {
-        const v = await call(activeDriver);
-        setAssessorLabel(activeDriver.label);
-        return v;
-      } catch {
-        /* LLM unavailable or bad output — fall through to the offline driver */
-      }
-    }
-    const v = await call(scriptedDriver);
-    setAssessorLabel('本地脚本');
-    return v;
-  };
 
   const engineRef = useRef<SimulationEngine | null>(null);
   if (!engineRef.current) {
@@ -239,13 +177,13 @@ export default function App() {
   const schemasRef = useRef(schemas);
   schemasRef.current = schemas;
   const replayRef = useRef<{
-    tc: TestCase;
+    tc: ProblemCaseDTO;
     tick: number;
-    events: NonNullable<TestCase['events']>;
-    kills: NonNullable<TestCase['kills']>;
+    events: NonNullable<ProblemCaseDTO['events']>;
+    kills: NonNullable<ProblemCaseDTO['kills']>;
   } | null>(null);
+  const structuralSeq = useRef(0);
 
-  const structural = useMemo(() => checkStructure(problem, design), [problem, design]);
   const selectedNode = design.nodes.find((n) => n.id === selectedId) ?? null;
   const locked = phase !== 'design';
   const mySubmissions = submissions.filter((s) => s.problemId === problemId);
@@ -261,19 +199,30 @@ export default function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(SETTINGS_KEY, JSON.stringify(driverSettings));
-    } catch {
-      /* ignore */
-    }
-  }, [driverSettings]);
-
-  useEffect(() => {
-    try {
       localStorage.setItem(SUBMISSIONS_KEY, JSON.stringify(submissions));
     } catch {
       /* ignore */
     }
   }, [submissions]);
+
+  // Structural findings are computed by the backend, not here. While
+  // designing, refresh them (debounced) through the judge endpoint and
+  // consume only its structural slice; a real submission re-judges
+  // everything and replaces both suite and structural state.
+  useEffect(() => {
+    if (phase !== 'design') return;
+    const seq = ++structuralSeq.current;
+    const t = window.setTimeout(() => {
+      judgeOnServer({ problemId: problem.id, design })
+        .then((jr) => {
+          if (structuralSeq.current === seq) setStructural(jr.structural);
+        })
+        .catch(() => {
+          /* backend hiccup — keep the last known findings */
+        });
+    }, 700);
+    return () => window.clearTimeout(t);
+  }, [design, problem, phase]);
 
   useEffect(() => {
     if (!running) return;
@@ -323,17 +272,18 @@ export default function App() {
 
   // ------------------------------------------------------------- actions ---
   const switchProblem = (id: string) => {
-    const p = problemById(id);
-    setProblemId(id);
+    const p = problems.find((x) => x.id === id) ?? problems[0]!;
+    setProblemId(p.id);
     setDesign(structuredClone(p.sampleDesign));
     setTraffic({ rps: p.scale.baselineRps, readRatio: p.scale.readRatio });
     setPhase('design');
     setRunning(false);
     setSnapshot(null);
     setSuite(null);
+    setStructural([]);
+    setJudgeError(null);
     setAssessment(null);
     setFollowUps(null);
-    setDriverReview(null);
     setHighlights(new Map());
     setSelectedId(null);
     setReplayingId(null);
@@ -344,9 +294,9 @@ export default function App() {
     });
   };
 
-  const problemIndex = PROBLEMS.findIndex((p) => p.id === problemId);
+  const problemIndex = problems.findIndex((p) => p.id === problemId);
   const stepProblem = (delta: number) => {
-    const next = PROBLEMS[(problemIndex + delta + PROBLEMS.length) % PROBLEMS.length]!;
+    const next = problems[(problemIndex + delta + problems.length) % problems.length]!;
     switchProblem(next.id);
   };
 
@@ -406,7 +356,6 @@ export default function App() {
     setSnapshot(null);
     setSuite(null);
     setAssessment(null);
-    setDriverReview(null);
     setHighlights(new Map());
     setReplayingId(null);
     replayRef.current = null;
@@ -414,22 +363,36 @@ export default function App() {
     engine.clearEvents();
   };
 
-  const runSuiteNow = () => {
-    const result = runSuite(problem, designRef.current);
+  /**
+   * Judging happens on the backend: POST the design (and current schema
+   * draft) and render what comes back — suite results, structural findings,
+   * schema signals. Hidden cases are judged there, where their data lives.
+   */
+  const runSuiteNow = async () => {
+    const p = problemRef.current;
+    let jr: JudgeResponseDTO;
+    try {
+      jr = await judgeOnServer({
+        problemId: p.id,
+        design: designRef.current,
+        schema: schemasRef.current[p.id]!,
+        schemaLoadFactor: snapshot ? Math.min(1.5, snapshot.hottestUtil) : 0,
+      });
+    } catch {
+      setJudgeError('判卷失败：后端不可达。请确认后端已启动（npm run dev:server）后，再点一次「提交设计」。');
+      return;
+    }
+    setJudgeError(null);
+    const result = jr.suite;
     setSuite(result);
+    setStructural(jr.structural);
     setSubmitStamp((s) => s + 1);
     setAssessment(null);
     setPhase('report');
-    // The scripted assessor is instant and offline — run its qualitative
-    // review automatically. An LLM assessor stays behind the button in the
-    // results panel so API calls are never a surprise.
-    if (activeDriver.kind === 'scripted') {
-      void runAssessment(result);
-    }
     setSubmissions((prev) =>
       [
         {
-          problemId: problem.id,
+          problemId: p.id,
           at: Date.now(),
           scorePct: result.scorePct,
           passed: result.passedCount,
@@ -438,13 +401,23 @@ export default function App() {
         ...prev,
       ].slice(0, 50),
     );
+    // When the backend has no LLM configured, its scripted assessment is
+    // instant and offline — run it automatically. With an LLM attached the
+    // assessment stays behind the button in the results panel so calls are
+    // never a surprise.
+    if (!llmConfigured) {
+      void runAssessment(result, jr.structural);
+    }
   };
 
-  /** Qualitative review of a judged submission, via the Driver layer. */
-  const runAssessment = async (s: SuiteResult) => {
+  /** Qualitative review of a judged submission — ONE backend evaluate call. */
+  const runAssessment = async (
+    s: SuiteResultDTO,
+    structuralOverride?: StructuralFindingDTO[],
+  ) => {
     setAssessmentBusy(true);
     try {
-      const ctx = {
+      const r = await evaluateOnServer<SubmissionAssessmentDTO>('submission', {
         problemName: problemRef.current.name,
         designSummary: buildDesignSummary(designRef.current),
         workloadSummary: workloadSummaryOf(problemRef.current),
@@ -452,9 +425,10 @@ export default function App() {
         passed: s.passedCount,
         total: s.totalCount,
         cases: s.results,
-        structuralFindings: checkStructure(problemRef.current, designRef.current),
-      };
-      setAssessment(await withAssessor((d) => d.assessSubmission(ctx)));
+        structuralFindings: structuralOverride ?? structural,
+      });
+      setAssessorLabel(r.label);
+      setAssessment(r.data);
     } catch {
       setAssessment(null);
     } finally {
@@ -465,7 +439,7 @@ export default function App() {
   /** LeetCode's green Submit: lock the design, judge everything, show results. */
   const onSubmit = () => {
     if (phase === 'design') submitDesign();
-    runSuiteNow();
+    void runSuiteNow();
     setBottomOpen(true);
   };
 
@@ -478,7 +452,10 @@ export default function App() {
     }
   };
 
-  const startReplay = (tc: TestCase) => {
+  const startReplay = (tc: ProblemCaseDTO) => {
+    // Hidden cases arrive stripped (locked): their scenario data never left
+    // the server, so there is nothing local to replay.
+    if (tc.locked) return;
     engine.reviveAll();
     engine.clearEvents();
     engine.setTraffic(tc.traffic);
@@ -526,48 +503,14 @@ export default function App() {
     }
   };
 
-  const runDriver = async () => {
-    setDriverBusy(true);
-    setDriverError(null);
-    try {
-      const tools = createSimulatorTools({
-        engine,
-        getProblem: () => problemRef.current,
-        getDesign: () => designRef.current,
-        getSchema: () => schemasRef.current[problemRef.current.id]!,
-        onHighlight: (componentId, reason) =>
-          setHighlights((prev) => new Map(prev).set(componentId, reason)),
-      });
-      const driver = activeDriver;
-      const designSummary = buildDesignSummary(designRef.current);
-      const ctx: DriverContext = {
-        problemName: problemRef.current.name,
-        problemStatement: problemRef.current.statement,
-        scaleNotes: `${problemRef.current.scale.dau} · ${problemRef.current.scale.notes} · 基线 ${problemRef.current.scale.baselineRps} req/s`,
-        designSummary,
-        structuralFindings: checkStructure(problemRef.current, designRef.current),
-        availableCases: problemRef.current.testCases.map((c) => ({
-          id: c.id,
-          name: c.name,
-          hidden: c.hidden,
-        })),
-      };
-      const review = await driver.review(tools, ctx);
-      setDriverReview(review);
-      setSnapshot(engine.snapshot());
-    } catch (err) {
-      setDriverError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setDriverBusy(false);
-    }
-  };
-
   // ------------------------------------- deep-dive follow-up generation ---
-  // When a component is opened (or a new submission lands), ask the Driver
+  // When a component is opened (or a new submission lands), ask the backend
   // for follow-ups generated from THIS design snapshot: the graph, this
   // component's settings, this problem's workload landing on it, the schema
-  // choices and the judging signals. Regenerates per (problem, node,
-  // submission, graph shape) — not on every settings keystroke.
+  // choices and the judging signals. The context is assembled here from
+  // runtime data; the questions themselves are produced by the backend's
+  // single evaluate call. Regenerates per (problem, node, submission, graph
+  // shape) — not on every settings keystroke.
   const followKey = selectedNode
     ? `${problem.id}|${selectedNode.id}|${submitStamp}|${design.nodes.length}|${design.edges.length}`
     : '';
@@ -588,7 +531,7 @@ export default function App() {
     const rSum = wPatterns.filter((x) => x.kind === 'read').reduce((s, x) => s + x.share, 0);
     const wSum = wPatterns.filter((x) => x.kind === 'write').reduce((s, x) => s + x.share, 0);
     const m = snapshot?.nodes[node.id];
-    const ctx: FollowUpContext = {
+    const ctx: FollowUpContextDTO = {
       problemName: p.name,
       componentType: node.type,
       componentName: componentDef(node.type).name,
@@ -623,9 +566,12 @@ export default function App() {
       structuralFindings: structural.filter((f) => f.componentIds.includes(node.id)),
     };
     let cancelled = false;
-    withAssessor((drv) => drv.generateFollowUps(ctx))
-      .then((qs) => {
-        if (!cancelled) setFollowUps(qs);
+    evaluateOnServer<FollowUpQuestionDTO[]>('followups', ctx)
+      .then((r) => {
+        if (!cancelled) {
+          setAssessorLabel(r.label);
+          setFollowUps(r.data);
+        }
       })
       .catch(() => {
         if (!cancelled) setFollowUps([]);
@@ -673,7 +619,7 @@ export default function App() {
             onChange={(e) => switchProblem(e.target.value)}
             title="切换题目"
           >
-            {PROBLEMS.map((p) => (
+            {problems.map((p) => (
               <option key={p.id} value={p.id}>
                 {p.name}（{p.difficulty}）
               </option>
@@ -692,7 +638,7 @@ export default function App() {
           <button className="lc-submit-btn" onClick={onSubmit}>
             提交设计
           </button>
-          <button className="lc-gear-btn" onClick={() => setSettingsOpen(true)} title="设置（AI 评审模型）">
+          <button className="lc-gear-btn" onClick={() => setSettingsOpen(true)} title="设置（后端连接状态）">
             ⚙
           </button>
         </div>
@@ -769,15 +715,16 @@ export default function App() {
                 snapshot={snapshot}
                 onChange={(s) => setSchemas({ ...schemas, [problem.id]: s })}
                 assessorNote={assessorLabel ? `评审：${assessorLabel}` : undefined}
-                onAssess={async (sch, signals) =>
-                  withAssessor((d) =>
-                    d.assessSchema({
-                      problemName: problem.name,
-                      schemaSummary: schemaSummaryOf(sch),
-                      signals: toSchemaSignals(signals),
-                    }),
-                  )
-                }
+                onReview={async (sch, loadFactor) => {
+                  const r = await evaluateOnServer<SchemaAssessmentDTO>('schema', {
+                    problemName: problem.name,
+                    schema: sch,
+                    loadFactor,
+                  });
+                  setAssessorLabel(r.label);
+                  if (!r.schemaSignals) throw new Error('后端未返回 schema 信号');
+                  return { signals: r.schemaSignals, assessment: r.data };
+                }}
               />
             )}
 
@@ -1023,6 +970,11 @@ export default function App() {
             </button>
             {bottomOpen && (
               <div className="lc-bottom-body">
+                {judgeError && (
+                  <div style={{ color: '#fca5a5', fontSize: 13, marginBottom: 8 }}>
+                    ⚠️ {judgeError}
+                  </div>
+                )}
                 {suite ? (
                   <>
                     <CaseList
@@ -1032,7 +984,7 @@ export default function App() {
                       onReplay={startReplay}
                       onStopReplay={stopReplay}
                     />
-                    {/* Qualitative review — Driver layer only. */}
+                    {/* Qualitative review — backend evaluate call only. */}
                     <div style={{ marginTop: 14, border: '1px solid #1e293b', borderRadius: 8, padding: '10px 12px', background: '#0b1220' }}>
                       <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                         <b>🧑‍⚖️ 评审员点评</b>
@@ -1135,18 +1087,100 @@ export default function App() {
                 ✕
               </button>
             </div>
-            <DriverPanel
-              settings={driverSettings}
-              onSettings={setDriverSettings}
-              busy={driverBusy}
-              review={driverReview}
-              error={driverError}
-              canRun={phase !== 'design'}
-              onRun={runDriver}
-            />
+            <SettingsPanel />
           </div>
         </>
       )}
     </div>
   );
+}
+
+// --------------------------------------------------------------- app shell ---
+// Thin frontend: problem packs arrive from the backend at runtime. There is
+// deliberately NO bundled fallback — without the backend there is nothing
+// legitimate to show, so the app says so plainly instead of inventing data.
+
+export default function App() {
+  const [problems, setProblems] = useState<ProblemPack[] | null>(null);
+  const [health, setHealth] = useState<HealthDTO | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    let on = true;
+    setFailed(false);
+    setProblems(null);
+    Promise.all([fetchProblems(), fetchHealth().catch(() => null)])
+      .then(([ps, h]) => {
+        if (!on) return;
+        setProblems(ps);
+        setHealth(h);
+      })
+      .catch(() => {
+        if (on) setFailed(true);
+      });
+    return () => {
+      on = false;
+    };
+  }, [attempt]);
+
+  if (failed) {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: '#020617',
+          color: '#e2e8f0',
+          padding: 24,
+          boxSizing: 'border-box',
+        }}
+      >
+        <div style={{ maxWidth: 540, lineHeight: 1.8 }}>
+          <h1 style={{ fontSize: 20, margin: '0 0 8px' }}>需要后端</h1>
+          <p style={{ color: '#94a3b8', fontSize: 14, margin: 0 }}>
+            这个前端不内置任何题目：题面、测试用例（包括隐藏用例）、判卷和 AI 评审都在后端
+            （当前地址 <code>{API_URL}</code>）。后端现在连不上，请先在项目根目录启动它：
+          </p>
+          <pre
+            style={{
+              background: '#0b1220',
+              border: '1px solid #1e293b',
+              borderRadius: 8,
+              padding: '10px 14px',
+              fontSize: 13,
+              overflowX: 'auto',
+            }}
+          >
+            npm run dev:server
+          </pre>
+          <button className="primary" onClick={() => setAttempt((a) => a + 1)}>
+            重试连接
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!problems) {
+    return (
+      <div
+        style={{
+          minHeight: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: '#020617',
+          color: '#94a3b8',
+          fontSize: 14,
+        }}
+      >
+        正在从后端加载题目…
+      </div>
+    );
+  }
+
+  return <Simulator problems={problems} llmConfigured={health?.llmConfigured ?? false} />;
 }

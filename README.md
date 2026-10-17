@@ -7,10 +7,16 @@
 
 ## 快速开始
 
+前端是「瘦前端」：题目、判卷和 AI 评审都在后端，所以要开两个终端：
+
 ```bash
 npm install
-npm run dev        # 打开 http://localhost:5173
+npm run dev:server   # 后端 API → http://localhost:8787（题目/判卷/评审）
+npm run dev          # 前端 → http://localhost:5173
 ```
+
+只开前端会看到「需要后端」页面——前端不内置任何题目数据，这是刻意的（见下方「后端」一节）。
+后端不配 LLM key 也能全功能运行（评审走脚本回落，离线可用）。
 
 生产构建与类型检查：
 
@@ -65,41 +71,83 @@ read_metrics / highlight / run_test_case / review_schema
 | `OpenAICompatibleDriver` | **云端 API（用户定的优先项）**。对任何 OpenAI 兼容的 `/chat/completions` 端点跑 function-calling agent 循环 |
 | `OllamaDriver` | 本地 fallback。走 Ollama `/api/chat` 的工具调用，需要本地有支持工具调用的模型（如 Qwen3 家族） |
 
-### 接云端 API
+### 接云端 API / Ollama
 
-两种方式，key 都只留在本地，**不要提交进仓库**（`.env*` 已在 .gitignore 里）：
+评审模型由**后端**配置（环境变量 `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL`，
+见下方「后端」一节），浏览器里不再填 key。Ollama 作为后端可达的
+OpenAI 兼容端点接入：把 `LLM_BASE_URL` 指向 `http://localhost:11434/v1`、
+`LLM_MODEL` 设为本地模型名即可（key 随便填一个非空值）。
 
-- 在页面「驾驶员」面板里选择「云端 LLM」，填 API Key / Base URL / 模型——只存浏览器 localStorage；
-- 或复制 `.env.example` 为 `.env.local`，填 `VITE_OPENAI_API_KEY` 等变量作为预填值。
+## 后端（Backend）
 
-### 接 Ollama
+四套系统（仿真 / 答题 / LLM eval / LLM 生成题目）里，后端是 eval 与题目的家：
+
+**瘦前端原则**：`apps/web` 不存任何题目逻辑——不 import `@sds/problems` /
+`@sds/checker` / `@sds/driver`，bundle 里没有题目数据、测试用例、读写画像、
+判卷或评审代码。前端只剩仿真系统本身（sim-core 引擎、组件定义、画布、实验室渲染）
+加渲染职责：题面、规模、可见用例、workload 画像都作为运行时数据从 API 拉取；
+细究需要的 workload 随题目从 API 来。后端不可达时前端显示明确的「需要后端」
+状态，不回退到任何内置题目。
 
 ```bash
-ollama pull qwen3:30b   # 任意支持工具调用的模型
-ollama serve            # 默认 http://localhost:11434
+npm run dev:server   # 或 npm run start -w @sds/server；tsx 直接跑 TS 源码
 ```
 
-页面驾驶员面板选「Ollama 本地」即可。注意浏览器从 `localhost:5173` 调用
-`localhost:11434` 时，Ollama 需要允许跨域：启动时设 `OLLAMA_ORIGINS=*`。
+环境变量（shell 导出，或复制 `apps/server/.env.example` 为 `apps/server/.env`）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PORT` | `8787` | API 监听端口 |
+| `LLM_BASE_URL` | `https://api.openai.com/v1` | 任意 OpenAI 兼容端点 |
+| `LLM_API_KEY` | （空） | 不设 = 脚本回落，服务照常工作，启动不要求 key |
+| `LLM_MODEL` | `gpt-4o-mini` | 评审模型名 |
+| `VITE_API_URL` | `http://localhost:8787` | 前端构建时变量，后端地址 |
+
+接口：
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/health` | 存活 + 题目数 + LLM 是否已配置 |
+| `GET /api/problems` / `GET /api/problems/:id` | 题目包（渲染数据）；隐藏用例只保留 id/名称/权重并标 `locked`，场景、阈值、提示一律剥离 |
+| `POST /api/submissions/judge` | `{ problemId, design, schema?, schemaLoadFactor? }` → 在服务端跑既有 checker 判卷，返回逐例结果 + 结构检查 + Schema 信号 |
+| `POST /api/evaluate` | `{ kind: submission \| schema \| followups, context }` → 后端组装 prompt、做**一次** LLM 调用、防御性解析结构化 JSON 返回；无 key 或调用失败回落 ScriptedDriver 同形状结果。`kind=schema` 可直接传 `{ problemName, schema, loadFactor }`，信号由服务端计算并随响应返回 |
+| `POST /api/problems/generate` | **桩**：校验题目种子 `{ title, statement, scaleNotes? }` 后返回 501 与计划中的题目包生成契约——这是第四套系统（LLM 生成题目）的接缝 |
+
+**隐藏用例为什么必须在服务端**：早期浏览器直连形态下，隐藏 edge cases 的场景与
+阈值就在前端 bundle 里，打开 DevTools 就能看光——那不叫隐藏。现在它们只存在于
+服务端 storage，客户端在提交前只能看到「🔒 隐藏用例」，判卷后才以结果形式揭示。
+
+**存储**：`apps/server/src/storage.ts` 定义 `ProblemStorage` 接口
+（listProblems / getProblem / saveProblem），唯一实现是 JSON 文件
+（`apps/server/data/problems/<id>.json`，由 `npm run seed -w @sds/server`
+从 `@sds/problems` 导出种子）。以后换 Postgres 只是再写一个实现，路由与判卷不动。
+
+**个人/离线使用**：本地起后端、不配 key 即全功能离线运行（评审为脚本回落）——
+这是原来「浏览器直连」形态的替代：key 只存在于后端 env，判卷公正性也不再依赖
+前端自觉。
 
 ## 架构
 
 npm workspaces 单仓多包，包之间只通过公开入口互相依赖，驾驶员与核心零耦合：
 
 ```
-apps/web/                 React + Vite 前端（LeetCode 式布局）：左侧题目页签（描述/Schema/
-                          用例/提交记录/驾驶员）、画布（SVG 标准图示图标 + 请求粒子）、
-                          细究 slide-over、底部结果面板
+apps/web/                 React + Vite 瘦前端（LeetCode 式布局）：运行时从 API 拉题目包渲染，
+                          左侧题目页签（描述/Schema/用例/提交记录）、画布（SVG 标准图示图标 +
+                          请求粒子）、细究 slide-over、底部结果面板；只含仿真 + 渲染
+apps/server/              Hono 后端：题目存储（JSON 包）、服务端判卷、LLM 评审调用、
+                          题目生成桩——见上方「后端」一节
 packages/sim-core/        模拟引擎：拓扑流量传播、组件行为模型、事件、指标快照
 packages/components/      13 个组件定义：容量/延迟/成本参数、白板图标、实验室映射、静态追问链
                           （仅作 ScriptedDriver 的离线 fallback 内容）
-packages/problems/        3 道题：题面、量级、可编辑 schema、用例套件（可见 + 隐藏）、示例设计，
-                          以及每道题自己的读写需求画像（workload：读写比、访问模式及
-                          QPS 量级、路径、一致性要求）——细究层跨题通用，数字全部由此驱动
+packages/problems/        题目作者格式：3 道题（题面、量级、可编辑 schema、用例套件、
+                          示例设计、每题的读写需求画像 workload）——经 seed 导出为
+                          服务端 storage 的 JSON 包后由 API 下发，运行时前端不打包它
 packages/checker/         只做硬判定：结构检查规则、用例判卷 runner（阈值 pass/fail）、
-                          Schema 规则信号（路径/延迟/发现），以及 SimulatorTools 实现
+                          Schema 规则信号（路径/延迟/发现），以及 SimulatorTools 实现；
+                          现在由服务端判卷接口调用
 packages/driver/          Driver contract（操作模拟器 + 全部定性评定接口）+ 三个实现：
-                          脚本驾驶员（离线 fallback）/ OpenAI 兼容（云端优先）/ Ollama
+                          脚本驾驶员（离线 fallback）/ OpenAI 兼容（云端优先）/ Ollama；
+                          评定接口在服务端被 /api/evaluate 消费
 labs/consistent-hashing/  一致性哈希实验室组件：只在分片 DB / NoSQL / 缓存集群的细究里出现
 ```
 
@@ -107,11 +155,11 @@ labs/consistent-hashing/  一致性哈希实验室组件：只在分片 DB / NoS
 
 - **代码判卷（`packages/checker`）**：逐用例 P99 / 错误率 / 成本阈值判定、总分、结构规则与
   Schema 路径/延迟信号。确定性、可复现，LLM 不改判。
-- **LLM 评定（`packages/driver` 接口）**：提交后的综合评审与分数理由、细究追问的生成
+- **LLM 评定（`packages/driver` 接口，经后端 `POST /api/evaluate` 消费）**：提交后的综合评审与分数理由、细究追问的生成
   （输入 = 设计快照 + 组件参数 + 本题 workload + 判卷信号，针对这份设计现场生成）、
-  Schema 结论与改进建议、结构 bug 的解释。所有评定类 UI 只经 Driver 接口取内容；
-  无 key 时 ScriptedDriver 用同一批确定性信号离线生成同形状的结果，云端 Driver 接上后
-  即由真 LLM 产出。
+  Schema 结论与改进建议、结构 bug 的解释。前端只组装上下文并发起调用、渲染返回的
+  结构化结果；服务端的单次 LLM 调用失败或没配 key 时，ScriptedDriver 在服务端用同一批
+  确定性信号回落生成同形状的结果。
 
 ### 模拟模型（刻意做成可解释的近似）
 
@@ -129,7 +177,12 @@ labs/consistent-hashing/  一致性哈希实验室组件：只在分片 DB / NoS
 
 ## 验证状态
 
-- `npm install` / `npm run build`（含全仓 tsc 类型检查）通过；
+- `npm install` / `npm run build`（含全仓 tsc 类型检查）通过；前端 bundle 已核查：
+  不含任何题目数据（用例名、workload、DAU 等字符串零命中）；
+- 后端实测：`/api/health`、题目包下发（隐藏用例剥离验证无泄漏）、
+  `POST /api/submissions/judge`（Instagram 示例设计 3/9、结构发现与 Schema 信号齐全）、
+  `POST /api/evaluate` 三种 kind 在无 key 模式下走脚本回落并返回设计相关的追问/评审、
+  `POST /api/problems/generate` 对合法种子返回 501 契约、非法入参 400；
 - 无头验证过判卷逻辑：三道题的示例设计都是「可见用例过、隐藏 edge cases 挂」
   的教学形态；一份刻意做强的 Instagram 设计能达到 8/9；
 - 脚本驾驶员可离线完整跑完一轮（读指标 → 加压 → 注入事件 → 杀节点 → 跑用例 → Schema 评审）；

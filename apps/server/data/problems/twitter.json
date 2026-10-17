@@ -1,0 +1,612 @@
+{
+  "id": "twitter",
+  "name": "Design Twitter",
+  "nameEn": "Design Twitter",
+  "difficulty": "困难",
+  "tags": [
+    "Feed 流",
+    "fan-out",
+    "热点",
+    "时间线"
+  ],
+  "statement": "设计一个微博类应用：用户发推、关注他人、刷首页时间线。大 V 的一条推要在分钟级内出现在上亿粉丝的时间线里。",
+  "functionalRequirements": [
+    "发推（文本 + 媒体链接）",
+    "关注 / 取关",
+    "首页时间线：关注者推文按时间倒序聚合",
+    "点赞与转发计数"
+  ],
+  "scale": {
+    "dau": "3 亿 DAU",
+    "readRatio": 0.8,
+    "peakMultiplier": 3,
+    "baselineRps": 1500,
+    "budgetCostPerHour": 480,
+    "notes": "读:写 ≈ 4:1，时间线读取极重，头部用户粉丝过亿"
+  },
+  "flags": {
+    "mediaHeavy": false,
+    "hasFanout": true,
+    "publicWriteApi": true,
+    "readHeavy": true
+  },
+  "workload": {
+    "readRatio": 0.8,
+    "consistency": "时间线可最终一致；自己刚发的推必须立刻在自己时间线可见；计数（赞/转）允许近似，严禁负数与重复计。",
+    "fanoutFollowers": 5000,
+    "patterns": [
+      {
+        "id": "tw-w-timeline",
+        "name": "首页时间线拉取",
+        "kind": "read",
+        "description": "查关注列表后聚合各作者最新推文：读路径的绝对主力，推拉模式之争就发生在这里。",
+        "share": 0.5,
+        "path": [
+          "client",
+          "loadbalancer",
+          "appserver",
+          "feedservice",
+          "cache",
+          "nosql"
+        ],
+        "table": "follows",
+        "consistency": "eventual",
+        "terminalPerSec": 6000
+      },
+      {
+        "id": "tw-w-author",
+        "name": "按作者查推文",
+        "kind": "read",
+        "description": "进作者主页按时间倒序翻推文：按 author_id 查 + 排序，分片键与查询维度是否一致决定生死。",
+        "share": 0.2,
+        "path": [
+          "client",
+          "loadbalancer",
+          "appserver",
+          "cache",
+          "nosql"
+        ],
+        "table": "tweets",
+        "consistency": "eventual",
+        "terminalPerSec": 4000
+      },
+      {
+        "id": "tw-w-profile",
+        "name": "查用户资料",
+        "kind": "read",
+        "description": "按 user_id 主键直查：量级不大，但每条时间线都要批量带出作者资料。",
+        "share": 0.1,
+        "path": [
+          "client",
+          "loadbalancer",
+          "appserver",
+          "cache",
+          "relationaldb"
+        ],
+        "table": "users",
+        "consistency": "eventual",
+        "terminalPerSec": 1000
+      },
+      {
+        "id": "tw-w-post",
+        "name": "发推写入",
+        "kind": "write",
+        "description": "推文落库后触发 fan-out：普通用户推给粉丝时间线，大 V（粉丝过亿）必须改拉模式。",
+        "share": 0.08,
+        "path": [
+          "client",
+          "loadbalancer",
+          "appserver",
+          "queue",
+          "worker",
+          "nosql"
+        ],
+        "table": "tweets",
+        "consistency": "strong",
+        "terminalPerSec": 800
+      },
+      {
+        "id": "tw-w-engage",
+        "name": "点赞 / 转发计数",
+        "kind": "write",
+        "description": "计数写直接打在推文行上：热点推文的 like_count 是全站最热的一行。",
+        "share": 0.12,
+        "path": [
+          "client",
+          "loadbalancer",
+          "appserver",
+          "cache",
+          "nosql"
+        ],
+        "table": "tweets",
+        "consistency": "eventual",
+        "terminalPerSec": 3000
+      }
+    ]
+  },
+  "schema": {
+    "tables": [
+      {
+        "name": "users",
+        "engine": "relational",
+        "rows": 300000000,
+        "primaryKey": "user_id",
+        "primaryKeyGen": "snowflake",
+        "shardKey": null,
+        "fields": [
+          {
+            "name": "user_id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "handle",
+            "type": "varchar",
+            "indexed": true
+          },
+          {
+            "name": "created_at",
+            "type": "timestamp",
+            "indexed": false
+          }
+        ]
+      },
+      {
+        "name": "tweets",
+        "engine": "nosql",
+        "rows": 50000000000,
+        "primaryKey": "tweet_id",
+        "primaryKeyGen": "snowflake",
+        "shardKey": null,
+        "fields": [
+          {
+            "name": "tweet_id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "author_id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "content",
+            "type": "text",
+            "indexed": false
+          },
+          {
+            "name": "like_count",
+            "type": "bigint",
+            "indexed": false
+          },
+          {
+            "name": "created_at",
+            "type": "timestamp",
+            "indexed": true
+          }
+        ]
+      },
+      {
+        "name": "follows",
+        "engine": "nosql",
+        "rows": 20000000000,
+        "primaryKey": "id",
+        "primaryKeyGen": "snowflake",
+        "shardKey": "follower_id",
+        "fields": [
+          {
+            "name": "id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "follower_id",
+            "type": "bigint",
+            "indexed": true
+          },
+          {
+            "name": "followee_id",
+            "type": "bigint",
+            "indexed": true
+          }
+        ]
+      }
+    ],
+    "accessPatterns": [
+      {
+        "id": "tw-p1",
+        "name": "查用户资料",
+        "table": "users",
+        "kind": "read",
+        "byField": "user_id",
+        "perSec": 1000
+      },
+      {
+        "id": "tw-p2",
+        "name": "按作者查推文（时间倒序）",
+        "table": "tweets",
+        "kind": "read",
+        "byField": "author_id",
+        "needsSort": true,
+        "perSec": 4000
+      },
+      {
+        "id": "tw-p3",
+        "name": "时间线：查关注列表",
+        "table": "follows",
+        "kind": "read",
+        "byField": "follower_id",
+        "perSec": 6000
+      },
+      {
+        "id": "tw-p4",
+        "name": "点赞计数更新",
+        "table": "tweets",
+        "kind": "count",
+        "byField": "tweet_id",
+        "perSec": 3000
+      },
+      {
+        "id": "tw-p5",
+        "name": "发推写入",
+        "table": "tweets",
+        "kind": "write",
+        "byField": "author_id",
+        "perSec": 800
+      }
+    ]
+  },
+  "testCases": [
+    {
+      "id": "tw-baseline",
+      "name": "基线负载",
+      "description": "日常稳态 1,500 req/s，读:写 = 4:1。",
+      "hidden": false,
+      "weight": 1,
+      "traffic": {
+        "rps": 1500,
+        "readRatio": 0.8
+      },
+      "durationTicks": 30,
+      "thresholds": {
+        "maxErrorRate": 0.001,
+        "maxP99Ms": 500,
+        "maxHottestUtil": 0.95
+      },
+      "hint": "基线都过不了说明某层容量明显不足。"
+    },
+    {
+      "id": "tw-peak",
+      "name": "晚高峰 ×3",
+      "description": "晚高峰 4,500 req/s。",
+      "hidden": false,
+      "weight": 1,
+      "traffic": {
+        "rps": 4500,
+        "readRatio": 0.8
+      },
+      "durationTicks": 40,
+      "thresholds": {
+        "maxErrorRate": 0.01,
+        "maxP99Ms": 1000
+      },
+      "hint": "先扩利用率最高的一层。"
+    },
+    {
+      "id": "tw-cost",
+      "name": "成本上限",
+      "description": "基线下成本不超过 $480/h。",
+      "hidden": false,
+      "weight": 1,
+      "traffic": {
+        "rps": 1500,
+        "readRatio": 0.8
+      },
+      "durationTicks": 15,
+      "thresholds": {
+        "maxCostPerHour": 480
+      },
+      "hint": "成本大头通常在 DB 与计算副本数。"
+    },
+    {
+      "id": "tw-fanout",
+      "name": "大 V 发推 fan-out",
+      "description": "隐藏用例：头部大 V 发推，粉丝时间线写入瞬间放大。",
+      "hidden": true,
+      "weight": 2,
+      "traffic": {
+        "rps": 2000,
+        "readRatio": 0.8
+      },
+      "durationTicks": 45,
+      "events": [
+        {
+          "atTick": 3,
+          "type": "viral_post",
+          "magnitude": 5,
+          "durationTicks": 40
+        }
+      ],
+      "thresholds": {
+        "maxErrorRate": 0.02,
+        "maxStorageQps": 8000,
+        "maxQueueDepth": 800000
+      },
+      "exposesRule": "sync-fanout",
+      "hint": "推特的经典解：普通用户推模式 + 大 V 拉模式；无论哪种，fan-out 必须异步过队列。"
+    },
+    {
+      "id": "tw-stampede",
+      "name": "热点推文缓存雪崩",
+      "description": "隐藏用例：热门推文的缓存批量过期，读取回源放大。",
+      "hidden": true,
+      "weight": 2,
+      "traffic": {
+        "rps": 4500,
+        "readRatio": 0.8
+      },
+      "durationTicks": 40,
+      "events": [
+        {
+          "atTick": 3,
+          "type": "cache_stampede",
+          "magnitude": 1,
+          "durationTicks": 30
+        }
+      ],
+      "thresholds": {
+        "maxErrorRate": 0.01,
+        "maxP99Ms": 1000
+      },
+      "hint": "缓存层要开互斥重建，应用层要留回源余量。"
+    },
+    {
+      "id": "tw-hotshard",
+      "name": "热点分片",
+      "description": "隐藏用例：某话题爆了，写入集中砸向单个 key 区间。",
+      "hidden": true,
+      "weight": 2,
+      "traffic": {
+        "rps": 3500,
+        "readRatio": 0.8
+      },
+      "durationTicks": 40,
+      "events": [
+        {
+          "atTick": 3,
+          "type": "hot_key",
+          "targetType": "nosql",
+          "magnitude": 4,
+          "durationTicks": 30
+        }
+      ],
+      "thresholds": {
+        "maxErrorRate": 0.02,
+        "maxHottestUtil": 1
+      },
+      "exposesRule": "db-scale",
+      "hint": "分片键要高基数且分布均匀；单调键（时间）会把写打到同一片。"
+    },
+    {
+      "id": "tw-nodefail",
+      "name": "峰值期节点宕机",
+      "description": "隐藏用例：高峰期一个应用节点宕机。",
+      "hidden": true,
+      "weight": 2,
+      "traffic": {
+        "rps": 3500,
+        "readRatio": 0.8
+      },
+      "durationTicks": 40,
+      "kills": [
+        {
+          "componentType": "appserver",
+          "atTick": 5
+        }
+      ],
+      "thresholds": {
+        "maxErrorRate": 0.02
+      },
+      "exposesRule": "spof",
+      "hint": "同层多节点 + 余量才是冗余，只加副本数在同节点上不算。"
+    },
+    {
+      "id": "tw-rwflip",
+      "name": "读写比翻转",
+      "description": "隐藏用例：突发事件让发推量暴涨，读写比短暂翻转。",
+      "hidden": true,
+      "weight": 1,
+      "traffic": {
+        "rps": 2500,
+        "readRatio": 0.8
+      },
+      "durationTicks": 40,
+      "events": [
+        {
+          "atTick": 3,
+          "type": "rw_flip",
+          "magnitude": 1,
+          "durationTicks": 30
+        }
+      ],
+      "thresholds": {
+        "maxErrorRate": 0.02,
+        "maxP99Ms": 1000
+      },
+      "hint": "写路径单独核算容量，别只按读优化。"
+    }
+  ],
+  "sampleDesign": {
+    "nodes": [
+      {
+        "id": "tw-client",
+        "type": "client",
+        "x": 60,
+        "y": 300,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1
+        }
+      },
+      {
+        "id": "tw-gateway",
+        "type": "gateway",
+        "x": 200,
+        "y": 300,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1,
+          "rateLimitPerSec": 0
+        }
+      },
+      {
+        "id": "tw-lb",
+        "type": "loadbalancer",
+        "x": 330,
+        "y": 300,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1,
+          "lbAlgorithm": "round_robin"
+        }
+      },
+      {
+        "id": "tw-app",
+        "type": "appserver",
+        "x": 470,
+        "y": 300,
+        "settings": {
+          "replicas": 6,
+          "capacityScale": 1
+        }
+      },
+      {
+        "id": "tw-cache",
+        "type": "cache",
+        "x": 620,
+        "y": 160,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1,
+          "eviction": "LRU",
+          "mutexRebuild": false
+        }
+      },
+      {
+        "id": "tw-nosql",
+        "type": "nosql",
+        "x": 790,
+        "y": 160,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 3,
+          "readReplicas": 0,
+          "sharded": true,
+          "shardKey": "user_id",
+          "consistency": "eventual"
+        }
+      },
+      {
+        "id": "tw-feed",
+        "type": "feedservice",
+        "x": 620,
+        "y": 320,
+        "settings": {
+          "replicas": 3,
+          "capacityScale": 2
+        }
+      },
+      {
+        "id": "tw-db",
+        "type": "relationaldb",
+        "x": 790,
+        "y": 460,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1,
+          "readReplicas": 0,
+          "sharded": false,
+          "shardKey": "user_id",
+          "consistency": "eventual"
+        }
+      },
+      {
+        "id": "tw-queue",
+        "type": "queue",
+        "x": 620,
+        "y": 480,
+        "settings": {
+          "replicas": 1,
+          "capacityScale": 1
+        }
+      },
+      {
+        "id": "tw-worker",
+        "type": "worker",
+        "x": 790,
+        "y": 560,
+        "settings": {
+          "replicas": 4,
+          "capacityScale": 1
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "tw-client->tw-gateway",
+        "from": "tw-client",
+        "to": "tw-gateway"
+      },
+      {
+        "id": "tw-gateway->tw-lb",
+        "from": "tw-gateway",
+        "to": "tw-lb"
+      },
+      {
+        "id": "tw-lb->tw-app",
+        "from": "tw-lb",
+        "to": "tw-app"
+      },
+      {
+        "id": "tw-app->tw-cache",
+        "from": "tw-app",
+        "to": "tw-cache"
+      },
+      {
+        "id": "tw-cache->tw-nosql",
+        "from": "tw-cache",
+        "to": "tw-nosql"
+      },
+      {
+        "id": "tw-cache->tw-db",
+        "from": "tw-cache",
+        "to": "tw-db"
+      },
+      {
+        "id": "tw-app->tw-feed",
+        "from": "tw-app",
+        "to": "tw-feed"
+      },
+      {
+        "id": "tw-feed->tw-nosql",
+        "from": "tw-feed",
+        "to": "tw-nosql"
+      },
+      {
+        "id": "tw-app->tw-queue",
+        "from": "tw-app",
+        "to": "tw-queue"
+      },
+      {
+        "id": "tw-queue->tw-worker",
+        "from": "tw-queue",
+        "to": "tw-worker"
+      },
+      {
+        "id": "tw-worker->tw-nosql",
+        "from": "tw-worker",
+        "to": "tw-nosql"
+      }
+    ]
+  }
+}
