@@ -1,0 +1,496 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { componentDef } from '@sds/components';
+import { ConsistentHashLab } from '@sds/lab-consistent-hashing';
+import type { ProblemDef } from '@sds/problems';
+import type { Design, DesignNode, MetricsSnapshot, NodeSettings } from '@sds/sim-core';
+import { IconGlyph } from './icons';
+
+const SHARD_KEY_OPTIONS = ['user_id', 'author_id', 'photo_id', 'tweet_id', 'short_code', 'url_hash', 'created_at', 'timestamp'];
+
+interface DeepDiveProps {
+  node: DesignNode;
+  design: Design;
+  problem: ProblemDef;
+  snapshot: MetricsSnapshot | null;
+  queueHistory: number[];
+  locked: boolean;
+  killed: boolean;
+  onUpdateSettings: (id: string, settings: NodeSettings) => void;
+  onDelete: (id: string) => void;
+  onKill: (id: string) => void;
+  onRevive: (id: string) => void;
+}
+
+export function DeepDive(props: DeepDiveProps) {
+  const { node, design, problem, snapshot, locked } = props;
+  const def = componentDef(node.type);
+  const m = snapshot?.nodes[node.id];
+  const s = node.settings;
+  const update = (patch: Partial<NodeSettings>) =>
+    props.onUpdateSettings(node.id, { ...s, ...patch });
+
+  const upstream = design.edges
+    .filter((e) => e.to === node.id)
+    .map((e) => design.nodes.find((n) => n.id === e.from))
+    .filter(Boolean) as DesignNode[];
+  const downstream = design.edges
+    .filter((e) => e.from === node.id)
+    .map((e) => design.nodes.find((n) => n.id === e.to))
+    .filter(Boolean) as DesignNode[];
+  const share =
+    snapshot && snapshot.totalInQps > 0 && m ? (m.inQps / snapshot.totalInQps) * 100 : 0;
+  const isStorage = def.behavior === 'storage' && (node.type === 'relationaldb' || node.type === 'nosql');
+
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={{ color: def.color, display: 'inline-flex' }}>
+          <svg width="34" height="34" viewBox="0 0 48 48">
+            <IconGlyph icon={def.icon} size={44} />
+          </svg>
+        </span>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 16 }}>{node.label ?? def.name}</div>
+          <div style={{ color: '#94a3b8', fontSize: 12 }}>{def.nameEn} · {def.category}</div>
+        </div>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+          {props.killed ? (
+            <button onClick={() => props.onRevive(node.id)}>▶ 恢复</button>
+          ) : (
+            <button onClick={() => props.onKill(node.id)}>💥 模拟宕机</button>
+          )}
+          <button onClick={() => props.onDelete(node.id)} disabled={locked}>
+            删除
+          </button>
+        </div>
+      </div>
+      <p style={{ color: '#cbd5e1', fontSize: 13, margin: '8px 0' }}>{def.blurb}</p>
+
+      {/* live context from the running design */}
+      <div className="stat-grid">
+        <div className="stat"><b>{m ? Math.round(m.inQps) : '—'}</b><span>入站 req/s（占全局 {share.toFixed(0)}%）</span></div>
+        <div className="stat"><b>{m ? `${Math.round(m.util * 100)}%` : '—'}</b><span>利用率 · 容量 {Math.round(def.defaultCapacityPerReplica * s.replicas * s.capacityScale)}/s</span></div>
+        <div className="stat"><b>{m ? `${Math.round(m.latencyMs)}ms` : '—'}</b><span>当前延迟</span></div>
+        <div className="stat"><b>{m ? `${(m.errorRate * 100).toFixed(1)}%` : '—'}</b><span>该节点错误率</span></div>
+      </div>
+      <div style={{ fontSize: 12.5, color: '#94a3b8', margin: '6px 0 10px' }}>
+        上游：{upstream.length ? upstream.map((u) => componentDef(u.type).name).join('、') : '（无）'}
+        {' · '}下游：{downstream.length ? downstream.map((u) => componentDef(u.type).name).join('、') : '（无）'}
+      </div>
+
+      {/* settings */}
+      <fieldset disabled={locked} style={{ border: '1px solid #1e293b', borderRadius: 8 }}>
+        <legend style={{ fontSize: 12, color: '#94a3b8' }}>参数</legend>
+        <div className="form-row">
+          <label>
+            节点副本 replicas
+            <input
+              type="number"
+              min={1}
+              max={16}
+              value={s.replicas}
+              onChange={(e) => update({ replicas: Math.max(1, Number(e.target.value) || 1) })}
+            />
+          </label>
+          <label>
+            单副本容量系数
+            <select
+              value={s.capacityScale}
+              onChange={(e) => update({ capacityScale: Number(e.target.value) })}
+            >
+              <option value={0.5}>×0.5（小实例）</option>
+              <option value={1}>×1（标准）</option>
+              <option value={2}>×2（大实例）</option>
+              <option value={4}>×4（超大）</option>
+            </select>
+          </label>
+        </div>
+        {node.type === 'loadbalancer' && (
+          <label className="form-row">
+            负载策略
+            <select value={s.lbAlgorithm} onChange={(e) => update({ lbAlgorithm: e.target.value as NodeSettings['lbAlgorithm'] })}>
+              <option value="round_robin">轮询 Round Robin</option>
+              <option value="least_connections">最少连接</option>
+              <option value="consistent_hashing">一致性哈希</option>
+            </select>
+          </label>
+        )}
+        {node.type === 'gateway' && (
+          <label className="form-row">
+            限流阈值 req/s（0 = 关闭）
+            <input
+              type="number"
+              min={0}
+              step={100}
+              value={s.rateLimitPerSec ?? 0}
+              onChange={(e) => update({ rateLimitPerSec: Math.max(0, Number(e.target.value) || 0) })}
+            />
+          </label>
+        )}
+        {node.type === 'cache' && (
+          <div className="form-row">
+            <label>
+              淘汰策略
+              <select value={s.eviction} onChange={(e) => update({ eviction: e.target.value as NodeSettings['eviction'] })}>
+                <option value="LRU">LRU</option>
+                <option value="LFU">LFU</option>
+                <option value="TTL">TTL 过期</option>
+              </select>
+            </label>
+            <label style={{ alignSelf: 'end' }}>
+              <input
+                type="checkbox"
+                checked={!!s.mutexRebuild}
+                onChange={(e) => update({ mutexRebuild: e.target.checked })}
+              />{' '}
+              互斥重建（防雪崩/击穿）
+            </label>
+          </div>
+        )}
+        {isStorage && (
+          <>
+            <div className="form-row">
+              <label>
+                读副本数
+                <input
+                  type="number"
+                  min={0}
+                  max={8}
+                  value={s.readReplicas ?? 0}
+                  onChange={(e) => update({ readReplicas: Math.max(0, Number(e.target.value) || 0) })}
+                />
+              </label>
+              <label>
+                一致性
+                <select value={s.consistency} onChange={(e) => update({ consistency: e.target.value as NodeSettings['consistency'] })}>
+                  <option value="eventual">最终一致（读副本）</option>
+                  <option value="strong">强一致（走主库）</option>
+                </select>
+              </label>
+            </div>
+            <div className="form-row">
+              <label style={{ alignSelf: 'end' }}>
+                <input type="checkbox" checked={!!s.sharded} onChange={(e) => update({ sharded: e.target.checked })} />{' '}
+                开启分片
+              </label>
+              <label>
+                分片键
+                <select value={s.shardKey} onChange={(e) => update({ shardKey: e.target.value })} disabled={!s.sharded}>
+                  {SHARD_KEY_OPTIONS.map((k) => (
+                    <option key={k} value={k}>{k}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </>
+        )}
+      </fieldset>
+
+      {/* mechanism lab, fed with this node's live data */}
+      <h4 style={{ margin: '14px 0 6px' }}>🔬 模块实验室 · {def.labTitle}</h4>
+      <Lab
+        kind={def.lab}
+        node={node}
+        design={design}
+        problem={problem}
+        snapshot={snapshot}
+        queueHistory={props.queueHistory}
+      />
+
+      {/* interviewer question chain */}
+      <h4 style={{ margin: '16px 0 6px' }}>🎤 面试官追问链</h4>
+      <QuestionsForNode node={node} />
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ labs ---
+
+function Lab(props: {
+  kind: string;
+  node: DesignNode;
+  design: Design;
+  problem: ProblemDef;
+  snapshot: MetricsSnapshot | null;
+  queueHistory: number[];
+}) {
+  const { kind, node, snapshot, problem, design } = props;
+  const m = snapshot?.nodes[node.id];
+  const def = componentDef(node.type);
+
+  if (kind === 'consistent-hashing') {
+    const seedKeys = Array.from({ length: 40 }, (_, i) => `${node.type}:${i * 31 + 7}`);
+    return (
+      <div>
+        <div style={{ fontSize: 12.5, color: '#94a3b8', marginBottom: 6 }}>
+          这个 {def.name} 此刻入站 {m ? Math.round(m.inQps) : 0} req/s。下面这张环就是它的分片视图：
+          点「＋加一个分片」看只有约 1/N 的 key 需要迁移（对比普通取模的近全量迁移）。
+        </div>
+        <ConsistentHashLab compact seedKeys={seedKeys} />
+      </div>
+    );
+  }
+  if (kind === 'cache-lru') return <LruLab liveHit={m?.hitRate} />;
+  if (kind === 'lb-strategy') return <LbLab current={node.settings.lbAlgorithm ?? 'round_robin'} />;
+  if (kind === 'token-bucket') return <TokenBucketLab limit={node.settings.rateLimitPerSec ?? 0} liveIn={m?.inQps ?? 0} />;
+  if (kind === 'queue-backlog') {
+    // For a worker, the backlog lives in its upstream queue.
+    const queueNode =
+      node.type === 'queue'
+        ? node
+        : design.edges
+            .filter((e) => e.to === node.id)
+            .map((e) => design.nodes.find((n) => n.id === e.from))
+            .find((n) => n?.type === 'queue');
+    const qm = queueNode ? snapshot?.nodes[queueNode.id] : undefined;
+    const depth = qm?.queueDepth ?? 0;
+    const production = qm?.inQps ?? 0;
+    const consumerCap =
+      node.type === 'worker'
+        ? def.defaultCapacityPerReplica * node.settings.replicas * node.settings.capacityScale
+        : design.edges
+            .filter((e) => e.from === node.id)
+            .reduce((sum, e) => {
+              const t = design.nodes.find((n) => n.id === e.to);
+              return sum + (t ? componentDef(t.type).defaultCapacityPerReplica * t.settings.replicas : 0);
+            }, 0);
+    const hist = props.queueHistory;
+    const max = Math.max(10, ...hist);
+    const points = hist.map((v, i) => `${(i / Math.max(1, hist.length - 1)) * 260},${46 - (v / max) * 42}`).join(' ');
+    return (
+      <div style={{ fontSize: 13 }}>
+        <div>生产速率（入队）<b>{Math.round(production)}</b> 条/s · 消费能力 <b>{consumerCap}</b> 条/s · 当前积压 <b>{Math.round(depth)}</b> 条</div>
+        <svg width="260" height="50" style={{ background: '#0f172a', borderRadius: 6, marginTop: 6 }}>
+          <polyline points={points} fill="none" stroke="#e879f9" strokeWidth={1.8} />
+        </svg>
+        <div style={{ color: '#94a3b8', fontSize: 12 }}>
+          {consumerCap >= production
+            ? '消费 ≥ 生产，积压可控。扩容时先看这条曲线是否还在涨。'
+            : '⚠️ 消费 < 生产：积压会线性增长。队列只是在把故障往后推，必须扩消费者或降级生产端。'}
+        </div>
+      </div>
+    );
+  }
+  if (kind === 'feed-push-pull') {
+    const followers = problem.id === 'twitter' ? 5000 : 800;
+    const writeQps = m ? m.inQps * 0.2 : 0;
+    return (
+      <div style={{ fontSize: 13, lineHeight: 1.7 }}>
+        以平均粉丝 {followers} 估算：当前发帖约 {Math.round(writeQps)} 次/s。
+        <table className="mini-table">
+          <tbody>
+            <tr><td>推模式（写扩散）</td><td>每发一帖写 {followers} 份时间线 → {Math.round(writeQps * followers).toLocaleString()} 写/s；读极便宜</td></tr>
+            <tr><td>拉模式（读扩散）</td><td>发帖只写 1 份；每次刷 Feed 要聚合关注列表 → 读放大</td></tr>
+            <tr><td>混合（大 V 拉、普通推）</td><td>工业界标准答案：大 V 的 fan-out 才是灾难源，单独走拉</td></tr>
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+  if (kind === 'cdn-origin') {
+    const total = snapshot?.totalInQps ?? problem.scale.baselineRps;
+    return <CdnLab total={total} liveHit={m?.hitRate ?? 0.85} />;
+  }
+  if (kind === 'capacity') {
+    const cap = def.defaultCapacityPerReplica * node.settings.replicas * node.settings.capacityScale;
+    const now = m?.inQps ?? 0;
+    return (
+      <table className="mini-table">
+        <tbody>
+          {[1, 2, 3, 5].map((mult) => (
+            <tr key={mult}>
+              <td>流量 ×{mult}</td>
+              <td>入站 {Math.round(now * mult)} req/s · 利用率 {cap > 0 ? Math.round((now * mult / cap) * 100) : 0}% {now * mult > cap ? '⚠️ 饱和' : ''}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    );
+  }
+  // scale-estimate
+  return (
+    <div style={{ fontSize: 13, lineHeight: 1.7 }}>
+      <div>{problem.scale.notes}</div>
+      <div>平均 {problem.scale.baselineRps} req/s · 峰值 ×{problem.scale.peakMultiplier} = {problem.scale.baselineRps * problem.scale.peakMultiplier} req/s · 读占比 {Math.round(problem.scale.readRatio * 100)}%</div>
+      <div style={{ color: '#94a3b8' }}>先算量级，再谈架构：任何一层的容量规划都要从峰值 QPS 反推副本数。</div>
+    </div>
+  );
+}
+
+function LruLab({ liveHit }: { liveHit?: number }) {
+  const [running, setRunning] = useState(false);
+  const [slots, setSlots] = useState<(string | null)[]>(Array(8).fill(null));
+  const [stats, setStats] = useState({ hits: 0, misses: 0, current: '' });
+  const tickRef = useRef(0);
+  useEffect(() => {
+    if (!running) return;
+    const iv = window.setInterval(() => {
+      tickRef.current += 1;
+      const t = tickRef.current;
+      // Zipf-ish access pattern: a few hot keys dominate.
+      const pool = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
+      const r = Math.abs(Math.sin(t * 12.9898) * 43758.5453) % 1;
+      const key = pool[Math.min(9, Math.floor(Math.pow(r, 2.2) * 10))]!;
+      setSlots((prev) => {
+        const idx = prev.indexOf(key);
+        setStats((st) => ({
+          hits: st.hits + (idx >= 0 ? 1 : 0),
+          misses: st.misses + (idx >= 0 ? 0 : 1),
+          current: key,
+        }));
+        if (idx >= 0) {
+          const next = [...prev];
+          next.splice(idx, 1);
+          next.unshift(key);
+          return next;
+        }
+        return [key, ...prev.slice(0, 7)];
+      });
+    }, 350);
+    return () => window.clearInterval(iv);
+  }, [running]);
+  const total = stats.hits + stats.misses;
+  const rate = total ? Math.round((stats.hits / total) * 100) : 0;
+  return (
+    <div style={{ fontSize: 13 }}>
+      <div style={{ display: 'flex', gap: 5, margin: '6px 0' }}>
+        {slots.map((k, i) => (
+          <div
+            key={i}
+            style={{
+              width: 34, height: 34, borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              background: k && k === stats.current ? '#854d0e' : '#1e293b', border: '1px solid #334155', fontWeight: 700,
+            }}
+          >
+            {k ?? '·'}
+          </div>
+        ))}
+        <span style={{ alignSelf: 'center', color: '#94a3b8' }}>← 最近使用</span>
+      </div>
+      <div>
+        实验室命中率 <b>{rate}%</b>（{stats.hits}/{total}）· 线上该节点命中率{' '}
+        <b>{liveHit !== undefined ? `${Math.round(liveHit * 100)}%` : '—'}</b>
+      </div>
+      <button onClick={() => setRunning(!running)} style={{ marginTop: 6 }}>
+        {running ? '⏸ 暂停' : '▶ 跑一遍访问流'}
+      </button>
+      <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 4 }}>
+        访问呈 Zipf 分布（少数热点 key 占大多数请求）时 LRU 命中率不错；一旦热点整体轮换（如整点过期），命中率会瞬间塌掉——那就是雪崩。
+      </div>
+    </div>
+  );
+}
+
+function LbLab({ current }: { current: string }) {
+  // Three instances with speeds 1 / 0.5 / 0.25 sharing 1,800 req/s.
+  const rows = [
+    { name: '轮询', id: 'round_robin', per: [600, 600, 600], note: '均分流量：慢实例利用率 240%，先被压垮' },
+    { name: '最少连接', id: 'least_connections', per: [900, 570, 330], note: '按在途请求分流：利用率大致拉平' },
+    { name: '一致性哈希', id: 'consistent_hashing', per: [780, 640, 380], note: '按 key 分布：倾斜取决于 key 的均匀程度，胜在会话亲和' },
+  ];
+  return (
+    <div style={{ fontSize: 13 }}>
+      {rows.map((r) => (
+        <div key={r.id} style={{ marginBottom: 8, opacity: current === r.id ? 1 : 0.75 }}>
+          <div>
+            <b>{r.name}</b>
+            {current === r.id && <span style={{ color: '#4ade80' }}>（当前策略）</span>} — {r.note}
+          </div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            {r.per.map((v, i) => (
+              <div key={i} style={{ flex: v, background: ['#60a5fa', '#facc15', '#f87171'][i], borderRadius: 4, padding: '2px 6px', fontSize: 11.5, minWidth: 54 }}>
+                实例{i + 1} {v}/s
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+      <div style={{ color: '#94a3b8', fontSize: 12 }}>场景：3 个实例速度比 1 : 0.5 : 0.25，总流量 1,800 req/s。策略选错，LB 就成了倾斜放大器。</div>
+    </div>
+  );
+}
+
+function TokenBucketLab({ limit, liveIn }: { limit: number; liveIn: number }) {
+  const [rate, setRate] = useState(limit > 0 ? limit : 1000);
+  const [tokens, setTokens] = useState(limit > 0 ? limit : 1000);
+  const [counts, setCounts] = useState({ ok: 0, dropped: 0 });
+  const [playing, setPlaying] = useState(false);
+  useEffect(() => {
+    if (!playing) return;
+    const iv = window.setInterval(() => {
+      const arrivals = Math.round(liveIn > 0 ? liveIn / 4 : 300);
+      setTokens((t) => {
+        const filled = Math.min(rate, t + rate / 4);
+        const ok = Math.min(filled, arrivals);
+        setCounts((c) => ({ ok: c.ok + ok, dropped: c.dropped + (arrivals - ok) }));
+        return filled - ok;
+      });
+    }, 250);
+    return () => window.clearInterval(iv);
+  }, [playing, rate, liveIn]);
+  return (
+    <div style={{ fontSize: 13 }}>
+      <label>
+        令牌生成速率（= 限流阈值）：{rate}/s
+        <input type="range" min={100} max={5000} step={100} value={rate} onChange={(e) => setRate(Number(e.target.value))} style={{ width: '100%' }} />
+      </label>
+      <div style={{ height: 14, background: '#1e293b', borderRadius: 7, margin: '6px 0' }}>
+        <div style={{ height: 14, borderRadius: 7, background: '#f472b6', width: `${(tokens / rate) * 100}%`, transition: 'width .2s' }} />
+      </div>
+      <div>桶内令牌 {Math.round(tokens)} · 已放行 {counts.ok} · 已限流 {counts.dropped}</div>
+      <button onClick={() => setPlaying(!playing)} style={{ marginTop: 6 }}>{playing ? '⏸ 暂停' : '▶ 用线上流量压测'}</button>
+      <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 4 }}>
+        令牌桶允许突发（桶里攒的令牌），但长期速率受生成速率封顶。阈值要按下游真实容量反推。
+        {limit === 0 && ' 当前线上网关限流是关闭的（阈值 0）——结构检查会点名这一条。'}
+      </div>
+    </div>
+  );
+}
+
+function CdnLab({ total, liveHit }: { total: number; liveHit: number }) {
+  const [hit, setHit] = useState(Math.round(liveHit * 100));
+  const origin = Math.round(total * (1 - hit / 100));
+  return (
+    <div style={{ fontSize: 13 }}>
+      <label>
+        命中率：{hit}%
+        <input type="range" min={0} max={99} value={hit} onChange={(e) => setHit(Number(e.target.value))} style={{ width: '100%' }} />
+      </label>
+      <div>总流量 {Math.round(total)} req/s → 回源 <b>{origin}</b> req/s</div>
+      <div style={{ color: '#94a3b8', fontSize: 12 }}>
+        命中率每掉 10 个点，回源就多扛一大截——这就是为什么命中率 85% → 15% 的雪崩能直接打爆源站。
+      </div>
+    </div>
+  );
+}
+
+export function QuestionsForNode({ node }: { node: DesignNode }) {
+  const def = componentDef(node.type);
+  const [open, setOpen] = useState<number | null>(null);
+  return (
+    <div>
+      {def.questions.map((item, i) => (
+        <div key={i} style={{ border: '1px solid #1e293b', borderRadius: 8, padding: '8px 10px', marginBottom: 8 }}>
+          <div style={{ fontSize: 13.5 }}>
+            <span className={`chip chip-${item.level}`}>{item.level}</span> {item.question}
+          </div>
+          {open === i ? (
+            <ul style={{ margin: '6px 0 2px', paddingLeft: 18, color: '#cbd5e1', fontSize: 12.5 }}>
+              {item.keyPoints.map((kp, j) => (
+                <li key={j}>{kp}</li>
+              ))}
+              <li>
+                <button onClick={() => setOpen(null)}>收起要点</button>
+              </li>
+            </ul>
+          ) : (
+            <button onClick={() => setOpen(i)} style={{ marginTop: 6 }}>
+              先想 10 秒，再看要点
+            </button>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+

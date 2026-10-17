@@ -1,0 +1,1 @@
+{"dependencies":{"@sds/components":"0.1.0","@sds/sim-core":"0.1.0"},"exports":{".":"./src/index.ts"},"main":"src/index.ts","name":"@sds/problems","type":"module","types":"src/index.ts","version":"0.1.0"}
