@@ -154,6 +154,15 @@ export interface ProblemDef {
   testCases: TestCase[];
   /** A decent-but-flawed starting design (the interview "sample answer"). */
   sampleDesign: Design;
+  /**
+   * Admin-only reference solution ("model answer"), produced by the LLM
+   * problem generator and merged into the pack only after the author
+   * accepts a validated generation draft: the generator's reference
+   * design + schema, proven by the simulator to pass the whole suite.
+   * NEVER served to the solver app — packs.ts strips it from the client
+   * projection; only admin endpoints may expose it.
+   */
+  referenceSolution?: { design: Design; schema: ProblemSchema };
 }
 
 // ---------------------------------------------------------------- helpers ---

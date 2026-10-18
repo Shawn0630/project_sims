@@ -13,7 +13,7 @@ import type { ProblemDef, TestCase } from '@sds/problems';
  */
 export type ClientTestCase = TestCase & { locked: boolean };
 
-export type ClientProblemPack = Omit<ProblemDef, 'testCases'> & {
+export type ClientProblemPack = Omit<ProblemDef, 'testCases' | 'referenceSolution'> & {
   testCases: ClientTestCase[];
 };
 
@@ -36,5 +36,9 @@ export function toClientCase(tc: TestCase): ClientTestCase {
 }
 
 export function toClientPack(pack: ProblemDef): ClientProblemPack {
-  return { ...pack, testCases: pack.testCases.map(toClientCase) };
+  // referenceSolution is the admin-only model answer: it must NEVER reach
+  // the solver app, so it is dropped here — the single projection every
+  // solver-facing pack response flows through.
+  const { referenceSolution: _referenceSolution, ...rest } = pack;
+  return { ...rest, testCases: pack.testCases.map(toClientCase) };
 }

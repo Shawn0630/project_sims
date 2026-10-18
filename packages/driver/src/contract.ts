@@ -908,3 +908,384 @@ export function parseProbeCases(json: unknown): ProbeCase[] {
   }
   return out;
 }
+
+// ------------------------------------------------------- problem generation ---
+//
+// The fourth system: LLM problem generation. Where the prober proposes
+// cases for ONE design and the simulator grades the predictions, the
+// generator proposes content for the PROBLEM BANK: new test cases for an
+// existing problem PLUS a complete reference solution (design + schema)
+// meant to pass the problem's whole suite. The same philosophy applies —
+// the LLM proposes, the simulator arbitrates: the server runs the
+// reference against the existing suite, the generated cases and the weak
+// sample design before anything may be merged (see apps/server generate
+// pipeline). Nothing the model emits is trusted at face value.
+//
+// The shapes below mirror @sds/problems' TestCase / ProblemSchema and
+// @sds/sim-core's Design (structurally — the contract package stays free
+// of a problems dependency, like the *Like shapes above). Node positions
+// (x/y) are NOT part of the model's output; the server lays the design
+// out when it assembles the real Design.
+
+/**
+ * The house standards handed to the generator: threshold conventions in
+ * CHECKER units (fractions, absolute RPS), what the engine can execute,
+ * and the two contracts its output will be held to — the reference must
+ * solve everything, and the new cases must discriminate.
+ */
+export const GENERATION_CRITERIA = `出题标准（本系统的口径，生成的用例与参考解都按这套来判）：
+- 用例形状：traffic.rps 是绝对值（相对题目基线 RPS 的 0.2–10 倍之间取值）；traffic.readRatio 0–1；durationTicks 10–120（1 tick ≈ 1 秒）；events 至多 3 个，类型只能取 viral_post（网红爆帖）/ cache_stampede（缓存雪崩）/ hot_key（热点 key）/ peak（流量峰值）/ rw_flip（读写比翻转），可带 targetType（组件类型）、magnitude（1–10）、atTick、durationTicks；kills 至多 3 个，按组件类型在 atTick 杀节点。
+- 阈值口径（checker 单位：错误率/利用率是 0–1 的小数，不是百分数）：基线场景 maxErrorRate 0.001、maxP99Ms 按题面延迟要求（一般 400–500）、maxHottestUtil 0.95；峰值/事件场景 maxErrorRate 0.01–0.02、maxP99Ms 1000 以内；成本红线 maxCostPerHour 不超过题目预算；maxStaleReadRate 红线 0.05；maxStorageQps 按存储层可承受入站设；每个用例至少给一项阈值。
+- 区分度（新用例的价值所在）：隐藏用例要能让"凑合的示例级设计"翻车、又让一份认真的参考解通过——阈值严到参考解也过不了的用例是无效用例（会被系统剔除），松到弱设计也能过的隐藏用例会被标记弱区分度。优先攻击题目已有的考点维度（热点、雪崩、单点、成本、一致性），但不要克隆现有用例的场景。
+- 参考解契约：referenceSolution 必须能通过这道题的【全部现有用例 + 你新生成的全部用例】——系统会拿它逐例真跑，挂任何一例，整份生成作废。设计只能用组件目录里的类型与合法参数；schema 要覆盖题目的访问模式（主键/索引/分片键选型要经得起推敲），行数规模与题面量级一致。`;
+
+/** Everything the generator may look at for ONE existing problem. */
+export interface GenerationContext {
+  problemName: string;
+  statement: string;
+  functionalRequirements: string[];
+  /** Scale facts rendered for the prompt （量级/基线/峰值/预算/读写比/备注）. */
+  scaleSummary: string;
+  /** This problem's read/write workload profile, rendered. */
+  workloadSummary: string;
+  /** The judging standards (GENERATION_CRITERIA). */
+  criteria: string;
+  /**
+   * Existing cases by NAME + one-line description only — enough to avoid
+   * cloning a scenario, deliberately without their traffic/thresholds.
+   */
+  existingCases: { name: string; description: string; hidden: boolean }[];
+  /** Component catalog: types, behavior, capacities, costs, legal settings. */
+  componentCatalog: string;
+  /** The pack's starter schema, rendered (tables + access patterns). */
+  schemaSummary: string;
+  /** How many NEW cases to generate. */
+  caseCount: number;
+  /** Author steer, when given (e.g. 「多出一致性方面的用例」). */
+  focus?: string;
+  /** Numeric anchors for the parser's clamps. */
+  baselineRps: number;
+  defaultReadRatio: number;
+}
+
+export interface GeneratedCaseEvent {
+  atTick: number;
+  type: EventType;
+  targetType?: ComponentTypeId;
+  magnitude?: number;
+  durationTicks?: number;
+}
+
+export interface GeneratedCaseKill {
+  componentType: ComponentTypeId;
+  atTick: number;
+}
+
+/** Thresholds in checker units (fractions) — the real TestCase shape. */
+export interface GeneratedCaseThresholds {
+  maxErrorRate?: number;
+  maxP99Ms?: number;
+  maxCostPerHour?: number;
+  maxStorageQps?: number;
+  maxStaleReadRate?: number;
+  maxHottestUtil?: number;
+  maxQueueDepth?: number;
+}
+
+/** One generated test case, in the real TestCase shape (post-clamp). */
+export interface GeneratedCase {
+  /** As proposed (may be empty/invalid/duplicated) — the server uniquifies. */
+  id: string;
+  name: string;
+  description: string;
+  hidden: boolean;
+  weight: number;
+  traffic: { rps: number; readRatio: number };
+  durationTicks: number;
+  events: GeneratedCaseEvent[];
+  kills: GeneratedCaseKill[];
+  thresholds: GeneratedCaseThresholds;
+  hint: string;
+  exposesRule?: string;
+}
+
+export interface GeneratedDesignNode {
+  id: string;
+  type: ComponentTypeId;
+  /** Raw settings bag (scalar values only) — semantically validated server-side. */
+  settings: Record<string, string | number | boolean>;
+}
+
+export interface GeneratedDesign {
+  nodes: GeneratedDesignNode[];
+  edges: { from: string; to: string }[];
+}
+
+export interface GeneratedSchemaField {
+  name: string;
+  type: string;
+  indexed: boolean;
+  blob?: boolean;
+}
+
+export interface GeneratedSchemaTable {
+  name: string;
+  engine: 'relational' | 'nosql';
+  rows: number;
+  primaryKey: string;
+  primaryKeyGen: 'auto' | 'snowflake' | 'uuid' | 'business';
+  shardKey: string | null;
+  fields: GeneratedSchemaField[];
+}
+
+export interface GeneratedAccessPattern {
+  id: string;
+  name: string;
+  table: string;
+  kind: 'read' | 'write' | 'count';
+  byField: string;
+  needsSort?: boolean;
+  perSec: number;
+}
+
+export interface GeneratedSchema {
+  tables: GeneratedSchemaTable[];
+  accessPatterns: GeneratedAccessPattern[];
+}
+
+export interface ParsedGeneration {
+  cases: GeneratedCase[];
+  referenceSolution: { design: GeneratedDesign; schema: GeneratedSchema };
+}
+
+export function buildGenerationPrompt(ctx: GenerationContext): { system: string; user: string } {
+  return {
+    system:
+      '你是一位资深系统设计面试题出题人，正在为一道已有题目扩充题库。你要产出两样东西：一批新的测试用例，和一份完整的参考解（架构设计 + 数据库 schema）。参考解不是样子货——系统会拿它跑遍这道题的全部现有用例和你新出的全部用例，挂掉任何一例，整份生成都会被驳回。所以先想清楚一份真正能过关的设计长什么样，再围绕这道题的考点出能区分强弱设计的新用例。只输出 JSON，不要输出其它文字。',
+    user:
+      `题目：${ctx.problemName}\n题面：${ctx.statement}\n` +
+      `功能需求：\n${ctx.functionalRequirements.map((r) => `- ${r}`).join('\n') || '（无）'}\n\n` +
+      `量级：${ctx.scaleSummary}\n\n` +
+      `本题读写需求：${ctx.workloadSummary}\n\n` +
+      `现有用例（只给名称与一句话说明，供你避开重复场景；参数不要猜、更不要克隆）：\n` +
+      `${ctx.existingCases.map((c) => `- ${c.hidden ? '🔒' : '👁'} ${c.name}：${c.description}`).join('\n') || '（无）'}\n\n` +
+      `组件目录（参考解只能使用这些组件类型与合法参数）：\n${ctx.componentCatalog}\n\n` +
+      `题目自带的 schema 草稿（参考解的 schema 可以在此基础上改进，但要覆盖同样的访问模式）：\n${ctx.schemaSummary}\n\n` +
+      `${ctx.criteria}\n\n` +
+      `本次生成 ${ctx.caseCount} 个新用例${ctx.focus ? `，作者指定的侧重：${ctx.focus}` : ''}。可见/隐藏搭配：多数设为隐藏（hidden=true），可留 0–1 个可见基线型。\n\n` +
+      `输出 JSON：{"cases":[{"id":"小写连字符 id","name":"用例名（点明场景）","description":"一句话说明","hidden":true,"weight":2,"traffic":{"rps":2500,"readRatio":0.97},"durationTicks":40,"events":[{"atTick":3,"type":"hot_key","targetType":"relationaldb","magnitude":3,"durationTicks":30}],"kills":[{"componentType":"appserver","atTick":5}],"thresholds":{"maxErrorRate":0.02,"maxP99Ms":1000},"hint":"挂了之后给候选人看的修复方向","exposesRule":"spof"}],"referenceSolution":{"design":{"nodes":[{"id":"节点id","type":"cache","settings":{"replicas":2,"mutexRebuild":true}}],"edges":[{"from":"上游节点id","to":"下游节点id"}]},"schema":{"tables":[{"name":"urls","engine":"relational","rows":1000000000,"primaryKey":"id","primaryKeyGen":"snowflake","shardKey":"short_code","fields":[{"name":"id","type":"bigint","indexed":true}]}],"accessPatterns":[{"id":"p1","name":"按短码跳转","table":"urls","kind":"read","byField":"short_code","perSec":5000}]}}}\n` +
+      `events/kills 没有就给空数组；thresholds 至少一项；settings 只给与默认不同的参数即可（replicas/capacityScale 通用；网关 rateLimitPerSec；缓存 mutexRebuild/eviction；负载均衡 lbAlgorithm；关系型 DB 与 NoSQL 的 sharded/shardKey/readReplicas/consistency）；design 的每个节点都要有至少一条连线，流量从 client 出发要能走到存储层。`,
+  };
+}
+
+const GEN_EVENT_TYPES: readonly string[] = ['viral_post', 'cache_stampede', 'hot_key', 'peak', 'rw_flip'];
+const PK_GENS: readonly string[] = ['auto', 'snowflake', 'uuid', 'business'];
+const PATTERN_KINDS: readonly string[] = ['read', 'write', 'count'];
+
+function normalizeGeneratedCase(
+  raw: unknown,
+  opts: { baselineRps: number; defaultReadRatio: number },
+): GeneratedCase | null {
+  const o = raw as Record<string, unknown> | null;
+  if (!o || typeof o !== 'object' || typeof o.name !== 'string' || !o.name.trim()) return null;
+  const durationTicks = Math.round(clampNum(o.durationTicks, 10, 120) ?? 40);
+  const t = (o.traffic ?? {}) as Record<string, unknown>;
+  const rps = clampNum(t.rps, 10, Math.max(100, opts.baselineRps * 10)) ?? opts.baselineRps;
+  const readRatio = clampNum(t.readRatio, 0, 1) ?? opts.defaultReadRatio;
+
+  const events: GeneratedCaseEvent[] = [];
+  if (Array.isArray(o.events)) {
+    for (const e of o.events.slice(0, 3)) {
+      const ev = e as Record<string, unknown>;
+      if (!ev || !GEN_EVENT_TYPES.includes(String(ev.type))) continue;
+      events.push({
+        atTick: Math.round(clampNum(ev.atTick, 1, durationTicks) ?? 3),
+        type: String(ev.type) as EventType,
+        ...(COMPONENT_TYPE_IDS.includes(String(ev.targetType))
+          ? { targetType: String(ev.targetType) as ComponentTypeId }
+          : {}),
+        magnitude: clampNum(ev.magnitude, 1, 10) ?? 3,
+        durationTicks: Math.round(clampNum(ev.durationTicks, 1, 60) ?? 20),
+      });
+    }
+  }
+  const kills: GeneratedCaseKill[] = [];
+  if (Array.isArray(o.kills)) {
+    for (const k of o.kills.slice(0, 3)) {
+      const kk = k as Record<string, unknown>;
+      const type = String(kk?.componentType ?? '');
+      if (!COMPONENT_TYPE_IDS.includes(type)) continue;
+      if (kills.some((x) => x.componentType === type)) continue;
+      kills.push({
+        componentType: type as ComponentTypeId,
+        atTick: Math.round(clampNum(kk.atTick, 1, durationTicks) ?? 5),
+      });
+    }
+  }
+
+  const th = (o.thresholds ?? {}) as Record<string, unknown>;
+  const thresholds: GeneratedCaseThresholds = {};
+  const err = clampNum(th.maxErrorRate, 0.0005, 0.5);
+  if (err !== undefined) thresholds.maxErrorRate = err;
+  const p99 = clampNum(th.maxP99Ms, 50, 10_000);
+  if (p99 !== undefined) thresholds.maxP99Ms = p99;
+  const cost = clampNum(th.maxCostPerHour, 1, 100_000);
+  if (cost !== undefined) thresholds.maxCostPerHour = cost;
+  const sqps = clampNum(th.maxStorageQps, 10, 1_000_000);
+  if (sqps !== undefined) thresholds.maxStorageQps = sqps;
+  const stale = clampNum(th.maxStaleReadRate, 0.001, 1);
+  if (stale !== undefined) thresholds.maxStaleReadRate = stale;
+  const hot = clampNum(th.maxHottestUtil, 0.5, 1);
+  if (hot !== undefined) thresholds.maxHottestUtil = hot;
+  const qd = clampNum(th.maxQueueDepth, 10, 10_000_000);
+  if (qd !== undefined) thresholds.maxQueueDepth = qd;
+  if (Object.keys(thresholds).length === 0) return null; // nothing to judge against
+
+  const exposesRaw = typeof o.exposesRule === 'string' ? o.exposesRule.trim() : '';
+  return {
+    id: typeof o.id === 'string' ? o.id.trim().slice(0, 64) : '',
+    name: o.name.trim().slice(0, 60),
+    description: typeof o.description === 'string' ? o.description.trim().slice(0, 300) : '',
+    hidden: o.hidden !== false,
+    weight: clampNum(o.weight, 0.5, 3) ?? 1,
+    traffic: { rps: Math.round(rps), readRatio },
+    durationTicks,
+    events,
+    kills,
+    thresholds,
+    hint: typeof o.hint === 'string' ? o.hint.trim().slice(0, 300) : '',
+    ...(/^[a-z0-9-]{1,40}$/.test(exposesRaw) ? { exposesRule: exposesRaw } : {}),
+  };
+}
+
+function normalizeGeneratedSchema(raw: unknown): GeneratedSchema | null {
+  const o = raw as { tables?: unknown; accessPatterns?: unknown } | null;
+  if (!o || !Array.isArray(o.tables)) return null;
+  const tables: GeneratedSchemaTable[] = [];
+  const seen = new Set<string>();
+  for (const t of o.tables.slice(0, 12)) {
+    const tb = t as Record<string, unknown> | null;
+    if (!tb || typeof tb.name !== 'string' || !tb.name.trim()) continue;
+    const name = tb.name.trim().slice(0, 60);
+    if (seen.has(name) || typeof tb.primaryKey !== 'string' || !tb.primaryKey.trim()) continue;
+    seen.add(name);
+    const fields: GeneratedSchemaField[] = [];
+    if (Array.isArray(tb.fields)) {
+      for (const f of tb.fields.slice(0, 24)) {
+        const fd = f as Record<string, unknown> | null;
+        if (!fd || typeof fd.name !== 'string' || !fd.name.trim() || typeof fd.type !== 'string') {
+          continue;
+        }
+        fields.push({
+          name: fd.name.trim().slice(0, 60),
+          type: fd.type.slice(0, 40),
+          indexed: fd.indexed === true,
+          ...(fd.blob === true ? { blob: true } : {}),
+        });
+      }
+    }
+    tables.push({
+      name,
+      engine: tb.engine === 'nosql' ? 'nosql' : 'relational',
+      rows: Math.round(clampNum(tb.rows, 1, 1_000_000_000_000) ?? 1_000_000),
+      primaryKey: tb.primaryKey.trim().slice(0, 60),
+      primaryKeyGen: (PK_GENS.includes(String(tb.primaryKeyGen))
+        ? String(tb.primaryKeyGen)
+        : 'snowflake') as GeneratedSchemaTable['primaryKeyGen'],
+      shardKey:
+        typeof tb.shardKey === 'string' && tb.shardKey.trim()
+          ? tb.shardKey.trim().slice(0, 60)
+          : null,
+      fields,
+    });
+  }
+  if (!tables.length) return null;
+  const accessPatterns: GeneratedAccessPattern[] = [];
+  if (Array.isArray(o.accessPatterns)) {
+    for (const p of o.accessPatterns.slice(0, 16)) {
+      const ap = p as Record<string, unknown> | null;
+      if (
+        !ap ||
+        typeof ap.name !== 'string' ||
+        !ap.name.trim() ||
+        typeof ap.table !== 'string' ||
+        !seen.has(ap.table) ||
+        typeof ap.byField !== 'string' ||
+        !ap.byField.trim() ||
+        !PATTERN_KINDS.includes(String(ap.kind))
+      ) {
+        continue;
+      }
+      accessPatterns.push({
+        id: typeof ap.id === 'string' && ap.id.trim() ? ap.id.trim().slice(0, 40) : `gp-${accessPatterns.length + 1}`,
+        name: ap.name.trim().slice(0, 60),
+        table: ap.table,
+        kind: String(ap.kind) as GeneratedAccessPattern['kind'],
+        byField: ap.byField.trim().slice(0, 60),
+        ...(ap.needsSort === true ? { needsSort: true } : {}),
+        perSec: Math.round(clampNum(ap.perSec, 0, 1_000_000) ?? 0),
+      });
+    }
+  }
+  return { tables, accessPatterns };
+}
+
+function normalizeGeneratedDesign(raw: unknown): GeneratedDesign | null {
+  const o = raw as { nodes?: unknown; edges?: unknown } | null;
+  if (!o || !Array.isArray(o.nodes)) return null;
+  const nodes: GeneratedDesignNode[] = [];
+  for (const n of o.nodes.slice(0, 24)) {
+    const nd = n as Record<string, unknown> | null;
+    if (!nd || typeof nd.id !== 'string' || !nd.id.trim()) continue;
+    if (!COMPONENT_TYPE_IDS.includes(String(nd.type))) continue;
+    const settings: Record<string, string | number | boolean> = {};
+    if (nd.settings && typeof nd.settings === 'object') {
+      for (const [k, v] of Object.entries(nd.settings as Record<string, unknown>)) {
+        if (typeof v === 'string' || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v))) {
+          settings[k] = v;
+        }
+      }
+    }
+    nodes.push({ id: nd.id.trim().slice(0, 60), type: String(nd.type) as ComponentTypeId, settings });
+  }
+  if (!nodes.length) return null;
+  const edges: { from: string; to: string }[] = [];
+  if (Array.isArray(o.edges)) {
+    for (const e of o.edges.slice(0, 40)) {
+      const ed = e as { from?: unknown; to?: unknown } | null;
+      if (ed && typeof ed.from === 'string' && typeof ed.to === 'string' && ed.from !== ed.to) {
+        edges.push({ from: ed.from, to: ed.to });
+      }
+    }
+  }
+  return { nodes, edges };
+}
+
+/**
+ * Parse the generator's reply. Throws only when the reply is unusable as a
+ * whole (no cases survive, no design, no schema) — the host then reports
+ * the generation as failed rather than storing a hollow draft. Individual
+ * malformed cases are dropped, like the probe parser.
+ */
+export function parseGeneration(
+  json: unknown,
+  opts: { baselineRps: number; defaultReadRatio: number },
+): ParsedGeneration {
+  const o = json as { cases?: unknown; referenceSolution?: unknown } | null;
+  if (!o || typeof o !== 'object') throw new Error('generation: bad shape');
+  const cases: GeneratedCase[] = [];
+  if (Array.isArray(o.cases)) {
+    for (const raw of o.cases) {
+      const gc = normalizeGeneratedCase(raw, opts);
+      if (gc) cases.push(gc);
+      if (cases.length >= 8) break;
+    }
+  }
+  if (!cases.length) throw new Error('generation: no usable cases');
+  const ref = (o.referenceSolution ?? {}) as { design?: unknown; schema?: unknown };
+  const design = normalizeGeneratedDesign(ref.design);
+  if (!design) throw new Error('generation: reference design unusable');
+  const schema = normalizeGeneratedSchema(ref.schema);
+  if (!schema) throw new Error('generation: reference schema unusable');
+  return { cases, referenceSolution: { design, schema } };
+}
