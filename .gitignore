@@ -7,3 +7,5 @@ dist/
 .DS_Store
 # LLM call log: may contain user design data — local only, never committed.
 apps/server/data/llm-calls.jsonl
+# LLM model profiles: contains API keys — local only, never committed.
+apps/server/data/llm-config.json

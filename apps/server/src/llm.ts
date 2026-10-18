@@ -1,4 +1,3 @@
-import process from 'node:process';
 import type { SchemaReviewReport } from '@sds/checker';
 import {
   ScriptedDriver,
@@ -22,6 +21,7 @@ import {
 } from '@sds/driver';
 import type { ProblemSchema } from '@sds/problems';
 import { appendCall } from './calllog';
+import { resolveActiveProfile } from './llmconfig';
 
 /**
  * The LLM eval system's server half.
@@ -30,12 +30,13 @@ import { appendCall } from './calllog';
  * per request: the prompt is assembled by the SAME builders the driver
  * contract defines (@sds/driver), the reply is parsed by the contract's
  * defensive parsers, and the structured result goes back to the frontend,
- * which only renders it. Configuration comes from server env — the browser
- * never holds an LLM key:
+ * which only renders it. Configuration comes from the server's active
+ * model PROFILE (llmconfig.ts — admin-editable, resolved per call); the
+ * browser never holds an LLM key:
  *
- *   LLM_BASE_URL  (default https://api.openai.com/v1)
- *   LLM_API_KEY   (unset → scripted fallback, server still fully works)
- *   LLM_MODEL     (default gpt-4o-mini)
+ *   data/llm-config.json   switchable profiles; the active one wins
+ *   (no file)              env LLM_BASE_URL / LLM_API_KEY / LLM_MODEL,
+ *                          exactly the original behavior
  *
  * Any LLM failure (no key, network, bad JSON) falls back to ScriptedDriver,
  * which produces the same shapes from the deterministic judging signals.
@@ -51,20 +52,11 @@ import { appendCall } from './calllog';
  * context it consumed — the admin console's 「LLM 调用」 view reads them back.
  */
 
+/** The three fields the call path consumes — a resolved profile fits. */
 export interface LlmConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
-}
-
-export function llmConfig(
-  env: Record<string, string | undefined> = process.env,
-): LlmConfig {
-  return {
-    baseUrl: (env.LLM_BASE_URL ?? 'https://api.openai.com/v1').replace(/\/$/, ''),
-    apiKey: env.LLM_API_KEY ?? '',
-    model: env.LLM_MODEL ?? 'gpt-4o-mini',
-  };
 }
 
 export type EvaluateKind = 'submission' | 'schema' | 'followups' | 'probe';
@@ -199,7 +191,9 @@ async function runLogged<T>(
   parse: (json: unknown) => T,
   scriptedFn: () => Promise<T>,
 ): Promise<EvaluateOutcome<T>> {
-  const cfg = llmConfig();
+  // Resolve the active model profile fresh for THIS call — an admin
+  // profile switch takes effect on the next evaluation, no restart.
+  const cfg = await resolveActiveProfile();
   let fellBackFromError: string | null = null;
 
   if (cfg.apiKey) {

@@ -8,6 +8,17 @@ import { COMPONENTS, componentDef, type ComponentDef } from '@sds/components';
 import { defaultSettings } from '@sds/sim-core';
 import type { ProblemStorage } from './storage';
 import { listCalls } from './calllog';
+import {
+  envProfile,
+  maskKey,
+  maskedProfile,
+  readConfigFile,
+  resolveActiveProfile,
+  resolveProfileById,
+  writeConfigFile,
+  type LlmConfigFile,
+  type LlmProfile,
+} from './llmconfig';
 
 /**
  * Author admin — the problem-bank console (and the future home of the LLM
@@ -26,7 +37,16 @@ import { listCalls } from './calllog';
  *   PUT    /api/components/:type/overrides   replace a component's numeric overrides
  *   DELETE /api/components/:type/overrides   clear them (or one, via ?key=)
  *   GET    /api/admin/llm-calls        recent LLM call log records (?limit=)
+ *   GET    /api/admin/llm-config       model profiles (keys MASKED) + active id
+ *   PUT    /api/admin/llm-config       save the whole profile table + active id
+ *   POST   /api/admin/llm-models       list a provider's models (GET /models)
+ *   POST   /api/admin/llm-test         one tiny chat completion to prove a
+ *                                      profile can actually be called
  *
+ * Model profiles live in data/llm-config.json (gitignored — it holds API
+ * keys). Evaluation resolves the ACTIVE profile per call, so a switch in
+ * this console takes effect on the next /api/evaluate with no restart.
+ * Keys are only ever returned to the browser masked (last 4 chars).
  * Component definitions themselves are code (@sds/components) — the console
  * never edits code. The ONLY writable layer is numeric default-parameter
  * overrides, stored server-side in data/component-overrides.json. HONEST
@@ -353,5 +373,198 @@ export function registerAdminRoutes(app: Hono, storage: ProblemStorage): void {
   app.get('/api/admin/llm-calls', async (c) => {
     const limit = Number(c.req.query('limit') ?? 50);
     return c.json(await listCalls(Number.isFinite(limit) ? limit : 50));
+  });
+
+  // ------------------------------------------------- LLM 配置（模型档案）-
+  app.get('/api/admin/llm-config', async (c) => {
+    const file = await readConfigFile();
+    const resolved = await resolveActiveProfile();
+    const profiles = file && file.profiles.length ? file.profiles : [envProfile()];
+    return c.json({
+      source: resolved.source,
+      activeProfileId: resolved.id,
+      profiles: profiles.map(maskedProfile),
+    });
+  });
+
+  app.put('/api/admin/llm-config', async (c) => {
+    const body = (await c.req.json().catch(() => null)) as {
+      profiles?: unknown;
+      activeProfileId?: unknown;
+    } | null;
+    if (!body || !Array.isArray(body.profiles)) {
+      return c.json(badRequest('需要 { profiles: [...], activeProfileId }'), 400);
+    }
+    const existing = await readConfigFile();
+    const existingById = new Map((existing?.profiles ?? []).map((p) => [p.id, p]));
+    const profiles: LlmProfile[] = [];
+    for (let i = 0; i < body.profiles.length; i += 1) {
+      const p = body.profiles[i] as Partial<LlmProfile> | null;
+      if (
+        !p ||
+        typeof p.name !== 'string' ||
+        !p.name.trim() ||
+        typeof p.baseUrl !== 'string' ||
+        !p.baseUrl.trim() ||
+        typeof p.model !== 'string' ||
+        !p.model.trim()
+      ) {
+        return c.json(badRequest(`profiles[${i}] 需要 name / baseUrl / model 非空字符串`), 400);
+      }
+      let baseUrl: string;
+      try {
+        baseUrl = new URL(p.baseUrl.trim()).toString().replace(/\/$/, '');
+      } catch {
+        return c.json(badRequest(`profiles[${i}].baseUrl 不是合法 URL`), 400);
+      }
+      const id =
+        typeof p.id === 'string' && p.id ? p.id : `profile-${Date.now().toString(36)}-${i}`;
+      const prev = existingById.get(id);
+      // Key preservation: an incoming key is adopted only when it is a real
+      // new value. Empty (form left blank) or the stored mask itself keeps
+      // the stored key — a masked round-trip can never clobber a real key.
+      let apiKey = prev?.apiKey ?? '';
+      if (
+        typeof p.apiKey === 'string' &&
+        p.apiKey !== '' &&
+        (!prev || p.apiKey !== maskKey(prev.apiKey))
+      ) {
+        apiKey = p.apiKey;
+      }
+      profiles.push({ id, name: p.name.trim(), baseUrl, apiKey, model: p.model.trim() });
+    }
+    const ids = new Set(profiles.map((p) => p.id));
+    if (ids.size !== profiles.length) {
+      return c.json(badRequest('profiles 里有重复 id'), 400);
+    }
+    const activeProfileId =
+      typeof body.activeProfileId === 'string' && ids.has(body.activeProfileId)
+        ? body.activeProfileId
+        : (profiles[0]?.id ?? null);
+    const file: LlmConfigFile = { profiles, activeProfileId };
+    await writeConfigFile(file);
+    return c.json({
+      ok: true,
+      source: 'admin-config',
+      activeProfileId,
+      profiles: profiles.map(maskedProfile),
+    });
+  });
+
+  // -------------------------------------------- 模型发现 / 连接测试（探针）-
+  interface ProbeBody {
+    baseUrl?: unknown;
+    apiKey?: unknown;
+    model?: unknown;
+    profileId?: unknown;
+  }
+
+  /**
+   * Resolve which endpoint/key/model a probe call targets: explicit body
+   * values win; gaps are filled from a stored profile (profileId first,
+   * else the active profile) so the console can probe an already-saved
+   * profile without the browser ever seeing its real key.
+   */
+  async function resolveProbeTarget(body: ProbeBody) {
+    const prof = await resolveProfileById(
+      typeof body.profileId === 'string' ? body.profileId : undefined,
+    );
+    return {
+      baseUrl: (typeof body.baseUrl === 'string' && body.baseUrl.trim()
+        ? body.baseUrl.trim()
+        : prof.baseUrl
+      ).replace(/\/$/, ''),
+      apiKey:
+        typeof body.apiKey === 'string' && body.apiKey !== '' ? body.apiKey : prof.apiKey,
+      model:
+        typeof body.model === 'string' && body.model.trim() ? body.model.trim() : prof.model,
+    };
+  }
+
+  app.post('/api/admin/llm-models', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as ProbeBody;
+    const { baseUrl, apiKey } = await resolveProbeTarget(body);
+    const t0 = Date.now();
+    try {
+      const res = await fetch(`${baseUrl}/models`, {
+        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        signal: AbortSignal.timeout(10_000),
+      });
+      const text = await res.text();
+      if (!res.ok) {
+        // Upstream status + body go back verbatim — a 401/404 must be seen.
+        return c.json({ ok: false, upstreamStatus: res.status, message: text.slice(0, 2000) });
+      }
+      let ids: string[] = [];
+      try {
+        const data = JSON.parse(text) as {
+          data?: { id?: unknown }[];
+          models?: { id?: unknown }[];
+        };
+        const arr = Array.isArray(data?.data)
+          ? data.data
+          : Array.isArray(data?.models)
+            ? data.models
+            : [];
+        ids = arr
+          .map((m) => (m && typeof m.id === 'string' ? m.id : ''))
+          .filter((s) => s !== '');
+      } catch {
+        /* unparseable body → empty list */
+      }
+      return c.json({
+        ok: true,
+        baseUrl,
+        models: [...new Set(ids)].sort(),
+        latencyMs: Date.now() - t0,
+      });
+    } catch (err) {
+      return c.json({ ok: false, message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/admin/llm-test', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as ProbeBody;
+    const { baseUrl, apiKey, model } = await resolveProbeTarget(body);
+    if (!model) {
+      return c.json(badRequest('需要 model（请求里给，或档案里已配置）'), 400);
+    }
+    const t0 = Date.now();
+    try {
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: 'Reply with exactly: ok' }],
+          max_tokens: 16,
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      const text = await res.text();
+      const latencyMs = Date.now() - t0;
+      if (!res.ok) {
+        return c.json({ ok: false, upstreamStatus: res.status, latencyMs, message: text.slice(0, 2000) });
+      }
+      let sample = '';
+      try {
+        const data = JSON.parse(text) as {
+          choices?: { message?: { content?: string } }[];
+        };
+        sample = data.choices?.[0]?.message?.content ?? '';
+      } catch {
+        /* leave the sample empty — ok + latency still prove reachability */
+      }
+      return c.json({ ok: true, latencyMs, sample: sample.slice(0, 200) });
+    } catch (err) {
+      return c.json({
+        ok: false,
+        latencyMs: Date.now() - t0,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
   });
 }

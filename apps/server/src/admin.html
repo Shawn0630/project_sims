@@ -62,6 +62,7 @@ summary { cursor: pointer; color: var(--accent); font-size: 13px;}
 <button data-page="problems" class="active">📚 题库</button>
 <button data-page="components">🧩 组件</button>
 <button data-page="calls">📞 LLM 调用</button>
+<button data-page="models">🤖 模型配置</button>
 </nav>
 
 <main>
@@ -107,6 +108,12 @@ LLM 生成题目系统（第四套系统）的入口将来长在这里。现在
 <section class="page" id="page-calls">
 <div class="card" id="callsRoot">正在加载调用日志…</div>
 </section>
+
+<!-- ======================================================== 模型配置 === -->
+<section class="page" id="page-models">
+<div class="card" id="modelsRoot">正在加载模型配置…</div>
+<div id="profileEditor"></div>
+</section>
 </main>
 
 <script>
@@ -130,6 +137,7 @@ document.querySelectorAll('#mainNav button').forEach((b) => b.classList.toggle('
 document.querySelectorAll('section.page').forEach((s) => s.classList.toggle('active', s.id === 'page-' + btn.dataset.page));
 if (btn.dataset.page === 'components' &&!window.__componentsLoaded) loadComponents();
 if (btn.dataset.page === 'calls' &&!window.__callsLoaded) loadCalls();
+if (btn.dataset.page === 'models' &&!window.__modelsLoaded) loadModels();
 });
 
 // ----------------------------------------------------------------- status --
@@ -138,7 +146,7 @@ const { json} = await api('/api/health');
 if (!json) { $('#statusBar').innerHTML = '<span class="err">后端不可达</span>'; return;}
 $('#statusBar').innerHTML =
 `后端：<b>正常</b> · 题目总数：<b>${json.problems}</b> · 存储：<b>${esc(json.storage)}</b> · ` +
-`LLM：${json.llmConfigured? `<b class="ok-text">已配置</b>（${esc(json.llmModel)} @ ${esc(json.llmBaseUrl)}）`: '<b style="color:var(--warn)">未配置 key</b>（评审走脚本回落）'}`;
+`LLM：${json.llmConfigured? `<b class="ok-text">已配置</b>（${esc(json.llmModel)} @ ${esc(json.llmBaseUrl)} · ${json.llmConfigSource === 'admin-config'? 'admin 档案': 'env'}）`: '<b style="color:var(--warn)">未配置 key</b>（评审走脚本回落）'}`;
 }
 
 // --------------------------------------------------------------- problems --
@@ -397,6 +405,172 @@ root.querySelectorAll('[data-call]').forEach((tr) => tr.addEventListener('click'
 const d = document.getElementById('call-detail-' + tr.dataset.call);
 d.style.display = d.style.display === 'none'? '': 'none';
 }));
+}
+
+// ------------------------------------------------------------ model config --
+let modelCfg = null; // { source, activeProfileId, profiles: [masked] }
+let editingProfileId = null; // profile id being edited, 'new', or null
+
+const PROVIDER_PRESETS = [
+{ name: 'Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai/' },
+{ name: 'OpenAI', baseUrl: 'https://api.openai.com/v1' },
+{ name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' },
+{ name: 'Mistral', baseUrl: 'https://api.mistral.ai/v1' },
+{ name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' },
+{ name: 'Ollama（本地）', baseUrl: 'http://localhost:11434/v1' },
+{ name: '自定义', baseUrl: '' },
+];
+
+function hostOf(u) { try { return new URL(u).host; } catch { return String(u); } }
+const plainProfiles = () => (modelCfg?.profiles ?? []).map(({ id, name, baseUrl, model }) => ({ id, name, baseUrl, model }));
+
+async function loadModels() {
+window.__modelsLoaded = true;
+const root = document.getElementById('modelsRoot');
+const { json, status } = await api('/api/admin/llm-config');
+if (status !== 200 || !json || !Array.isArray(json.profiles)) { root.innerHTML = '<span class="err">模型配置加载失败</span>'; return; }
+modelCfg = json;
+renderModels();
+}
+
+function renderModels() {
+const root = document.getElementById('modelsRoot');
+const rows = modelCfg.profiles.map((p) => `
+<tr>
+<td><b>${esc(p.name)}</b>${p.id === modelCfg.activeProfileId? ' <span class="badge ok">当前启用</span>': ''}</td>
+<td>${esc(hostOf(p.baseUrl))}</td>
+<td><code>${esc(p.model)}</code></td>
+<td>${p.hasKey? `<code>${esc(p.keyMasked)}</code>`: '<span class="muted">（无 key）</span>'}</td>
+<td>${p.id === modelCfg.activeProfileId? '': `<button class="btn" data-activate="${esc(p.id)}">启用</button> `}
+<button class="btn" data-edit="${esc(p.id)}">编辑</button>
+<button class="btn danger" data-delprofile="${esc(p.id)}">删除</button></td>
+</tr>`).join('');
+root.innerHTML = `
+<div class="row"><b>模型档案</b><span class="muted small">配置来源：${modelCfg.source === 'admin-config'? 'admin 档案文件': 'env（尚未保存过档案）'} · 切换启用后，下一次 evaluate 立即生效、无需重启</span>
+<span class="grow"></span><button class="btn" id="modelsReload">↻ 刷新</button></div>
+<p class="muted small" style="margin:6px 0 0">档案存服务端本地文件 <code>apps/server/data/llm-config.json</code>（含 key，已 gitignore，<b>不进 repo</b>）。key 在浏览器里永远只显示掩码（末 4 位）。<br>
+⚠️ 「拉取可用模型」给出的列表<b>不等于每个都能调</b>（免费层 / 新用户限制）——以「测试连接」的实际结果为准。</p>
+<table><thead><tr><th>名称</th><th>端点 host</th><th>模型</th><th>key</th><th></th></tr></thead>
+<tbody>${rows || '<tr><td colspan="5" class="muted">暂无档案</td></tr>'}</tbody></table>
+<div style="margin-top:10px"><button class="btn primary" id="profileNew">➕ 新增档案</button></div>`;
+document.getElementById('modelsReload').onclick = () => loadModels();
+document.getElementById('profileNew').onclick = () => openProfileEditor(null);
+root.querySelectorAll('[data-activate]').forEach((b) => b.onclick = () => saveModelCfg(plainProfiles(), b.dataset.activate));
+root.querySelectorAll('[data-edit]').forEach((b) => b.onclick = () => openProfileEditor(b.dataset.edit));
+root.querySelectorAll('[data-delprofile]').forEach((b) => b.onclick = async () => {
+const p = modelCfg.profiles.find((x) => x.id === b.dataset.delprofile);
+if (!confirm(`确定删除档案「${p? p.name: b.dataset.delprofile}」？`)) return;
+const rest = plainProfiles().filter((x) => x.id !== b.dataset.delprofile);
+const active = modelCfg.activeProfileId === b.dataset.delprofile? (rest[0]?.id ?? null): modelCfg.activeProfileId;
+saveModelCfg(rest, active);
+});
+}
+
+async function saveModelCfg(profiles, activeProfileId) {
+const r = await api('/api/admin/llm-config', {
+method: 'PUT', headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify({ profiles, activeProfileId }),
+});
+if (r.status === 200 && r.json) {
+modelCfg = r.json;
+editingProfileId = null;
+document.getElementById('profileEditor').innerHTML = '';
+renderModels();
+loadStatus();
+return true;
+}
+alert('保存失败：' + (r.json?.message ?? r.text ?? r.status));
+return false;
+}
+
+function openProfileEditor(id) {
+editingProfileId = id ?? 'new';
+const p = id? modelCfg.profiles.find((x) => x.id === id): null;
+const box = document.getElementById('profileEditor');
+box.innerHTML = `
+<div class="card">
+<b>${p? '编辑档案': '新增档案'}</b>
+<label>名称 <input id="pfName" value="${esc(p?.name ?? '')}" placeholder="例如：Gemini 免费层" /></label>
+<label>服务商预设（只填 Base URL）
+<select id="pfPreset">${PROVIDER_PRESETS.map((x) => `<option value="${esc(x.baseUrl)}">${esc(x.name)}</option>`).join('')}</select></label>
+<label>Base URL <input id="pfBaseUrl" value="${esc(p?.baseUrl ?? '')}" placeholder="https://…/v1" /></label>
+<label>API Key <input id="pfApiKey" type="password" autocomplete="off" placeholder="${p? (p.hasKey? `已保存 ${esc(p.keyMasked)} — 留空不修改`: '该档案无 key，可留空（如 Ollama）'): '粘贴 key（Ollama 可留空）'}" /></label>
+<label>模型（可手填，或先拉取列表再选）
+<div class="row"><input id="pfModel" value="${esc(p?.model ?? '')}" placeholder="模型 id" style="flex:1" />
+<select id="pfModelList" style="flex:1; display:none"></select></div></label>
+<div class="row" style="margin-top:8px">
+<button class="btn" id="pfFetchModels">⬇ 拉取可用模型</button>
+<button class="btn" id="pfTest">🔌 测试连接</button>
+<span class="small" id="pfProbeMsg"></span>
+</div>
+<div class="row" style="margin-top:10px">
+<button class="btn primary" id="pfSave">💾 保存档案</button>
+<button class="btn" id="pfCancel">取消</button>
+<span class="small" id="pfMsg"></span>
+</div>
+</div>`;
+const preset = document.getElementById('pfPreset');
+preset.onchange = () => { if (preset.value) document.getElementById('pfBaseUrl').value = preset.value; };
+document.getElementById('pfCancel').onclick = () => { editingProfileId = null; box.innerHTML = ''; };
+
+const probeBody = () => {
+const typedKey = document.getElementById('pfApiKey').value;
+return {
+baseUrl: document.getElementById('pfBaseUrl').value.trim(),
+...(typedKey? { apiKey: typedKey }: {}),
+...(editingProfileId && editingProfileId !== 'new'? { profileId: editingProfileId }: {}),
+};
+};
+
+document.getElementById('pfFetchModels').onclick = async () => {
+const msg = document.getElementById('pfProbeMsg');
+msg.textContent = '拉取中…';
+const r = await api('/api/admin/llm-models', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(probeBody()) });
+if (r.json?.ok) {
+const sel = document.getElementById('pfModelList');
+sel.innerHTML = r.json.models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join('');
+sel.style.display = r.json.models.length? '': 'none';
+sel.onchange = () => { document.getElementById('pfModel').value = sel.value; };
+if (r.json.models.length) document.getElementById('pfModel').value = r.json.models[0];
+msg.innerHTML = `<span class="ok-text">拉到 ${r.json.models.length} 个模型</span>（列表不等于都能调，以测试连接为准）`;
+} else {
+msg.innerHTML = `<span class="err">拉取失败${r.json?.upstreamStatus? `（上游 HTTP ${r.json.upstreamStatus}）`: ''}：${esc(r.json?.message ?? r.text ?? '')}</span>`;
+}
+};
+
+document.getElementById('pfTest').onclick = async () => {
+const msg = document.getElementById('pfProbeMsg');
+msg.textContent = '测试中…';
+const r = await api('/api/admin/llm-test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...probeBody(), model: document.getElementById('pfModel').value.trim() }) });
+if (r.json?.ok) {
+msg.innerHTML = `<span class="ok-text">连接成功</span> · ${r.json.latencyMs} ms · 模型回复：<code>${esc(r.json.sample ?? '')}</code>`;
+} else {
+msg.innerHTML = `<span class="err">测试失败${r.json?.upstreamStatus? `（上游 HTTP ${r.json.upstreamStatus}）`: ''}：${esc(r.json?.message ?? r.text ?? '')}</span>`;
+}
+};
+
+document.getElementById('pfSave').onclick = async () => {
+const name = document.getElementById('pfName').value.trim();
+const baseUrl = document.getElementById('pfBaseUrl').value.trim();
+const model = document.getElementById('pfModel').value.trim();
+const typedKey = document.getElementById('pfApiKey').value;
+const msg = document.getElementById('pfMsg');
+if (!name || !baseUrl || !model) { msg.innerHTML = '<span class="err">名称 / Base URL / 模型都要填</span>'; return; }
+const plain = plainProfiles();
+const entry = {
+...(editingProfileId && editingProfileId !== 'new'? { id: editingProfileId }: {}),
+name, baseUrl, model,
+...(typedKey? { apiKey: typedKey }: {}),
+};
+if (entry.id) {
+const ix = plain.findIndex((x) => x.id === entry.id);
+if (ix >= 0) plain[ix] = entry; else plain.push(entry);
+} else {
+plain.push(entry);
+}
+msg.textContent = '保存中…';
+await saveModelCfg(plain, modelCfg.activeProfileId);
+};
 }
 </script>
 </body>

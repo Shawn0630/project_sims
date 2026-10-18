@@ -11,10 +11,10 @@ import {
   evaluateProbes,
   evaluateSchema,
   evaluateSubmission,
-  llmConfig,
   toSchemaReviewLike,
   type EvaluateKind,
 } from './llm';
+import { resolveActiveProfile } from './llmconfig';
 import { verifyProbes } from './probe';
 import { toClientPack } from './packs';
 import { JsonProblemStorage, type ProblemStorage } from './storage';
@@ -67,7 +67,7 @@ function isDesign(v: unknown): v is Design {
 
 // ------------------------------------------------------------------ health -
 app.get('/api/health', async (c) => {
-  const cfg = llmConfig();
+  const cfg = await resolveActiveProfile();
   let problemCount = 0;
   try {
     problemCount = (await storage.listProblems()).length;
@@ -81,6 +81,8 @@ app.get('/api/health', async (c) => {
     llmConfigured: cfg.apiKey.length > 0,
     llmBaseUrl: cfg.baseUrl,
     llmModel: cfg.model,
+    llmProfile: cfg.name,
+    llmConfigSource: cfg.source,
   });
 });
 
@@ -265,12 +267,13 @@ app.notFound((c) => c.json({ error: 'not_found' }, 404));
 
 // -------------------------------------------------------------------- boot -
 const port = Number(process.env.PORT ?? 8787);
-const cfg = llmConfig();
 serve({ fetch: app.fetch, port }, (info) => {
   console.log(`[sds-server] listening on http://localhost:${info.port}`);
-  console.log(
-    cfg.apiKey
-      ? `[sds-server] LLM eval: ${cfg.model} @ ${cfg.baseUrl}`
-      : '[sds-server] LLM eval: no LLM_API_KEY set — scripted fallback (offline mode)',
-  );
+  void resolveActiveProfile().then((cfg) => {
+    console.log(
+      cfg.apiKey
+        ? `[sds-server] LLM eval: ${cfg.model} @ ${cfg.baseUrl}（档案「${cfg.name}」，来源 ${cfg.source}）`
+        : '[sds-server] LLM eval: active profile has no API key — scripted fallback (offline mode)',
+    );
+  });
 });

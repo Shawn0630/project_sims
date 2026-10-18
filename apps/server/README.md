@@ -22,6 +22,17 @@ Shell env wins; otherwise `apps/server/.env` is loaded if present
 | `LLM_API_KEY` | — | Unset → scripted fallback for `/api/evaluate` |
 | `LLM_MODEL` | `gpt-4o-mini` | Evaluation model |
 
+**Model profiles (dynamic, preferred over env):** the admin console's
+「模型配置」 tab stores switchable profiles in `data/llm-config.json`
+(gitignored — it holds API keys). When that file exists, its ACTIVE
+profile is resolved fresh on every evaluation call — switching profiles
+takes effect immediately, no restart — and env only seeds the implicit
+`env 默认` profile shown before anything is saved. Keys are only ever
+returned to the browser masked (last 4 chars). Admin endpoints:
+`GET/PUT /api/admin/llm-config`, `POST /api/admin/llm-models`
+(provider model discovery), `POST /api/admin/llm-test` (one tiny
+completion proving a profile can actually be called).
+
 The web app finds the backend at `VITE_API_URL` (frontend build-time env,
 default `http://localhost:8787`).
 
