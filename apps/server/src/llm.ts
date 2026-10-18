@@ -39,6 +39,12 @@ import { appendCall } from './calllog';
  *
  * Any LLM failure (no key, network, bad JSON) falls back to ScriptedDriver,
  * which produces the same shapes from the deterministic judging signals.
+ * One exception: TRANSIENT upstream failures — HTTP 429, any 5xx, and
+ * network fetch errors — are retried (up to 2 extra attempts, ~1.5s then
+ * ~4s backoff) before falling back, since providers like Gemini answer
+ * load spikes with temporary 503s. Non-transient failures (other 4xx, a
+ * 200 whose body does not parse) never retry. Every attempt is reflected
+ * in the call's log record (attempt count + per-attempt errors).
  *
  * EVERY evaluation is recorded in the call log (calllog.ts): the real model
  * call with its full request/response, and the scripted fallback with the
@@ -79,6 +85,36 @@ interface ChatResult {
   usage?: unknown;
 }
 
+/** The upstream answered with a non-2xx HTTP status. */
+class LlmHttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/** The upstream answered 200 but the body was not parseable JSON. */
+class LlmResponseError extends Error {}
+
+/**
+ * Is repeating the identical call after a short wait plausibly useful?
+ * 429 and 5xx are the provider saying "busy / broken right now", and a
+ * fetch-level throw (DNS, connection reset, the 60s timeout) never got an
+ * answer at all — all transient. Other 4xx are the request's own fault,
+ * and a 200 with an unparseable body will not heal by resending.
+ */
+function classifyCallError(err: unknown): { message: string; transient: boolean } {
+  if (err instanceof LlmHttpError) {
+    return { message: err.message, transient: err.status === 429 || err.status >= 500 };
+  }
+  if (err instanceof LlmResponseError) {
+    return { message: err.message, transient: false };
+  }
+  return { message: err instanceof Error ? err.message : String(err), transient: true };
+}
+
 async function chatCompletion(
   cfg: LlmConfig,
   requestBody: Record<string, unknown>,
@@ -93,13 +129,52 @@ async function chatCompletion(
     signal: AbortSignal.timeout(60_000),
   });
   if (!res.ok) {
-    throw new Error(`LLM API ${res.status}: ${await res.text()}`);
+    throw new LlmHttpError(res.status, `LLM API ${res.status}: ${await res.text()}`);
   }
-  const data = (await res.json()) as {
-    choices?: { message?: { content?: string } }[];
-    usage?: unknown;
-  };
+  let data: { choices?: { message?: { content?: string } }[]; usage?: unknown };
+  try {
+    data = (await res.json()) as typeof data;
+  } catch {
+    throw new LlmResponseError('LLM API returned HTTP 200 with a non-JSON body');
+  }
   return { content: data.choices?.[0]?.message?.content ?? '', usage: data.usage };
+}
+
+/** Waits before retry attempts 2 and 3 — transient errors only. */
+const RETRY_DELAYS_MS = [1_500, 4_000];
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+interface ChatOutcome {
+  /** The successful completion, or null when every attempt failed. */
+  result: ChatResult | null;
+  /** One entry per attempt made, in order; `error` set for failed attempts. */
+  attempts: { error?: string }[];
+}
+
+/**
+ * One logical model call with bounded retries on transient failures.
+ * Non-transient failures return after the first attempt.
+ */
+async function chatWithRetry(
+  cfg: LlmConfig,
+  requestBody: Record<string, unknown>,
+): Promise<ChatOutcome> {
+  const attempts: { error?: string }[] = [];
+  for (let i = 0; ; i += 1) {
+    try {
+      const result = await chatCompletion(cfg, requestBody);
+      attempts.push({});
+      return { result, attempts };
+    } catch (err) {
+      const { message, transient } = classifyCallError(err);
+      attempts.push({ error: message });
+      if (!transient || i >= RETRY_DELAYS_MS.length) {
+        return { result: null, attempts };
+      }
+      await sleep(RETRY_DELAYS_MS[i] + Math.floor(Math.random() * 300));
+    }
+  }
 }
 
 function hostOf(baseUrl: string): string {
@@ -138,27 +213,56 @@ async function runLogged<T>(
       response_format: { type: 'json_object' },
     };
     const t0 = Date.now();
-    let raw = '';
-    try {
-      const r = await chatCompletion(cfg, requestBody);
-      raw = r.content;
-      const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-      const data = parse(JSON.parse(cleaned) as unknown);
-      appendCall({
-        kind,
-        source: 'llm',
-        ok: true,
-        baseUrlHost: hostOf(cfg.baseUrl),
-        model: cfg.model,
-        durationMs: Date.now() - t0,
-        usage: r.usage,
-        request: requestBody,
-        responseRaw: raw,
-        responseParsed: data,
-      });
-      return { source: 'llm', label: LLM_LABEL, data };
-    } catch (err) {
-      fellBackFromError = err instanceof Error ? err.message : String(err);
+    // One logical call; transient upstream failures (429 / 5xx / network)
+    // retry inside chatWithRetry before we give up and fall back.
+    const { result, attempts } = await chatWithRetry(cfg, requestBody);
+    const attemptErrors = attempts.flatMap((a) => (a.error ? [a.error] : []));
+    const retrySummary =
+      attempts.length > 1
+        ? `共尝试 ${attempts.length} 次${result ? '，重试后成功' : '，全部失败'}；失败尝试：${attemptErrors.join('；')}`
+        : undefined;
+    if (result) {
+      const raw = result.content;
+      try {
+        const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+        const data = parse(JSON.parse(cleaned) as unknown);
+        appendCall({
+          kind,
+          source: 'llm',
+          ok: true,
+          baseUrlHost: hostOf(cfg.baseUrl),
+          model: cfg.model,
+          durationMs: Date.now() - t0,
+          usage: result.usage,
+          request: requestBody,
+          responseRaw: raw,
+          responseParsed: data,
+          attempts: attempts.length,
+          ...(attemptErrors.length ? { attemptErrors } : {}),
+          ...(retrySummary ? { note: retrySummary } : {}),
+        });
+        return { source: 'llm', label: LLM_LABEL, data };
+      } catch (err) {
+        // The call succeeded but its content did not parse — resending the
+        // identical request is not the fix, so no retry happened for this.
+        fellBackFromError = err instanceof Error ? err.message : String(err);
+        appendCall({
+          kind,
+          source: 'llm',
+          ok: false,
+          baseUrlHost: hostOf(cfg.baseUrl),
+          model: cfg.model,
+          durationMs: Date.now() - t0,
+          request: requestBody,
+          responseRaw: raw,
+          error: fellBackFromError,
+          attempts: attempts.length,
+          ...(attemptErrors.length ? { attemptErrors } : {}),
+          ...(retrySummary ? { note: retrySummary } : {}),
+        });
+      }
+    } else {
+      fellBackFromError = attemptErrors[attemptErrors.length - 1] ?? 'LLM call failed';
       appendCall({
         kind,
         source: 'llm',
@@ -167,8 +271,10 @@ async function runLogged<T>(
         model: cfg.model,
         durationMs: Date.now() - t0,
         request: requestBody,
-        ...(raw ? { responseRaw: raw } : {}),
         error: fellBackFromError,
+        attempts: attempts.length,
+        attemptErrors,
+        ...(retrySummary ? { note: retrySummary } : {}),
       });
     }
   }

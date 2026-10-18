@@ -37,6 +37,13 @@ export interface LlmCallRecord {
   responseRaw?: string;
   /** The structured result after defensive parsing / scripted generation. */
   responseParsed?: unknown;
+  /**
+   * How many HTTP attempts this logical call took (llm calls only).
+   * > 1 means transient upstream failures were retried before the outcome.
+   */
+  attempts?: number;
+  /** Error message of each failed attempt, in order (llm calls only). */
+  attemptErrors?: string[];
   error?: string;
   note?: string;
 }
@@ -44,6 +51,7 @@ export interface LlmCallRecord {
 export const CALLS_FILE = fileURLToPath(new URL('../data/llm-calls.jsonl', import.meta.url));
 
 let seq = 0;
+let appendChain: Promise<void> = Promise.resolve();
 
 /** Append one record. Fire-and-forget: logging must never break evaluation. */
 export function appendCall(rec: Omit<LlmCallRecord, 'id' | 'ts'>): void {
@@ -52,14 +60,17 @@ export function appendCall(rec: Omit<LlmCallRecord, 'id' | 'ts'>): void {
     id: `call-${Date.now().toString(36)}-${(seq += 1)}`,
     ts: new Date().toISOString(),
   };
-  void (async () => {
+  // Serialize appends through a chain so records land in call order — a
+  // fallback entry that says "see the previous record" must actually have
+  // that record above it in the file.
+  appendChain = appendChain.then(async () => {
     try {
       await mkdir(path.dirname(CALLS_FILE), { recursive: true });
       await appendFile(CALLS_FILE, `${JSON.stringify(full)}\n`, 'utf8');
     } catch {
       /* local log only — swallow */
     }
-  })();
+  });
 }
 
 /** Most recent N records, newest first. */
