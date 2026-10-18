@@ -1436,6 +1436,15 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                       onPinToggle={(tc) => void pinCase(tc)}
                       onApplyFix={enterPreview}
                     />
+                    {/* Structural checks are computed by the judge call
+                        alongside the scores — deterministic results live
+                        with the judging tab, NOT under the AI review. */}
+                    <h4 style={{ margin: '18px 0 8px' }}>🧱 结构检查（确定性规则，不依赖 LLM）</h4>
+                    <StructuralList
+                      structural={structural}
+                      onSelectNode={(id) => setSelectedId(id)}
+                      onApplyFix={enterPreview}
+                    />
                   </>
                 ) : (
                   <p className="hint" style={{ marginTop: 0 }}>
@@ -1516,12 +1525,6 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                     </div>
                   )}
                 </div>
-                <h4 style={{ margin: '16px 0 8px' }}>🧱 结构检查（确定性规则，不依赖 LLM）</h4>
-                <StructuralList
-                  structural={structural}
-                  onSelectNode={(id) => setSelectedId(id)}
-                  onApplyFix={enterPreview}
-                />
               </div>
             )}
 
