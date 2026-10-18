@@ -137,7 +137,26 @@ export interface ProblemPack {
   schema: ProblemSchemaDTO;
   workload: WorkloadProfileDTO;
   testCases: ProblemCaseDTO[];
+  /** The database design's own test cases (hidden ones locked: their
+   *  assertions are revealed only as judge results after a submit). */
+  schemaTestCases: SchemaCaseDTO[];
   sampleDesign: Design;
+}
+
+/** A schema test case as served in the pack (assertion locked if hidden). */
+export interface SchemaCaseDTO {
+  id: string;
+  name: string;
+  description: string;
+  hidden: boolean;
+  weight: number;
+  scale: 'now' | 'grown';
+  assertion:
+    | { kind: 'pattern'; patternId: string; metric: 'p99Ms' | 'rowsExamined'; max: number }
+    | { kind: 'pattern-path'; patternId: string; forbiddenPaths: string[] }
+    | { kind: 'table'; table: string; metric: 'hottestShardUtil' | 'writeAmp'; max: number }
+    | { kind: 'global'; metric: 'sustainableQps'; min: number };
+  locked: boolean;
 }
 
 // ------------------------------------------------------------ judging DTOs -
@@ -320,6 +339,27 @@ export interface JudgeResponseDTO {
   suite: SuiteResultDTO;
   structural: StructuralFindingDTO[];
   schemaSignals: SchemaSignalsDTO | null;
+  /** Schema test-case judging — the database design's own score. */
+  schemaSuite: SchemaSuiteDTO | null;
+}
+
+/** One judged schema test case (post-submit reveal, like arch results). */
+export interface SchemaCaseResultDTO {
+  caseId: string;
+  name: string;
+  hidden: boolean;
+  passed: boolean;
+  measuredText: string;
+  thresholdText: string;
+  failures: string[];
+  fix?: { title: string; actions: SchemaOpDTO[] };
+}
+
+export interface SchemaSuiteDTO {
+  results: SchemaCaseResultDTO[];
+  passedCount: number;
+  totalCount: number;
+  scorePct: number;
 }
 
 // ---------------------------------------------------------- assessment DTOs -

@@ -6,6 +6,7 @@ import {
   attachCaseFixes,
   buildSchemaSimSummary,
   checkStructure,
+  judgeSchemaCases,
   reviewSchema,
   runSuite,
   simulateSchema,
@@ -42,6 +43,8 @@ import { registerGenerationRoutes } from './generate';
  *   GET  /api/problems            problem packs (hidden cases stripped)
  *   GET  /api/problems/:id        one pack (hidden cases stripped)
  *   POST /api/submissions/judge   code judging + structural + schema signals
+ *                                 + the schema's own test suite (schemaSuite,
+ *                                 sim-judged, scored independently)
  *   POST /api/schema/simulate     run the problem's requirement workload
  *                                 against a candidate schema (the schema
  *                                 simulator: paths, measured latencies,
@@ -184,7 +187,14 @@ app.post('/api/submissions/judge', async (c) => {
           typeof body.schemaLoadFactor === 'number' ? body.schemaLoadFactor : 0,
       })
     : null;
-  return c.json({ problemId: problem.id, suite, structural, schemaSignals });
+  // The database design's OWN test suite: the schema sim judges the
+  // pack's schemaTestCases deterministically. Scored independently —
+  // it rides along in the response but never touches the suite score.
+  const schemaSuite =
+    body.schema && (problem.schemaTestCases ?? []).length > 0
+      ? judgeSchemaCases(problem, body.schema as ProblemSchema)
+      : null;
+  return c.json({ problemId: problem.id, suite, structural, schemaSignals, schemaSuite });
 });
 
 // --------------------------------------------------------- schema simulate -

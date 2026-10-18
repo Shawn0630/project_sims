@@ -33,6 +33,7 @@ import {
   type SchemaOpDTO,
   type SchemaSignalsDTO,
   type SchemaSimDTO,
+  type SchemaSuiteDTO,
   type StructuralFindingDTO,
   type SubmissionAssessmentDTO,
   type SuiteResultDTO,
@@ -68,7 +69,7 @@ import {
   StructuralList,
   scoreColor,
 } from './ReportPanel';
-import { SchemaPanel, SchemaAssessmentView, SchemaSignalsView, SchemaSimView } from './SchemaPanel';
+import { SchemaPanel, SchemaAssessmentView, SchemaSignalsView, SchemaSimView, SchemaSuiteView } from './SchemaPanel';
 import { IconGlyph } from './icons';
 
 type Phase = 'design' | 'run' | 'report';
@@ -285,6 +286,10 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   // The deterministic signals travel separately (they ride every judge
   // response) and also feed the schema view's design-time checker display.
   const [schemaSignals, setSchemaSignals] = useState<SchemaSignalsDTO | null>(null);
+  // The schema test-case suite result from the last judge response —
+  // the database design's own score （数据库评审 tab), independent of
+  // the architecture suite.
+  const [schemaSuite, setSchemaSuite] = useState<SchemaSuiteDTO | null>(null);
   // Schema simulation runs, kept per problem alongside the schema draft
   // (same lifecycle): the sim that ran + the exact draft fingerprint it
   // ran on, so a later edit can mark the shown results as the last run's.
@@ -498,6 +503,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setJudgeError(null);
     setView('design');
     setSchemaAssessment(null);
+    setSchemaSuite(null);
     setSchemaLabel('');
     setSchemaError(null);
     setSchemaSignals(null);
@@ -591,6 +597,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setAssessment(null);
     setAssessmentError(null);
     setSchemaAssessment(null);
+    setSchemaSuite(null);
     setSchemaLabel('');
     setSchemaError(null);
     setSubmittedSnapshot(null);
@@ -655,6 +662,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setSuite(result);
     setStructural(jr.structural);
     setSchemaSignals(jr.schemaSignals);
+    setSchemaSuite(jr.schemaSuite);
     setSubmittedSnapshot({
       design: JSON.stringify(designRef.current),
       schema: JSON.stringify(schemasRef.current[p.id]!),
@@ -1704,6 +1712,15 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
 
             {resultsTab === 'schema' && (
               <div>
+                {schemaSuite ? (
+                  <SchemaSuiteView suite={schemaSuite} onApplyFix={enterSchemaPreview} />
+                ) : (
+                  !suite && (
+                    <p className="hint" style={{ marginTop: 0 }}>
+                      尚未提交——提交后，数据库用例判卷（由数据库模拟实测、独立计分）会出现在这里。
+                    </p>
+                  )
+                )}
                 {schemaBusy && (
                   <div style={{ color: '#94a3b8', fontSize: 13, marginBottom: 8 }}>
                     数据库评审生成中…（和提交是同一次评审，稍等）

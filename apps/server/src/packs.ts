@@ -1,4 +1,4 @@
-import type { ProblemDef, TestCase } from '@sds/problems';
+import type { ProblemDef, SchemaTestCase, TestCase } from '@sds/problems';
 
 /**
  * Client-safe projection of a problem pack.
@@ -13,8 +13,17 @@ import type { ProblemDef, TestCase } from '@sds/problems';
  */
 export type ClientTestCase = TestCase & { locked: boolean };
 
-export type ClientProblemPack = Omit<ProblemDef, 'testCases' | 'referenceSolution'> & {
+/** A schema test case as the solver may see it: hidden ones keep only
+ *  their identity — the assertion (the thing being graded) stays server-side
+ *  until a submission's judge results reveal it. */
+export type ClientSchemaTestCase = SchemaTestCase & { locked: boolean };
+
+export type ClientProblemPack = Omit<
+  ProblemDef,
+  'testCases' | 'referenceSolution' | 'schemaTestCases'
+> & {
   testCases: ClientTestCase[];
+  schemaTestCases: ClientSchemaTestCase[];
 };
 
 export function toClientCase(tc: TestCase): ClientTestCase {
@@ -35,10 +44,30 @@ export function toClientCase(tc: TestCase): ClientTestCase {
   };
 }
 
+export function toClientSchemaCase(sc: SchemaTestCase): ClientSchemaTestCase {
+  if (!sc.hidden) return { ...sc, locked: false };
+  return {
+    id: sc.id,
+    name: sc.name,
+    description: '隐藏用例：断言与阈值在提交判卷后揭示。',
+    hidden: true,
+    weight: sc.weight,
+    scale: sc.scale,
+    // Neutral placeholder assertion — never evaluated client-side; the
+    // real assertion is revealed only as judge results after a submit.
+    assertion: { kind: 'global', metric: 'sustainableQps', min: 0 },
+    locked: true,
+  };
+}
+
 export function toClientPack(pack: ProblemDef): ClientProblemPack {
   // referenceSolution is the admin-only model answer: it must NEVER reach
   // the solver app, so it is dropped here — the single projection every
   // solver-facing pack response flows through.
   const { referenceSolution: _referenceSolution, ...rest } = pack;
-  return { ...rest, testCases: pack.testCases.map(toClientCase) };
+  return {
+    ...rest,
+    testCases: pack.testCases.map(toClientCase),
+    schemaTestCases: (pack.schemaTestCases ?? []).map(toClientSchemaCase),
+  };
 }

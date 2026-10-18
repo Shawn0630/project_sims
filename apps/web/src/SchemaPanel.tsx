@@ -6,6 +6,7 @@ import type {
   SchemaOpDTO,
   SchemaSignalsDTO,
   SchemaSimDTO,
+  SchemaSuiteDTO,
   SchemaTableDTO,
 } from './api';
 import { ActionSourceLabel } from './ReportPanel';
@@ -285,6 +286,61 @@ export function SchemaSignalsView({ signals }: { signals: SchemaSignalsDTO }) {
  * ✨ button that enters the schema fix preview (confirm/undo discipline
  * lives in App, exactly like the architecture fix loop).
  */
+/**
+ * The schema test-case suite results — the database design's own
+ * LeetCode score, judged deterministically by the schema simulator at
+ * submit time. Independent of the architecture score by design. Failed
+ * rows carry the grounded fix derived from the failed metric itself
+ * （规则·实测）: preview → confirm applies it to the schema draft.
+ */
+export function SchemaSuiteView({
+  suite,
+  onApplyFix,
+}: {
+  suite: SchemaSuiteDTO;
+  onApplyFix?: (title: string, actions: SchemaOpDTO[]) => void;
+}) {
+  return (
+    <div style={{ border: '1px solid #1e293b', borderRadius: 8, padding: '10px 12px', background: '#0b1220', marginBottom: 12 }}>
+      <div style={{ display: 'flex', gap: 14, alignItems: 'baseline', flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 26, fontWeight: 800, color: suite.scorePct >= 80 ? '#4ade80' : suite.scorePct >= 50 ? '#facc15' : '#f87171' }}>
+          {suite.scorePct} 分
+        </span>
+        <b>🗄️ 数据库用例判卷</b>
+        <span style={{ color: '#94a3b8', fontSize: 12.5 }}>
+          通过 {suite.passedCount}/{suite.totalCount} · 由数据库模拟实测判定 · 与架构总分独立
+        </span>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+        {suite.results.map((r) => (
+          <div key={r.caseId} className="case-row">
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span className={`chip ${r.passed ? 'chip-pass' : 'chip-fail'}`}>{r.passed ? '通过' : '未通过'}</span>
+              <b>{r.name}</b>
+              {r.hidden && <span className="chip chip-neutral">隐藏用例</span>}
+            </div>
+            <div style={{ fontSize: 12.5, marginTop: 3, color: '#94a3b8' }}>
+              实测：{r.measuredText} · 要求：{r.thresholdText}
+            </div>
+            {!r.passed && r.failures.length > 0 && (
+              <div style={{ fontSize: 12.5, marginTop: 3, color: '#fca5a5' }}>{r.failures.join('；')}</div>
+            )}
+            {!r.passed && r.fix && onApplyFix && (
+              <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                <button onClick={() => onApplyFix(r.fix!.title, r.fix!.actions)} title="预览这条修复，确认后才应用到数据库设计草稿">
+                  ✨ 应用修复
+                </button>
+                <ActionSourceLabel source="rule" />
+                <span style={{ color: '#94a3b8', fontSize: 12 }}>{r.fix.title}</span>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function SchemaAssessmentView({
   assessment,
   label,
