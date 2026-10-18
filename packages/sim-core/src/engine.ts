@@ -327,7 +327,9 @@ export class SimulationEngine {
         case 'storage': {
           // A hot key adds a write storm that bypasses every cache layer and
           // lands directly on the targeted storage type.
-          if (hotKey && (hotKey.targetType === undefined || hotKey.targetType === node.type)) {
+          const hotKeyTargeted =
+            !!hotKey && (hotKey.targetType === undefined || hotKey.targetType === node.type);
+          if (hotKeyTargeted) {
             inQps += entryTotal * 0.15 * hotKey.magnitude;
           }
           let effectiveCapacity = capacity;
@@ -336,9 +338,20 @@ export class SimulationEngine {
           if (rr > 0) {
             effectiveCapacity = capacity * (1 + rr * traffic.readRatio * 0.7);
           }
-          if (hotKey && (hotKey.targetType === undefined || hotKey.targetType === node.type)) {
-            const key = node.settings.shardKey ?? '';
-            if (node.settings.sharded && BAD_SHARD_KEYS.has(key)) effectiveCapacity *= 0.3;
+          // Shard distribution is a function of the shard KEY, standing in
+          // every scenario — the same口径 as the schema review's 热点分片
+          // finding and the structural bad-shard-key rule: a monotonic key
+          // (created_at / timestamp / auto-increment id…) sends every new
+          // write to the newest shard while the rest idle; a high-
+          // cardinality key (user_id…) spreads writes evenly.
+          const shardKey = node.settings.shardKey ?? '';
+          const monotonicSharding = !!node.settings.sharded && BAD_SHARD_KEYS.has(shardKey);
+          if (hotKeyTargeted) {
+            // Storm concentration, as calibrated: the storm's targeted
+            // store collapses to a fraction of its capacity — hardest for
+            // a monotonic key (one shard takes the storm), mildest for
+            // an evenly-sharded one.
+            if (monotonicSharding) effectiveCapacity *= 0.3;
             else if (node.settings.sharded) effectiveCapacity *= 0.75;
             else effectiveCapacity *= 0.5;
           }
@@ -347,8 +360,17 @@ export class SimulationEngine {
             effectiveCapacity *= 0.55;
           }
           // Writes are more expensive than reads; replica headroom (below)
-          // only helps the read share.
-          const loadFactor = 0.8 * traffic.readRatio + 1.8 * (1 - traffic.readRatio);
+          // only helps the read share. Standing shard concentration is
+          // charged on the WRITE share only: with a monotonic key the
+          // writes land on one shard, so they are costed against that
+          // shard's share (0.3) of the store instead of the whole store.
+          // (When a hot-key storm targets this store, the capacity
+          // multiplier above already prices the concentration in — the
+          // write share is not charged twice.)
+          const writeShare = 1 - traffic.readRatio;
+          const shardWriteFactor = monotonicSharding && !hotKeyTargeted ? 0.3 : 1;
+          const loadFactor =
+            0.8 * traffic.readRatio + (1.8 * writeShare) / shardWriteFactor;
           util = effectiveCapacity > 0 ? (inQps * loadFactor) / effectiveCapacity : 0;
           if (util > 1) {
             errorRate = Math.min(0.95, (util - 1) * 0.8);
