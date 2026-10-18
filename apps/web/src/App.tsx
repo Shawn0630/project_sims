@@ -35,7 +35,8 @@ import { SchemaPanel } from './SchemaPanel';
 import { IconGlyph } from './icons';
 
 type Phase = 'design' | 'run' | 'report';
-type LeftTab = 'desc' | 'schema' | 'cases' | 'subs';
+type LeftTab = 'desc' | 'cases' | 'subs';
+type RightView = 'arch' | 'schema';
 
 interface SubmissionRecord {
   problemId: string;
@@ -65,9 +66,13 @@ const DIFF_STYLE: Record<string, React.CSSProperties> = {
 
 const LEFT_TABS: { id: LeftTab; label: string }[] = [
   { id: 'desc', label: '题目描述' },
-  { id: 'schema', label: '数据库设计' },
   { id: 'cases', label: '测试用例' },
   { id: 'subs', label: '提交记录' },
+];
+
+const RIGHT_VIEWS: { id: RightView; label: string }[] = [
+  { id: 'arch', label: '架构设计' },
+  { id: 'schema', label: '数据库设计' },
 ];
 
 // ------------------------------------------- shared summary builders -----
@@ -146,6 +151,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   const [replayingId, setReplayingId] = useState<string | null>(null);
   const [queueHistory, setQueueHistory] = useState<number[]>([]);
   const [activeTab, setActiveTab] = useState<LeftTab>('desc');
+  const [rightView, setRightView] = useState<RightView>('arch');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [bottomOpen, setBottomOpen] = useState(true);
   const [submissions, setSubmissions] = useState<SubmissionRecord[]>(loadSubmissions);
@@ -587,7 +593,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   const stepIndex = phase === 'design' ? 0 : phase === 'run' ? 1 : 2;
   const nextHint =
     phase === 'design'
-      ? '下一步：在画布上完成设计（数据库设计在左侧「数据库设计」页），然后点「提交设计」判卷——或先点「▶ 运行」看它跑起来。'
+      ? '下一步：在右侧「架构设计」画布上完成设计（表结构在右侧「数据库设计」视图里交卷），然后点「提交设计」判卷——或先点「▶ 运行」看它跑起来。'
       : phase === 'run'
         ? '下一步：设计已锁定、模拟运行中。可以注入场景、杀节点观察现象，或点「提交设计」跑全部用例判卷。'
         : '下一步：在下方结果面板看每个用例的判定，点失败用例看缺陷说明并回放；改设计就「返回设计」后重新提交。';
@@ -703,29 +709,10 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                   ——完整场景清单在「测试用例」页；隐藏 edge cases 提交后才揭示。
                 </div>
                 <p className="hint" style={{ marginTop: 14 }}>
-                  玩法和面试一样：先在右侧画布把设计画完（点任意组件可进入「面试官细究」），
-                  数据库表结构在「数据库设计」页交卷，最后点右上角「提交设计」判卷。
+                  玩法和面试一样：先在右侧「架构设计」画布把设计画完（点任意组件可进入「面试官细究」），
+                  数据库表结构在右侧「数据库设计」视图里交卷，最后点右上角「提交设计」判卷。
                 </p>
               </div>
-            )}
-
-            {activeTab === 'schema' && (
-              <SchemaPanel
-                schema={schemas[problem.id]!}
-                snapshot={snapshot}
-                onChange={(s) => setSchemas({ ...schemas, [problem.id]: s })}
-                assessorNote={assessorLabel ? `评审：${assessorLabel}` : undefined}
-                onReview={async (sch, loadFactor) => {
-                  const r = await evaluateOnServer<SchemaAssessmentDTO>('schema', {
-                    problemName: problem.name,
-                    schema: sch,
-                    loadFactor,
-                  });
-                  setAssessorLabel(r.label);
-                  if (!r.schemaSignals) throw new Error('后端未返回 schema 信号');
-                  return { signals: r.schemaSignals, assessment: r.data };
-                }}
-              />
             )}
 
             {activeTab === 'cases' && (
@@ -779,6 +766,23 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
 
         {/* ------------------------------------------------- workspace --- */}
         <section className="lc-workspace">
+          {/* right-pane view tabs: the two main work surfaces live here —
+              架构设计 (canvas) and 数据库设计 (schema editor). Both stay
+              mounted; switching only toggles visibility so in-progress
+              work in either view is never lost. */}
+          <div className="ws-view-tabs">
+            {RIGHT_VIEWS.map((v) => (
+              <button
+                key={v.id}
+                className={`ws-view-tab ${rightView === v.id ? 'active' : ''}`}
+                onClick={() => setRightView(v.id)}
+              >
+                {v.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="ws-view" style={{ display: rightView === 'arch' ? 'flex' : 'none' }}>
           {/* component palette: slim strip */}
           <div className="palette-strip">
             {categories.map((cat) => (
@@ -936,6 +940,33 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
             >
               ♻️ 全部恢复
             </button>
+          </div>
+          </div>
+
+          {/* -------- 数据库设计 view: the schema editor as a full
+              right-pane surface. Kept mounted alongside the canvas view —
+              drafts live in App state per problem, switching views loses
+              nothing. Review output renders inside the panel, as before. */}
+          <div
+            className="ws-view ws-view-schema"
+            style={{ display: rightView === 'schema' ? 'flex' : 'none' }}
+          >
+            <SchemaPanel
+              schema={schemas[problem.id]!}
+              snapshot={snapshot}
+              onChange={(s) => setSchemas({ ...schemas, [problem.id]: s })}
+              assessorNote={assessorLabel ? `评审：${assessorLabel}` : undefined}
+              onReview={async (sch, loadFactor) => {
+                const r = await evaluateOnServer<SchemaAssessmentDTO>('schema', {
+                  problemName: problem.name,
+                  schema: sch,
+                  loadFactor,
+                });
+                setAssessorLabel(r.label);
+                if (!r.schemaSignals) throw new Error('后端未返回 schema 信号');
+                return { signals: r.schemaSignals, assessment: r.data };
+              }}
+            />
           </div>
 
           {/* ------------------------- bottom results panel (collapsible) --- */}

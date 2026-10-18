@@ -258,6 +258,24 @@ fieldset { margin: 0; padding: 10px; }
   padding: 10px 12px; overflow-y: auto;
 }
 
+/* right-pane view switcher: 架构设计 / 数据库设计 — the two work surfaces */
+.ws-view-tabs {
+  display: flex; gap: 2px; flex: 0 0 auto;
+  border-bottom: 1px solid var(--border);
+}
+.ws-view-tab {
+  background: transparent; border: none; border-bottom: 2px solid transparent;
+  border-radius: 0; padding: 7px 14px; font-size: 13.5px; color: var(--muted);
+}
+.ws-view-tab:hover:not(:disabled) { background: transparent; color: var(--text); }
+.ws-view-tab.active { color: var(--text); font-weight: 600; border-bottom-color: var(--accent); }
+
+/* one right-pane view (arch or schema). Both stay mounted; the inactive
+   one is display:none via inline style so no in-progress work is lost. */
+.ws-view { display: flex; flex-direction: column; gap: 8px; flex: 1 0 auto; min-height: 0; }
+.ws-view-schema { overflow-y: auto; padding: 6px 4px 12px; }
+.ws-view-schema .schema-table-card { padding: 14px 16px; }
+
 .palette-strip {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
