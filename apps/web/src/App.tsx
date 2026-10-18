@@ -27,6 +27,7 @@ import {
   type ProblemCaseDTO,
   type ProblemPack,
   type ProblemSchemaDTO,
+  type NextStepDTO,
   type SchemaAssessmentDTO,
   type SchemaOpDTO,
   type SchemaSignalsDTO,
@@ -60,6 +61,7 @@ import {
   ActionSourceLabel,
   CaseList,
   CoverageLine,
+  NextStepsSection,
   ProbeSection,
   StructuralList,
   scoreColor,
@@ -262,6 +264,17 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   const [assessmentCoverage, setAssessmentCoverage] = useState<ActionCoverageDTO | null>(null);
   const [probeCoverage, setProbeCoverage] = useState<ActionCoverageDTO | null>(null);
   const [schemaCoverage, setSchemaCoverage] = useState<ActionCoverageDTO | null>(null);
+
+  // Next steps: ONE pinned action per FAILED case, generated with the
+  // submit (its own evaluate kind) and rendered at the top of the 判卷结果
+  // tab. Like every other result here it belongs to the submitted
+  // snapshot — the stale banner covers it once the design diverges.
+  const [nextSteps, setNextSteps] = useState<NextStepDTO[] | null>(null);
+  const [nextStepsBusy, setNextStepsBusy] = useState(false);
+  const [nextStepsError, setNextStepsError] = useState<string | null>(null);
+  const [nextStepsNote, setNextStepsNote] = useState<string | null>(null);
+  const [nextStepsLabel, setNextStepsLabel] = useState('');
+  const [nextStepsCoverage, setNextStepsCoverage] = useState<ActionCoverageDTO | null>(null);
 
   // --------------------------------------------- schema evaluation layer -
   // There is NO standalone schema review anymore: the AI assessment is
@@ -563,6 +576,11 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setProbeResults(null);
     setProbeNote(null);
     setProbeLabel('');
+    setNextSteps(null);
+    setNextStepsError(null);
+    setNextStepsNote(null);
+    setNextStepsLabel('');
+    setNextStepsCoverage(null);
     setHighlights(new Map());
     setActiveSim(null);
     setSimReadout(null);
@@ -629,6 +647,11 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setProbeResults(null);
     setProbeNote(null);
     setProbeLabel('');
+    setNextSteps(null);
+    setNextStepsError(null);
+    setNextStepsNote(null);
+    setNextStepsLabel('');
+    setNextStepsCoverage(null);
     setAssessmentCoverage(null);
     setProbeCoverage(null);
     setSchemaCoverage(null);
@@ -662,6 +685,9 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     // no separate schema-review trigger anymore. Its conclusions render
     // only in the results page's 「数据库评审」 tab.
     void runSchemaAssessment(loadFactor);
+    // And the per-case next steps (their own evaluate kind), rendered at
+    // the top of the 判卷结果 tab: one pinned action per failed case.
+    void runNextSteps(result, jr.structural);
   };
 
   /**
@@ -750,6 +776,68 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
       setSchemaError('数据库评审调用失败：后端未返回结论，请确认后端在运行后重新提交。');
     } finally {
       setSchemaBusy(false);
+    }
+  };
+
+  /**
+   * Per-case next steps — ONE backend evaluate call for THIS submission's
+   * failed cases. The server ladder guarantees a step with a validated
+   * action per red case; when the AI part is unavailable the response is
+   * scripted-sourced and the section says so (the steps shown are then
+   * the rule / measured synthesis). A failed REQUEST gets an honest
+   * error line — the deterministic case-row fixes below still work.
+   */
+  const runNextSteps = async (s: SuiteResultDTO, structuralFindings: StructuralFindingDTO[]) => {
+    const p = problemRef.current;
+    const failed = s.results.filter((r) => !r.passed);
+    if (!failed.length) {
+      setNextSteps([]);
+      return;
+    }
+    setNextStepsBusy(true);
+    setNextStepsError(null);
+    setNextStepsNote(null);
+    try {
+      const caseById = new Map(p.testCases.map((tc) => [tc.id, tc]));
+      const r = await evaluateOnServer<NextStepDTO[]>(
+        'next-steps',
+        {
+          problemName: p.name,
+          designSummary: buildDesignSummary(designRef.current),
+          schemaSummary: schemaSummaryOf(schemasRef.current[p.id]!),
+          workloadSummary: workloadSummaryOf(p),
+          structuralFindings,
+          failedCases: failed.map((fc) => {
+            const tc = caseById.get(fc.caseId);
+            return {
+              caseId: fc.caseId,
+              name: fc.name,
+              failures: fc.failures,
+              measured: fc.measured,
+              hottestNode: fc.measured.hottestNode,
+              ...(tc && !tc.locked ? { thresholds: tc.thresholds } : {}),
+            };
+          }),
+        },
+        designRef.current,
+        p.id,
+      );
+      setNextStepsLabel(r.label);
+      setNextSteps(r.data);
+      setNextStepsCoverage(r.actionCoverage ?? null);
+      if (r.source === 'scripted') {
+        setNextStepsNote(
+          llmConfigured
+            ? 'AI 下一步不可用（本次调用失败），以下为规则·实测合成的下一步。'
+            : '未配置 LLM，AI 下一步不可用——以下为规则·实测合成的下一步。',
+        );
+      }
+    } catch {
+      setNextStepsError(
+        '下一步生成失败：后端未返回，请确认后端在运行后重新提交。用例行里的规则修复仍然可用。',
+      );
+    } finally {
+      setNextStepsBusy(false);
     }
   };
 
@@ -1370,13 +1458,14 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
               </span>
             )}
           </div>
-          {(probeBusy || assessmentBusy || schemaBusy) && (
+          {(probeBusy || assessmentBusy || schemaBusy || nextStepsBusy) && (
             <div className="res-progress">
               ⏳ 评审流程进行中：
               {[
                 probeBusy && '探测用例生成 + 仿真验证',
                 assessmentBusy && '提交点评',
                 schemaBusy && '数据库评审',
+                nextStepsBusy && '下一步建议',
               ]
                 .filter(Boolean)
                 .join(' · ')}
@@ -1426,6 +1515,16 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                       </span>
                       <button onClick={onSubmit}>⟳ 重新判卷</button>
                     </div>
+                    <NextStepsSection
+                      busy={nextStepsBusy}
+                      error={nextStepsError}
+                      note={nextStepsNote}
+                      steps={nextSteps}
+                      caseNames={Object.fromEntries(suite.results.map((r) => [r.caseId, r.name]))}
+                      sourceLabel={nextStepsLabel}
+                      coverage={nextStepsCoverage}
+                      onApplyFix={enterPreview}
+                    />
                     <CaseList
                       problem={problem}
                       suite={suite}

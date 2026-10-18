@@ -1,5 +1,5 @@
 import type { ComponentTypeId } from '@sds/components';
-import type { EditOp } from '@sds/driver';
+import type { ActionSource, EditOp } from '@sds/driver';
 import type { ProblemDef, TestCase } from '@sds/problems';
 import { SimulationEngine, type Design, type MetricsSnapshot } from '@sds/sim-core';
 
@@ -41,6 +41,14 @@ export interface CaseFix {
   findingId: string;
   title: string;
   actions: EditOp[];
+  /**
+   * Provenance of the actions (the UI badges it next to the apply
+   * button). Case-linked fixes are deterministic by construction —
+   * structural rules and the measured synthesis — so this is 'rule'
+   * whenever set; the field exists so every fix entry point in the UI
+   * can render its badge from data instead of assuming.
+   */
+  actionSource?: ActionSource;
 }
 
 export interface CaseResult {

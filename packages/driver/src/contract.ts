@@ -1091,6 +1091,131 @@ export function parseProbeCases(json: unknown): ProbeCase[] {
   return out;
 }
 
+// --------------------------------------------------------- next steps ---
+//
+// The per-case counterpart of the submission review. The review (AI 评审)
+// is BROAD qualitative commentary over the whole submission; a next step
+// is ONE pinned action per FAILED case — the single highest-leverage move
+// for that case, stated against its measured numbers, carrying validated
+// actions the user can apply and immediately re-judge. The model sees
+// ONLY the failed cases (with their measured-vs-threshold deltas and the
+// measured hottest node of each run), never the passed ones.
+
+/** One failed case, briefed for next-step generation. */
+export interface NextStepFailedCase {
+  caseId: string;
+  name: string;
+  /** Judge-produced failure lines — measured vs threshold, verbatim. */
+  failures: string[];
+  measured: CaseMeasuredLike;
+  /**
+   * The measured bottleneck of this case's run: which node peaked
+   * hottest, and how hot (0..>1). Null when no node registered load.
+   */
+  hottestNode?: { nodeId: string; type: ComponentTypeId; util: number } | null;
+  /** The case's thresholds (checker units), when the caller has them. */
+  thresholds?: ExecutedScenarioThresholds;
+}
+
+export interface NextStepsContext {
+  problemName: string;
+  /** Human-readable summary of the submitted design graph. */
+  designSummary: string;
+  schemaSummary?: string;
+  workloadSummary: string;
+  /** Deterministic structural findings — only their titles are briefed. */
+  structuralFindings: StructuralFindingLike[];
+  failedCases: NextStepFailedCase[];
+}
+
+/** One pinned next action for one failed case. */
+export interface NextStep {
+  caseId: string;
+  /** The action in one line, e.g. 「把发帖链路改异步：先入队列再扩散」. */
+  title: string;
+  /** Why this step, for this case — must cite its measured numbers. */
+  rationale: string;
+  /**
+   * The step's executable form, in the edit-op vocabulary. Under the
+   * action guarantee every step ships with ≥1 action validated against
+   * the submitted design whenever one is constructible at all (the
+   * server ladder: first-pass validation → ONE repair re-prompt →
+   * measured/rule synthesis → universal fallback).
+   */
+  actions?: EditOp[];
+  /** Provenance of `actions` (the UI renders it next to the apply button). */
+  actionSource?: ActionSource;
+}
+
+export function buildNextStepsPrompt(ctx: NextStepsContext): { system: string; user: string } {
+  const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
+  const caseBlock = (c: NextStepFailedCase) => {
+    const m = c.measured;
+    const t = c.thresholds;
+    const lines = [
+      `- 用例「${c.name}」（caseId: ${c.caseId}）未通过：`,
+      `  判卷失败项：${c.failures.join('；') || '（未给出）'}`,
+      `  实测：错误率 ${pct(m.errorRate)}${t?.maxErrorRate !== undefined ? `（阈值 ${pct(t.maxErrorRate)}）` : ''} · P99 ${Math.round(m.p99Ms)}ms${t?.maxP99Ms !== undefined ? `（阈值 ${t.maxP99Ms}ms）` : ''} · 成本 $${m.costPerHour.toFixed(0)}/h${t?.maxCostPerHour !== undefined ? `（阈值 $${t.maxCostPerHour}/h）` : ''} · 存储入站 ${Math.round(m.maxStorageQps)} QPS${t?.maxStorageQps !== undefined ? `（阈值 ${t.maxStorageQps}）` : ''} · 最热利用率 ${pct(m.hottestUtil)}${t?.maxHottestUtil !== undefined ? `（阈值 ${pct(t.maxHottestUtil)}）` : ''} · 读旧 ${pct(m.staleReadRate)}${t?.maxStaleReadRate !== undefined ? `（阈值 ${pct(t.maxStaleReadRate)}）` : ''}${m.queueDepthMax > 0 ? ` · 最大积压 ${Math.round(m.queueDepthMax).toLocaleString()} 条${t?.maxQueueDepth !== undefined ? `（阈值 ${t.maxQueueDepth.toLocaleString()}）` : ''}` : ''}`,
+    ];
+    if (c.hottestNode) {
+      lines.push(
+        `  实测最热节点：${c.hottestNode.nodeId}（类型 ${c.hottestNode.type}），峰值利用率 ${pct(c.hottestNode.util)}——这条用例的瓶颈在这里（除非你能指出更上游的成因）。`,
+      );
+    }
+    return lines.join('\n');
+  };
+  return {
+    system:
+      '你是一位资深系统设计面试官，正在给候选人指"下一步"。判卷刚结束：分数已由代码给出，你不改判。你的任务只有一个：对每一个未通过的用例，给出恰好一条下一步——杠杆最高的那一个动作，应用之后值得立刻重新提交验证。不要写全面点评（那是评审环节的事），不要给一个用例列一串清单。只输出 JSON，不要输出其它文字。',
+    user:
+      `题目：${ctx.problemName}\n候选人设计：\n${ctx.designSummary}\n\n` +
+      (ctx.schemaSummary ? `数据库 schema：\n${ctx.schemaSummary}\n\n` : '') +
+      `本题读写需求：${ctx.workloadSummary}\n\n` +
+      `结构缺陷（确定性规则，仅供参考，不要逐条复述）：\n${ctx.structuralFindings.map((f) => `- ${f.title}`).join('\n') || '（无）'}\n\n` +
+      `未通过的用例（共 ${ctx.failedCases.length} 个，逐个给下一步）：\n${ctx.failedCases.map(caseBlock).join('\n')}\n\n` +
+      `【硬性要求】\n` +
+      `- 每个未通过用例恰好一条 step，caseId 必须逐字抄上面给出的 caseId；多给、漏给、编造 caseId 的 step 会被系统丢弃。\n` +
+      `- title 是一句话动作（做什么、对哪个组件），不是问题描述；rationale 必须引用该用例的实测数字（差阈值多少、最热节点利用率多少），说明为什么这一步是这一例的最高杠杆。\n` +
+      `- 每条 step 必须附带 actions：一键可应用的结构化改法（用户预览确认后由系统执行），只能用这三种操作，且 nodeId 必须引用上面设计摘要里出现的 id：\n` +
+      `  - {"op":"setSetting","nodeId":"节点id","key":"参数名","value":值}：参数名只能是该组件类型合法的参数——通用 replicas（整数）/ capacityScale；网关 rateLimitPerSec；缓存 mutexRebuild（布尔）/ eviction；负载均衡 lbAlgorithm；关系型 DB 与 NoSQL 的 sharded（布尔）/ shardKey（字符串）/ readReplicas（整数）/ consistency。\n` +
+      `  - {"op":"addComponent","componentType":"cache","connectFromId":"上游节点id","connectToId":"下游节点id"}：在两个已有节点之间插入一个新组件（两端 id 至少给一个）。要把两个新组件串成链（例如先插队列、再插消费它的 Worker），给第一个 addComponent 写 "newNodeId":"自取的id"，后续操作用这个 id 引用新节点。\n` +
+      `  - {"op":"addEdge","fromId":"节点id","toId":"节点id"}：新增一条连线。\n` +
+      `- 没有合法 actions 的 step 会被系统判为不合格（先触发修复轮，还不行就由规则合成替换），所以第一次就给对：id 抄准、参数合法、每条最多 3 个操作。扩容要一步到位：按实测利用率把目标节点的容量/副本提到能把利用率压到 80% 以下，不要只加一点点。\n\n` +
+      `输出 JSON：{"steps":[{"caseId":"…","title":"一句话动作","rationale":"引用实测数字的理由","actions":[{"op":"setSetting","nodeId":"…","key":"replicas","value":3}]}]}`,
+  };
+}
+
+/**
+ * Parse the next-steps reply: {"steps":[ ... ]}. Defensive like every
+ * parser here: steps naming a caseId that is not one of THIS submission's
+ * failed cases are dropped (the model does not get to invent work), a
+ * second step for the same case is dropped (exactly one per case), and
+ * actions are shape-sanitized (semantic validation is the server
+ * ladder's job). Throws only when the reply is unusable as a whole; an
+ * empty-but-well-formed reply yields [] and the ladder synthesizes the
+ * steps deterministically.
+ */
+export function parseNextSteps(json: unknown, failedCaseIds: ReadonlySet<string>): NextStep[] {
+  const arr = Array.isArray(json) ? json : (json as { steps?: unknown })?.steps;
+  if (!Array.isArray(arr)) throw new Error('next-steps: bad shape');
+  const out: NextStep[] = [];
+  const seen = new Set<string>();
+  for (const raw of arr) {
+    const o = raw as { caseId?: unknown; title?: unknown; rationale?: unknown; actions?: unknown } | null;
+    if (!o || typeof o.caseId !== 'string' || typeof o.title !== 'string' || !o.title.trim()) continue;
+    if (!failedCaseIds.has(o.caseId) || seen.has(o.caseId)) continue;
+    seen.add(o.caseId);
+    const actions = sanitizeEditOps(o.actions);
+    out.push({
+      caseId: o.caseId,
+      title: o.title.trim(),
+      rationale: typeof o.rationale === 'string' ? o.rationale : '',
+      ...(actions.length ? { actions } : {}),
+    });
+  }
+  return out;
+}
+
 // ------------------------------------------------------ action repair ---
 //
 // Ladder step 2. When a first-pass evaluation ships findings whose actions
@@ -1104,7 +1229,7 @@ export function parseProbeCases(json: unknown): ProbeCase[] {
 export interface ActionRepairItem {
   /** Index of the item within its batch — the reply refers back by it. */
   index: number;
-  kind: 'finding' | 'probe' | 'schema';
+  kind: 'finding' | 'probe' | 'schema' | 'step';
   title: string;
   detail: string;
   /** Why the first pass's actions did not survive (verbatim-ish). */
@@ -1126,7 +1251,7 @@ export function buildActionRepairPrompt(ctx: ActionRepairContext): { system: str
   const archItems = ctx.items.filter((i) => i.kind !== 'schema');
   const schemaItems = ctx.items.filter((i) => i.kind === 'schema');
   const itemLine = (i: ActionRepairItem) =>
-    `- [${i.index}] ${i.kind === 'schema' ? 'schema 建议' : i.kind === 'probe' ? '探测用例的修复' : '评审发现'}「${i.title}」：${i.detail}\n  上一轮动作的问题：${i.errors.join('；') || '（没有给 actions）'}`;
+    `- [${i.index}] ${i.kind === 'schema' ? 'schema 建议' : i.kind === 'probe' ? '探测用例的修复' : i.kind === 'step' ? '下一步建议' : '评审发现'}「${i.title}」：${i.detail}\n  上一轮动作的问题：${i.errors.join('；') || '（没有给 actions）'}`;
   return {
     system:
       '你是一位资深系统设计面试官，正在执行【动作修复轮】。上一轮评审里有几条发现没有给出合法的一键修复动作（或给的动作没通过服务端校验）。你的唯一任务：为列出的每一条补出合法的结构化动作。不要改写发现的文字，不要新增发现，不要解释——只输出 JSON。',
@@ -1140,7 +1265,7 @@ export function buildActionRepairPrompt(ctx: ActionRepairContext): { system: str
       `架构动作（finding/probe 条目）只能用三种操作：{"op":"setSetting","nodeId":"合法节点id","key":"该类型合法参数","value":值} / {"op":"addComponent","componentType":"组件类型","connectFromId":"合法节点id","connectToId":"合法节点id","newNodeId":"串联时给第一个新节点取的id"} / {"op":"addEdge","fromId":"合法节点id","toId":"合法节点id"}。\n` +
       `Schema 动作（schema 条目）只能用四种操作：{"op":"setShardKey","table":"表名","field":"字段名或 null"} / {"op":"addIndex","table":"表名","field":"字段名"} / {"op":"setPrimaryKeyGen","table":"表名","gen":"auto|snowflake|uuid|business"} / {"op":"setEngine","table":"表名","engine":"relational|nosql"}。\n` +
       `每条最多 3 个操作；动作要对症这条发现说的问题，不要给无关的通用扩容。\n\n` +
-      `输出 JSON：{"repairs":[{"index":0,"actions":[{"op":"setSetting","nodeId":"…","key":"replicas","value":2}]},{"index":2,"schemaActions":[{"op":"addIndex","table":"…","field":"…"}]}]}（finding/probe 条目用 actions，schema 条目用 schemaActions）`,
+      `输出 JSON：{"repairs":[{"index":0,"actions":[{"op":"setSetting","nodeId":"…","key":"replicas","value":2}]},{"index":2,"schemaActions":[{"op":"addIndex","table":"…","field":"…"}]}]}（finding/probe/step 条目用 actions，schema 条目用 schemaActions）`,
   };
 }
 

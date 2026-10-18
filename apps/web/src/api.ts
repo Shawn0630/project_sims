@@ -184,6 +184,8 @@ export interface CaseFixDTO {
   findingId: string;
   title: string;
   actions: EditOpDTO[];
+  /** Provenance of the actions — deterministic fixes are 'rule'. */
+  actionSource?: ActionSourceDTO;
 }
 
 export interface CaseResultDTO {
@@ -343,6 +345,42 @@ export interface FollowUpContextDTO {
   schemaSummary?: string;
   failedCases: { id: string; name: string; failures: string[] }[];
   structuralFindings: StructuralFindingDTO[];
+}
+
+/**
+ * One pinned next action for one FAILED case — the per-case counterpart
+ * of the broad AI review. The server ladder guarantees every failed case
+ * ships a step with ≥1 validated action; `actionSource` says where the
+ * actions came from (AI 生成 / AI·已修复 / 规则·实测 / 兜底）.
+ */
+export interface NextStepDTO {
+  caseId: string;
+  /** The action in one line. */
+  title: string;
+  /** Why — cites the case's measured numbers. */
+  rationale: string;
+  actions?: EditOpDTO[];
+  actionSource?: ActionSourceDTO;
+}
+
+/** Context for next-step generation — the submission's FAILED cases only. */
+export interface NextStepsContextDTO {
+  problemName: string;
+  designSummary: string;
+  schemaSummary?: string;
+  workloadSummary: string;
+  structuralFindings: StructuralFindingDTO[];
+  failedCases: {
+    caseId: string;
+    name: string;
+    /** Judge failure lines — measured vs threshold, verbatim. */
+    failures: string[];
+    measured: CaseMeasuredDTO;
+    /** The measured bottleneck of this case's run. */
+    hottestNode?: { nodeId: string; type: ComponentTypeId; util: number } | null;
+    /** The case's thresholds, when the pack exposes them (visible cases). */
+    thresholds?: CaseThresholdsDTO;
+  }[];
 }
 
 /** Context for the post-submission qualitative review. */
@@ -555,11 +593,17 @@ export function evaluateOnServer<T>(
   problemId?: string,
 ): Promise<EvaluateResponseDTO<T>>;
 export function evaluateOnServer<T>(
+  kind: 'next-steps',
+  context: NextStepsContextDTO,
+  design?: Design,
+  problemId?: string,
+): Promise<EvaluateResponseDTO<T>>;
+export function evaluateOnServer<T>(
   kind: 'schema',
   context: { problemName: string; schema: ProblemSchemaDTO; loadFactor?: number },
 ): Promise<EvaluateResponseDTO<T>>;
 export function evaluateOnServer<T>(
-  kind: 'submission' | 'schema' | 'followups' | 'probe',
+  kind: 'submission' | 'schema' | 'followups' | 'probe' | 'next-steps',
   context: unknown,
   design?: Design,
   problemId?: string,

@@ -1,6 +1,7 @@
 import { COMPONENT_MAP, componentDef } from '@sds/components';
 import {
   settingRuleFor,
+  synthesizeCapacityFixForNode,
   validateEditOps,
   validateSchemaOps,
   type SchemaReviewReport,
@@ -13,6 +14,8 @@ import {
   type ActionSource,
   type DriverFinding,
   type EditOp,
+  type NextStep,
+  type NextStepFailedCase,
   type NonMechanicalReason,
   type ParsedRepair,
   type ProbeCase,
@@ -931,4 +934,212 @@ export async function guaranteeSchemaActions(
     return next;
   });
   return { suggestions: out, coverage };
+}
+
+// ------------------------------------------------------- next-step ladder -
+
+/** One-line rendering of an op list, for steps whose actions were
+ *  synthesized server-side (their title must describe the ACTION that
+ *  actually ships, not the model's discarded proposal). */
+function describeOpsBrief(ops: EditOp[], design: Design): string {
+  const nameOf = (id: string): string => {
+    const n = design.nodes.find((x) => x.id === id);
+    return n ? `${componentDef(n.type).name}${n.label ? `「${n.label}」` : ''}` : id;
+  };
+  return ops
+    .map((op) => {
+      if (op.op === 'setSetting') {
+        return `把 ${nameOf(op.nodeId)} 的 ${op.key} 调到 ${JSON.stringify(op.value)}`;
+      }
+      if (op.op === 'addComponent') {
+        return `插入一个${componentDef(op.componentType).name}${op.connectFromId ? `（接在 ${nameOf(op.connectFromId)} 之后）` : ''}`;
+      }
+      return `新增连线：${nameOf(op.fromId)} → ${nameOf(op.toId)}`;
+    })
+    .join('；');
+}
+
+interface NextStepLadderOpts {
+  /** Provenance of surviving first-pass actions ('llm' | 'rule'). */
+  baseSource: ActionSource;
+  repairCall?: RepairCall | null;
+  problem?: ProblemDef;
+  problemName: string;
+  designSummary?: string;
+}
+
+/**
+ * Guarantee actions on per-case next steps. The input steps are the
+ * model's (already filtered to this submission's failed cases by the
+ * contract parser); the output carries EXACTLY ONE step per failed
+ * case, in the cases' order. The ladder mirrors the findings ladder,
+ * with one next-steps-specific rung inserted before generic synthesis:
+ *
+ *   1. first-pass validation ('llm');
+ *   2. ONE repair re-prompt for the lacking steps (their measured facts
+ *      ride along — the model repairs against the same numbers);
+ *   3. MEASURED CAPACITY SYNTHESIS — bf09874's machinery
+ *      (synthesizeCapacityFixForNode on the case's OWN measured hottest
+ *      node, same applicability gate as attachCaseFixes: util > 100%
+ *      or over the case's own hottest-util threshold). This is also
+ *      what the scripted path produces for a bottlenecked case, so the
+ *      offline flow and the AI-failure degradation land in the same
+ *      place, honestly tagged 'rule';
+ *   4. category synthesis, then the universal fallback.
+ *
+ * Whenever a synthesis rung supplies the actions, title and rationale
+ * are REGENERATED from the measured data — never left describing the
+ * model's discarded proposal. There is no non-mechanical escape here:
+ * a "next step" that cannot be acted on is a contradiction, so the
+ * coverage denominator is simply the failed-case count.
+ */
+export async function guaranteeNextStepActions(
+  modelSteps: NextStep[],
+  failedCases: NextStepFailedCase[],
+  design: Design,
+  opts: NextStepLadderOpts,
+): Promise<{ steps: NextStep[]; coverage: ActionCoverage }> {
+  const coverage = emptyCoverage();
+  const globalHottestId = opts.problem
+    ? (measureHottestNodeId(opts.problem, design) ?? heuristicHottestNodeId(design))
+    : heuristicHottestNodeId(design);
+  const stepByCase = new Map(modelSteps.map((s) => [s.caseId, s]));
+
+  interface Work {
+    brief: NextStepFailedCase;
+    title: string;
+    rationale: string;
+    rawActions?: EditOp[];
+    actions?: EditOp[];
+    actionSource?: ActionSource;
+  }
+  const work: Work[] = failedCases.map((brief) => {
+    const model = stepByCase.get(brief.caseId);
+    return {
+      brief,
+      title: model?.title ?? '',
+      rationale: model?.rationale ?? '',
+      ...(model?.actions ? { rawActions: model.actions } : {}),
+    };
+  });
+
+  // Rung 1 — first-pass validation.
+  let lacking: Work[] = [];
+  for (const w of work) {
+    const valid = validateEditOps(w.rawActions, design);
+    if (valid.length) {
+      w.actions = valid;
+      w.actionSource = opts.baseSource;
+    } else {
+      lacking.push(w);
+    }
+  }
+
+  // Rung 2 — one bounded repair call for everything still lacking.
+  if (opts.repairCall && lacking.length) {
+    const items: ActionRepairItem[] = lacking.map((w, i) => {
+      const hot = w.brief.hottestNode;
+      const facts =
+        `判卷失败项：${w.brief.failures.join('；') || '（未给出）'}` +
+        (hot
+          ? `；实测最热节点 ${hot.nodeId}（${hot.type}），峰值利用率 ${Math.round(hot.util * 100)}%`
+          : '');
+      return {
+        index: i,
+        kind: 'step',
+        title: w.title || `用例「${w.brief.name}」的下一步`,
+        detail: `${w.rationale ? `${w.rationale} ` : ''}${facts}`,
+        errors: diagnoseEditOps(w.rawActions, design),
+      };
+    });
+    let repairs: Map<number, ParsedRepair> = new Map();
+    try {
+      const json = await opts.repairCall(
+        buildActionRepairPrompt({
+          problemName: opts.problemName,
+          items,
+          legalArch: legalArchVocab(design),
+          ...(opts.designSummary ? { designSummary: opts.designSummary } : {}),
+        }),
+      );
+      if (json) repairs = parseActionRepair(json);
+    } catch {
+      repairs = new Map();
+    }
+    const still: Work[] = [];
+    lacking.forEach((w, i) => {
+      const r = repairs.get(i);
+      const valid = r?.archActions ? validateEditOps(r.archActions, design) : [];
+      if (valid.length) {
+        w.actions = valid;
+        w.actionSource = 'repaired';
+        if (!w.title) w.title = describeOpsBrief(valid, design);
+        if (!w.rationale) {
+          w.rationale = `针对这一例的判卷实测（${w.brief.failures.join('；')}），先做这一步，再重新提交验证。`;
+        }
+      } else {
+        still.push(w);
+      }
+    });
+    lacking = still;
+  }
+
+  // Rungs 3–5 — measured capacity, category synthesis, universal fallback.
+  for (const w of lacking) {
+    const hot = w.brief.hottestNode;
+    const overOwnThreshold =
+      w.brief.thresholds?.maxHottestUtil !== undefined &&
+      hot !== null &&
+      hot !== undefined &&
+      hot.util > w.brief.thresholds.maxHottestUtil;
+    if (hot && (hot.util > 1 || overOwnThreshold)) {
+      const fix = synthesizeCapacityFixForNode(design, hot.nodeId, hot.util);
+      if (fix) {
+        w.actions = fix.actions;
+        w.actionSource = 'rule';
+        w.title = fix.title;
+        w.rationale =
+          `判卷实测：${w.brief.failures.join('；') || '未通过'}。这一例的瓶颈就压在实测最热的节点上——` +
+          `先按实测利用率把它的容量一步扩到位（目标利用率约 80%），再重新提交看这一例是否翻绿。`;
+        continue;
+      }
+    }
+    const text = `${w.brief.name} ${w.rationale} ${w.brief.failures.join(' ')}`;
+    const synth = synthesizeArchByCategory(
+      inferCategory(text),
+      text,
+      design,
+      hot ? [hot.nodeId] : [],
+      hot?.nodeId ?? globalHottestId,
+    );
+    if (synth.length) {
+      w.actions = synth;
+      w.actionSource = 'rule';
+      w.title = describeOpsBrief(synth, design);
+      w.rationale = `针对这一例的判卷实测（${w.brief.failures.join('；')}），先做这一步，再重新提交验证。`;
+      continue;
+    }
+    const fb = universalArchFallback(design, hot?.nodeId ?? globalHottestId);
+    if (fb.length) {
+      w.actions = fb;
+      w.actionSource = 'fallback';
+      w.title = describeOpsBrief(fb, design);
+      w.rationale = `这一例的实测（${w.brief.failures.join('；')}）没有更具体的规则解，先给最相关的节点留出余量，再重新提交验证。`;
+    }
+  }
+
+  tally(
+    coverage,
+    work.map((w) => ({
+      ...(w.actions?.length ? { actions: w.actions, actionSource: w.actionSource } : {}),
+      escaped: false,
+    })),
+  );
+  const steps: NextStep[] = work.map((w) => ({
+    caseId: w.brief.caseId,
+    title: w.title || `用例「${w.brief.name}」的下一步`,
+    rationale: w.rationale,
+    ...(w.actions?.length ? { actions: w.actions, actionSource: w.actionSource } : {}),
+  }));
+  return { steps, coverage };
 }

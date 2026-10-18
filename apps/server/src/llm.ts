@@ -4,12 +4,14 @@ import {
   ScriptedDriver,
   buildFollowUpPrompt,
   buildGenerationPrompt,
+  buildNextStepsPrompt,
   buildProbePrompt,
   buildSchemaPrompt,
   buildSubmissionPrompt,
   buildWholeProblemPrompt,
   parseFollowUps,
   parseGeneration,
+  parseNextSteps,
   parseProbeCases,
   parseSchemaAssessment,
   parseSubmissionAssessment,
@@ -18,6 +20,8 @@ import {
   type FollowUpContext,
   type FollowUpQuestion,
   type GenerationContext,
+  type NextStep,
+  type NextStepsContext,
   type ParsedGeneration,
   type ParsedWholeProblem,
   type ProbeCase,
@@ -32,6 +36,7 @@ import {
 import type { ProblemDef, ProblemSchema } from '@sds/problems';
 import {
   guaranteeFindingActions,
+  guaranteeNextStepActions,
   guaranteePredictionActions,
   guaranteeSchemaActions,
   type RepairCall,
@@ -80,7 +85,7 @@ export interface LlmConfig {
   model: string;
 }
 
-export type EvaluateKind = 'submission' | 'schema' | 'followups' | 'probe';
+export type EvaluateKind = 'submission' | 'schema' | 'followups' | 'probe' | 'next-steps';
 
 export interface EvaluateOutcome<T> {
   source: 'llm' | 'scripted';
@@ -96,9 +101,9 @@ export interface EvaluateOutcome<T> {
   viaUserChoice: boolean;
   /**
    * Action-guarantee accounting for this evaluation (submission / probe /
-   * schema kinds): how many assessed findings ship ≥1 validated action,
-   * broken down by provenance. Absent on kinds without actions
-   * (followups).
+   * schema / next-steps kinds): how many assessed items ship ≥1
+   * validated action, broken down by provenance. Absent on kinds
+   * without actions (followups).
    */
   actionCoverage?: ActionCoverage;
 }
@@ -579,6 +584,56 @@ export async function evaluateProbes(
         designSummary: ctx.designSummary,
       });
       return { data: r.cases, coverage: r.coverage };
+    },
+  );
+}
+
+/**
+ * The per-case next steps: ONE pinned, applicable action per FAILED
+ * case, proposed by the model against the case's measured numbers
+ * (division of labour: the submission review is broad commentary; this
+ * is the single move to make next, per red case).
+ *
+ * The scripted path needs no ScriptedDriver method: its "script" IS the
+ * ladder's deterministic synthesis (measured capacity first), which
+ * lives server-side because it needs the checker — so scriptedFn
+ * returns nothing and the enrich step constructs every step, honestly
+ * sourced 'rule'/'fallback'. The same degradation serves an LLM
+ * failure: runLogged falls back, the ladder still ships steps.
+ */
+export async function evaluateNextSteps(
+  ctx: NextStepsContext,
+  profileId?: string,
+  design?: Design,
+  problem?: ProblemDef,
+): Promise<EvaluateOutcome<NextStep[]>> {
+  const failedIds = new Set(ctx.failedCases.map((c) => c.caseId));
+  return runLogged(
+    'next-steps',
+    ctx,
+    () => buildNextStepsPrompt(ctx),
+    (json) => parseNextSteps(json, failedIds),
+    async () => [],
+    profileId,
+    async (data, repairCall, source) => {
+      if (!design) {
+        // No design to validate against: unvalidated ops never ship.
+        const steps = data.map((s) => {
+          const next = { ...s };
+          delete next.actions;
+          delete next.actionSource;
+          return next;
+        });
+        return { data: steps, coverage: zeroCoverage(ctx.failedCases.length) };
+      }
+      const r = await guaranteeNextStepActions(data, ctx.failedCases, design, {
+        baseSource: source === 'llm' ? 'llm' : 'rule',
+        repairCall,
+        ...(problem ? { problem } : {}),
+        problemName: ctx.problemName,
+        designSummary: ctx.designSummary,
+      });
+      return { data: r.steps, coverage: r.coverage };
     },
   );
 }

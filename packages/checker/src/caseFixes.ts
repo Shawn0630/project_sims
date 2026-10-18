@@ -142,12 +142,33 @@ function synthesizeCapacityFix(design: Design, tc: TestCase, r: CaseResult): Cas
   const overOwnThreshold =
     tc.thresholds.maxHottestUtil !== undefined && hot.util > tc.thresholds.maxHottestUtil;
   if (!(hot.util > 1 || overOwnThreshold)) return null;
-  const node = design.nodes.find((n) => n.id === hot.nodeId);
+  return synthesizeCapacityFixForNode(design, hot.nodeId, hot.util);
+}
+
+/**
+ * The measured-capacity synthesis, addressed directly by node + measured
+ * utilization: size one capacity step for `nodeId` so the same load
+ * would run at ≈CAPACITY_TARGET_UTIL. This is the sizing core of
+ * synthesizeCapacityFix, exported for the next-steps ladder (server
+ * actions.ts): an LLM next step whose actions failed validation falls
+ * back to THIS — the same numbers-driven remedy, from either entry
+ * point. The applicability gate (util over 100% or over the case's own
+ * threshold) is the CALLER's; what is shared is the remedy itself:
+ * null for a missing node, for source/queue behaviors (no setting
+ * scales them), and when both knobs are already at their legal
+ * ceilings (a computed no-op is not a fix).
+ */
+export function synthesizeCapacityFixForNode(
+  design: Design,
+  nodeId: string,
+  util: number,
+): CaseFix | null {
+  const node = design.nodes.find((n) => n.id === nodeId);
   if (!node) return null;
   const behavior = componentDef(node.type).behavior;
   if (behavior === 'source' || behavior === 'queue') return null;
 
-  const factor = hot.util / CAPACITY_TARGET_UTIL;
+  const factor = util / CAPACITY_TARGET_UTIL;
   let op: EditOp | null = null;
   const scaleOp = (): EditOp | null => {
     const cur = node.settings.capacityScale;
@@ -178,8 +199,9 @@ function synthesizeCapacityFix(design: Design, tc: TestCase, r: CaseResult): Cas
     findingId: `capacity#${node.id}`,
     title:
       `扩容瓶颈节点（实测最热：${componentDef(node.type).name}` +
-      `${node.label ? `「${node.label}」` : ''}，利用率 ${Math.round(hot.util * 100)}%）`,
+      `${node.label ? `「${node.label}」` : ''}，利用率 ${Math.round(util * 100)}%）`,
     actions,
+    actionSource: 'rule',
   };
 }
 
@@ -253,7 +275,7 @@ export function attachCaseFixes(
       // Category agreement alone must be corroborated (see header note).
       if (!explicit && (overlap === 0 || (!typeOverlap && overlap < 2))) continue;
       scored.push({
-        fix: { findingId: c.findingId, title: c.finding.title, actions: c.actions },
+        fix: { findingId: c.findingId, title: c.finding.title, actions: c.actions, actionSource: 'rule' },
         // Explicit problem-data linkage dominates; then the case stressing
         // the finding's own layer; then breadth of category agreement.
         score: (explicit ? 100 : 0) + (typeOverlap ? 10 : 0) + overlap,

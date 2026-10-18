@@ -3,6 +3,7 @@ import type {
   ActionCoverageDTO,
   ActionSourceDTO,
   EditOpDTO,
+  NextStepDTO,
   ProblemCaseDTO,
   ProblemPack,
   StructuralFindingDTO,
@@ -11,11 +12,13 @@ import type {
 } from './api';
 
 /** Provenance of a fix's actions, shown small + muted next to its apply
- *  button so the user sees the pedigree at a glance. */
+ *  button so the user sees the pedigree at a glance: AI-written steps and
+ *  deterministic (rule / measured-synthesis) steps are labelled
+ *  differently ON PURPOSE — the user asked which is which. */
 export const ACTION_SOURCE_LABELS: Record<ActionSourceDTO, string> = {
-  llm: 'LLM',
-  repaired: '修复',
-  rule: '规则',
+  llm: 'AI 生成',
+  repaired: 'AI·已修复',
+  rule: '规则·实测',
   fallback: '兜底',
 };
 
@@ -29,9 +32,9 @@ export function ActionSourceLabel({ source }: { source: ActionSourceDTO }) {
 export function CoverageLine({ coverage }: { coverage: ActionCoverageDTO }) {
   const b = coverage.bySource;
   const parts = [
-    b.llm ? `LLM ${b.llm}` : '',
-    b.repaired ? `修复 ${b.repaired}` : '',
-    b.rule ? `规则 ${b.rule}` : '',
+    b.llm ? `AI 生成 ${b.llm}` : '',
+    b.repaired ? `AI·已修复 ${b.repaired}` : '',
+    b.rule ? `规则·实测 ${b.rule}` : '',
     b.fallback ? `兜底 ${b.fallback}` : '',
   ].filter(Boolean);
   return (
@@ -163,8 +166,10 @@ export function CaseList(props: CaseListProps) {
                     >
                       ✨ 应用此改进（{fix.title}）
                     </button>
-                    {/* Case-linked fixes ARE the checker's canned rule fixes. */}
-                    <ActionSourceLabel source="rule" />
+                    {/* Case-linked fixes are the checker's deterministic
+                        fixes (rules + measured synthesis) — badge from
+                        the data, 'rule' when the server didn't tag it. */}
+                    <ActionSourceLabel source={fix.actionSource ?? 'rule'} />
                   </span>
                 ))}
               </div>
@@ -172,6 +177,92 @@ export function CaseList(props: CaseListProps) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+interface NextStepsSectionProps {
+  busy: boolean;
+  /** The whole next-steps call failed — no steps at all. */
+  error: string | null;
+  /** The AI part is unavailable; the steps shown are rule-sourced. */
+  note: string | null;
+  steps: NextStepDTO[] | null;
+  /** caseId → display name, from the judged suite's results. */
+  caseNames: Record<string, string>;
+  /** Attribution of the generator （云端 LLM / 本地脚本）. */
+  sourceLabel: string;
+  /** Action coverage of the steps (from the evaluate response). */
+  coverage?: ActionCoverageDTO | null;
+  /** Enter the fix preview for a step's validated actions. */
+  onApplyFix: (title: string, actions: EditOpDTO[]) => void;
+}
+
+/**
+ * 🎯 下一步 — ONE pinned action per FAILED case: the single
+ * highest-leverage move for that case, against its measured numbers,
+ * applicable in one click and re-judgeable immediately. Deliberately
+ * distinct from the AI 评审 tab (broad qualitative review of the whole
+ * submission): this section is per-red-case and action-only. Every
+ * step's badge says where its actions came from — AI 生成 / AI·已修复 /
+ * 规则·实测 / 兜底 — and when the AI is unavailable the section degrades
+ * to the rule-sourced steps with a note, never to a blank box.
+ */
+export function NextStepsSection(props: NextStepsSectionProps) {
+  const { busy, error, note, steps, sourceLabel } = props;
+  return (
+    <div style={{ marginBottom: 14, border: '1px solid #1e293b', borderRadius: 8, padding: '10px 12px', background: '#0b1220' }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <b>🎯 下一步</b>
+        <span style={{ color: '#94a3b8', fontSize: 12 }}>每个未过用例一条 · 应用后重新提交即可验证</span>
+        {sourceLabel && (
+          <span style={{ color: '#94a3b8', fontSize: 12, marginLeft: 'auto' }}>生成：{sourceLabel}</span>
+        )}
+      </div>
+      {props.coverage && steps && steps.length > 0 && <CoverageLine coverage={props.coverage} />}
+      {busy && (
+        <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>
+          生成中…（正在针对每个未过用例钉一条最高杠杆的动作）
+        </div>
+      )}
+      {!busy && error && (
+        <div style={{ color: '#fca5a5', fontSize: 13, marginTop: 6 }}>{error}</div>
+      )}
+      {!busy && !error && note && (
+        <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>{note}</div>
+      )}
+      {!busy && !error && steps && steps.length === 0 && (
+        <div style={{ color: '#4ade80', fontSize: 13, marginTop: 6 }}>
+          全部用例都通过了——这一轮没有需要钉的下一步。
+        </div>
+      )}
+      {steps && steps.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+          {steps.map((s) => (
+            <div key={s.caseId} className="case-row">
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                <span className="chip chip-fail">未通过</span>
+                <b>{props.caseNames[s.caseId] ?? s.caseId}</b>
+              </div>
+              <div style={{ fontSize: 13, marginTop: 4, color: '#e2e8f0' }}>{s.title}</div>
+              {s.rationale && (
+                <div style={{ fontSize: 12.5, marginTop: 3, color: '#94a3b8' }}>{s.rationale}</div>
+              )}
+              {s.actions && s.actions.length > 0 && (
+                <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                  <button
+                    onClick={() => props.onApplyFix(s.title, s.actions!)}
+                    title="预览这一步的改动，确认后才应用到设计"
+                  >
+                    ✨ 应用此改进
+                  </button>
+                  {s.actionSource && <ActionSourceLabel source={s.actionSource} />}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

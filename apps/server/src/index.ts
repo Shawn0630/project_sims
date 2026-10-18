@@ -15,6 +15,7 @@ import type { Design } from '@sds/sim-core';
 import {
   buildSchemaSummary,
   evaluateFollowUps,
+  evaluateNextSteps,
   evaluateProbes,
   evaluateSchema,
   evaluateSubmission,
@@ -46,7 +47,9 @@ import { registerGenerationRoutes } from './generate';
  *                                 (incl. hidden ones, on demand) — powers the
  *                                 frontend's local quick re-simulation
  *   POST /api/evaluate            ONE LLM call (or scripted fallback) →
- *                                 structured assessment / follow-ups / probes.
+ *                                 structured assessment / follow-ups / probes /
+ *                                 next-steps (one pinned action per failed
+ *                                 case, ladder-guaranteed like the rest).
  *                                 Optional body.profileId: an end user's pick
  *                                 among admin-opened (userSelectable) model
  *                                 profiles — honored for that call only
@@ -255,9 +258,9 @@ app.post('/api/evaluate', async (c) => {
   // measure the design's genuinely hottest node for synthesis/fallback.
   const problem =
     typeof body?.problemId === 'string' ? await storage.getProblem(body.problemId) : null;
-  if (!kind || !['submission', 'schema', 'followups', 'probe'].includes(kind) || !ctx) {
+  if (!kind || !['submission', 'schema', 'followups', 'probe', 'next-steps'].includes(kind) || !ctx) {
     return c.json(
-      badRequest("需要 { kind: 'submission' | 'schema' | 'followups' | 'probe', context }"),
+      badRequest("需要 { kind: 'submission' | 'schema' | 'followups' | 'probe' | 'next-steps', context }"),
       400,
     );
   }
@@ -274,6 +277,18 @@ app.post('/api/evaluate', async (c) => {
   if (kind === 'submission') {
     const outcome = await evaluateSubmission(
       ctx as unknown as Parameters<typeof evaluateSubmission>[0],
+      profileId,
+      design,
+      problem ?? undefined,
+    );
+    return c.json({ kind, ...outcome });
+  }
+  if (kind === 'next-steps') {
+    // Per-case next steps: the model pins ONE applicable action on each
+    // FAILED case (measured numbers in the context); the server ladder
+    // validates / repairs / synthesizes so every red case ships a step.
+    const outcome = await evaluateNextSteps(
+      ctx as unknown as Parameters<typeof evaluateNextSteps>[0],
       profileId,
       design,
       problem ?? undefined,
