@@ -1549,3 +1549,248 @@ export function parseGeneration(
   if (!schema) throw new Error('generation: reference schema unusable');
   return { cases, referenceSolution: { design, schema } };
 }
+
+// ------------------------------------------------- whole-problem generation -
+// The generation system's other mode: instead of EXTENDING an existing
+// problem, the model authors an ENTIRE new problem from a source document
+// the author supplies (a URL the server fetched, pasted text, or an
+// uploaded .md/.txt). The output is a complete ProblemDef — statement,
+// scale, workload profile, STARTER schema, visible + hidden cases, a
+// deliberately naive sampleDesign, and a referenceSolution — and it flows
+// through the whole-problem validation pipeline server-side (generate.ts)
+// before an admin may accept it into the problem bank. The shapes mirror
+// @sds/problems structurally, like the extension-mode shapes above.
+
+/** Everything the whole-problem generator may look at. */
+export interface WholeProblemContext {
+  /** Where the source material came from. */
+  sourceType: 'url' | 'text' | 'file';
+  /** Human label for the source (the URL, the file name, or 「粘贴文本」). */
+  sourceLabel: string;
+  /** The source document itself, server-capped (≈30k chars). */
+  sourceText: string;
+  /** True when the source was truncated to the cap. */
+  sourceTruncated: boolean;
+  /** Optional author-supplied title steer. */
+  titleHint?: string;
+  /**
+   * Existing problems described by STRUCTURE ONLY — field lists and shape
+   * notes, never their statement text — so the model imitates the pack
+   * format without copying an existing problem's content.
+   */
+  existingProblemStructures: string;
+  /** Component catalog: types, behavior, capacities, costs, legal settings. */
+  componentCatalog: string;
+  /** The judging standards (GENERATION_CRITERIA). */
+  criteria: string;
+}
+
+/** One workload pattern of a generated problem (@sds/problems WorkloadPattern). */
+export interface GeneratedWorkloadPattern {
+  id: string;
+  name: string;
+  kind: 'read' | 'write';
+  description: string;
+  share: number;
+  path: ComponentTypeId[];
+  table?: string;
+  consistency: 'strong' | 'eventual';
+  terminalPerSec?: number;
+}
+
+/** A complete generated problem, post-normalization (see parseWholeProblem). */
+export interface ParsedWholeProblem {
+  /** As proposed — the server flags conflicts with the existing bank. */
+  id: string;
+  name: string;
+  nameEn: string;
+  difficulty: '简单' | '中等' | '困难';
+  tags: string[];
+  statement: string;
+  functionalRequirements: string[];
+  scale: {
+    dau: string;
+    readRatio: number;
+    peakMultiplier: number;
+    baselineRps: number;
+    budgetCostPerHour: number;
+    notes: string;
+  };
+  workload: {
+    readRatio: number;
+    consistency: string;
+    fanoutFollowers?: number;
+    patterns: GeneratedWorkloadPattern[];
+  };
+  /** The STARTER schema handed to solvers (not the reference schema). */
+  schema: GeneratedSchema;
+  cases: GeneratedCase[];
+  /** Deliberately naive starting design — the discrimination baseline. */
+  sampleDesign: GeneratedDesign;
+  referenceSolution: { design: GeneratedDesign; schema: GeneratedSchema };
+}
+
+export function buildWholeProblemPrompt(ctx: WholeProblemContext): { system: string; user: string } {
+  return {
+    system:
+      '你是一位资深系统设计面试题出题人。作者给你一份题目来源材料，你要据此命制一道【完整的新题】：题面、量级、读写需求、起始数据库 schema、一套可见+隐藏测试用例、一个故意朴素的起始设计（sampleDesign），以及一份参考解（referenceSolution：架构 + schema）。参考解不是样子货——系统会拿它逐例真跑你出的全部用例，挂掉任何一例该用例即作废，参考解通过率过半数以下整题驳回；起始设计则应至少能通过可见的基线用例、但要栽在隐藏用例上（栽不了的隐藏用例会被标弱区分度）。只输出 JSON，不要输出其它文字。',
+    user:
+      `【题目来源】类型：${ctx.sourceType === 'url' ? '链接抓取' : ctx.sourceType === 'file' ? '上传文件' : '粘贴文本'}（${ctx.sourceLabel}）${ctx.sourceTruncated ? '；来源较长，已被截断到上限，以现有内容为准' : ''}${ctx.titleHint ? `\n作者给的标题提示：${ctx.titleHint}` : ''}\n` +
+      `----- 来源全文开始 -----\n${ctx.sourceText}\n----- 来源全文结束 -----\n\n` +
+      `【现有题目的结构】（只有字段清单与形状说明，没有题面全文——照这个结构命题，不要克隆任何一道现有题的内容）：\n${ctx.existingProblemStructures}\n\n` +
+      `【组件目录】设计（sampleDesign 与 referenceSolution.design）只能使用这些组件类型与合法参数：\n${ctx.componentCatalog}\n\n` +
+      `${ctx.criteria}\n\n` +
+      `整题的额外口径：\n` +
+      `- id 用英文小写连字符 slug（如 like-system），name 给中文题名（如「Design 点赞系统」），nameEn 给英文题名，difficulty 取 简单|中等|困难，tags 2–5 个。\n` +
+      `- statement 与 functionalRequirements 忠实来源材料：来源讲什么就出什么，不要发明来源里没有的核心功能。\n` +
+      `- workload.patterns 必须与 schema 自洽：pattern 的 table 只能是 schema 里的表；path 是组件类型数组，从 client 出发到存储层；share 合计约 1。\n` +
+      `- schema 是给答题者的【起始版】，可以朴素（比如该分片没分片、该加的索引没加），留出改进空间；referenceSolution.schema 是参考答案版（分片/索引/主键生成都经得起推敲）。两者的表集合应一致（同一批表，参数不同）。\n` +
+      `- testCases 4–7 个：至少 1 个可见基线型（hidden=false，无 events/kills，稳态流量），其余多数隐藏，覆盖来源暗示的考点（热点、雪崩、单点、成本、一致性…）。每个用例至少一项阈值。\n` +
+      `- sampleDesign 故意朴素：单链路、无缓存/无队列、副本少——能过基线、过不了峰值与隐藏用例是理想状态。\n` +
+      `- referenceSolution 必须通过你出的【全部】用例；设计里每个节点都要有连线，流量从 client 出发能走到存储层。\n\n` +
+      `输出 JSON：{"id":"like-system","name":"Design 点赞系统","nameEn":"Design a Like System","difficulty":"中等","tags":["计数","热点","缓存"],"statement":"题面…","functionalRequirements":["点赞/取消点赞","…"],"scale":{"dau":"1 亿 DAU","readRatio":0.95,"peakMultiplier":3,"baselineRps":2000,"budgetCostPerHour":300,"notes":"…"},"workload":{"readRatio":0.95,"consistency":"计数可最终一致…","patterns":[{"id":"w1","name":"查点赞数","kind":"read","description":"…","share":0.8,"path":["client","loadbalancer","appserver","cache","nosql"],"table":"likes","consistency":"eventual","terminalPerSec":5000}]},"schema":{"tables":[{"name":"likes","engine":"nosql","rows":10000000000,"primaryKey":"id","primaryKeyGen":"snowflake","shardKey":null,"fields":[{"name":"id","type":"bigint","indexed":true},{"name":"target_id","type":"bigint","indexed":true}]}],"accessPatterns":[{"id":"p1","name":"按对象查点赞数","table":"likes","kind":"count","byField":"target_id","perSec":5000}]},"cases":[{"id":"baseline","name":"基线负载","description":"…","hidden":false,"weight":1,"traffic":{"rps":2000,"readRatio":0.95},"durationTicks":30,"events":[],"kills":[],"thresholds":{"maxErrorRate":0.001,"maxP99Ms":500},"hint":"…"}],"sampleDesign":{"nodes":[{"id":"app","type":"appserver","settings":{}}],"edges":[]},"referenceSolution":{"design":{"nodes":[{"id":"c","type":"client","settings":{}}],"edges":[]},"schema":{"tables":[],"accessPatterns":[]}}}`,
+  };
+}
+
+const DIFFICULTIES: readonly string[] = ['简单', '中等', '困难'];
+
+function normalizeGeneratedWorkload(
+  raw: unknown,
+  tableNames: ReadonlySet<string>,
+  fallbackReadRatio: number,
+): ParsedWholeProblem['workload'] {
+  const o = (raw ?? {}) as Record<string, unknown>;
+  const patterns: GeneratedWorkloadPattern[] = [];
+  if (Array.isArray(o.patterns)) {
+    for (const p of o.patterns.slice(0, 10)) {
+      const ap = p as Record<string, unknown> | null;
+      if (!ap || typeof ap.name !== 'string' || !ap.name.trim()) continue;
+      if (ap.kind !== 'read' && ap.kind !== 'write') continue;
+      const path = Array.isArray(ap.path)
+        ? ap.path
+            .map((x) => String(x))
+            .filter((x) => COMPONENT_TYPE_IDS.includes(x)) as ComponentTypeId[]
+        : [];
+      if (!path.length) continue;
+      const table =
+        typeof ap.table === 'string' && tableNames.has(ap.table) ? ap.table : undefined;
+      patterns.push({
+        id:
+          typeof ap.id === 'string' && ap.id.trim()
+            ? ap.id.trim().slice(0, 40)
+            : `w-${patterns.length + 1}`,
+        name: ap.name.trim().slice(0, 60),
+        kind: ap.kind,
+        description: typeof ap.description === 'string' ? ap.description.trim().slice(0, 300) : '',
+        share: clampNum(ap.share, 0.01, 1) ?? 0.1,
+        path,
+        ...(table ? { table } : {}),
+        consistency: ap.consistency === 'strong' ? 'strong' : 'eventual',
+        ...(clampNum(ap.terminalPerSec, 0, 1_000_000) !== undefined
+          ? { terminalPerSec: Math.round(clampNum(ap.terminalPerSec, 0, 1_000_000)!) }
+          : {}),
+      });
+    }
+  }
+  return {
+    readRatio: clampNum(o.readRatio, 0, 1) ?? fallbackReadRatio,
+    consistency:
+      typeof o.consistency === 'string' && o.consistency.trim()
+        ? o.consistency.trim().slice(0, 500)
+        : '（生成未给一致性说明）',
+    ...(clampNum(o.fanoutFollowers, 1, 1_000_000_000) !== undefined
+      ? { fanoutFollowers: Math.round(clampNum(o.fanoutFollowers, 1, 1_000_000_000)!) }
+      : {}),
+    patterns,
+  };
+}
+
+/**
+ * Parse the whole-problem generator's reply. Throws when the reply is
+ * unusable as a whole (no statement, no tables, no cases, no designs) —
+ * the host then reports an honest generation failure instead of storing a
+ * hollow draft. Individual malformed pieces are dropped or defaulted,
+ * mirroring parseGeneration's posture.
+ */
+export function parseWholeProblem(json: unknown): ParsedWholeProblem {
+  const o = json as Record<string, unknown> | null;
+  if (!o || typeof o !== 'object') throw new Error('whole-problem: bad shape');
+  const name = typeof o.name === 'string' ? o.name.trim().slice(0, 80) : '';
+  const statement = typeof o.statement === 'string' ? o.statement.trim().slice(0, 4000) : '';
+  if (!name || !statement) throw new Error('whole-problem: missing name/statement');
+
+  const sc = (o.scale ?? {}) as Record<string, unknown>;
+  const baselineRps = Math.round(clampNum(sc.baselineRps, 10, 1_000_000) ?? 500);
+  const scaleReadRatio = clampNum(sc.readRatio, 0, 1) ?? 0.9;
+  const scale: ParsedWholeProblem['scale'] = {
+    dau: typeof sc.dau === 'string' && sc.dau.trim() ? sc.dau.trim().slice(0, 120) : '（生成未给量级）',
+    readRatio: scaleReadRatio,
+    peakMultiplier: clampNum(sc.peakMultiplier, 1, 100) ?? 3,
+    baselineRps,
+    budgetCostPerHour: Math.round(clampNum(sc.budgetCostPerHour, 1, 1_000_000) ?? 200),
+    notes: typeof sc.notes === 'string' ? sc.notes.trim().slice(0, 500) : '',
+  };
+
+  const schema = normalizeGeneratedSchema(o.schema);
+  if (!schema) throw new Error('whole-problem: starter schema unusable');
+  const ref = (o.referenceSolution ?? {}) as { design?: unknown; schema?: unknown };
+  const refSchema = normalizeGeneratedSchema(ref.schema);
+  if (!refSchema) throw new Error('whole-problem: reference schema unusable');
+  const tableNames = new Set([
+    ...schema.tables.map((t) => t.name),
+    ...refSchema.tables.map((t) => t.name),
+  ]);
+
+  const cases: GeneratedCase[] = [];
+  if (Array.isArray(o.cases)) {
+    for (const raw of o.cases) {
+      const gc = normalizeGeneratedCase(raw, {
+        baselineRps,
+        defaultReadRatio: scaleReadRatio,
+      });
+      if (gc) cases.push(gc);
+      if (cases.length >= 8) break;
+    }
+  }
+  if (!cases.length) throw new Error('whole-problem: no usable cases');
+
+  const sampleDesign = normalizeGeneratedDesign(o.sampleDesign);
+  if (!sampleDesign) throw new Error('whole-problem: sample design unusable');
+  const refDesign = normalizeGeneratedDesign(ref.design);
+  if (!refDesign) throw new Error('whole-problem: reference design unusable');
+
+  const idRaw = typeof o.id === 'string' ? o.id.trim().toLowerCase() : '';
+  return {
+    id: /^[a-z0-9][a-z0-9-]*$/.test(idRaw)
+      ? idRaw.slice(0, 64)
+      : idRaw
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '')
+          .slice(0, 64),
+    name,
+    nameEn:
+      typeof o.nameEn === 'string' && o.nameEn.trim() ? o.nameEn.trim().slice(0, 80) : name,
+    difficulty: (DIFFICULTIES.includes(String(o.difficulty))
+      ? String(o.difficulty)
+      : '中等') as ParsedWholeProblem['difficulty'],
+    tags: Array.isArray(o.tags)
+      ? o.tags
+          .filter((t): t is string => typeof t === 'string' && !!t.trim())
+          .map((t) => t.trim().slice(0, 20))
+          .slice(0, 6)
+      : [],
+    statement,
+    functionalRequirements: Array.isArray(o.functionalRequirements)
+      ? o.functionalRequirements
+          .filter((r): r is string => typeof r === 'string' && !!r.trim())
+          .map((r) => r.trim().slice(0, 200))
+          .slice(0, 12)
+      : [],
+    scale,
+    workload: normalizeGeneratedWorkload(o.workload, tableNames, scaleReadRatio),
+    schema,
+    cases,
+    sampleDesign,
+    referenceSolution: { design: refDesign, schema: refSchema },
+  };
+}

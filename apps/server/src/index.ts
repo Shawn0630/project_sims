@@ -57,6 +57,15 @@ import { registerGenerationRoutes } from './generate';
  *                                 cases + a reference solution — validated
  *                                 by the simulator and stored as an admin
  *                                 review draft (accept/discard there)
+ *   POST /api/problems/generate-from-source
+ *                                 whole-problem generation: the author gives
+ *                                 a source (URL fetched server-side / pasted
+ *                                 text / uploaded .md|.txt), the LLM authors
+ *                                 an ENTIRE new problem, validated whole
+ *                                 (reference vs its own cases, sample
+ *                                 discrimination, pack shape) and stored as a
+ *                                 kind 'new-problem' draft; accepting it in
+ *                                 admin writes a new pack (409 on id clash)
  *   GET  /admin + /api/admin/*     author console (see admin.ts) — pack CRUD,
  *                                 component registry + overrides, LLM call log.
  *                                 LOCAL USE ONLY: no auth in this round.

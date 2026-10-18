@@ -7,16 +7,19 @@ import {
   buildProbePrompt,
   buildSchemaPrompt,
   buildSubmissionPrompt,
+  buildWholeProblemPrompt,
   parseFollowUps,
   parseGeneration,
   parseProbeCases,
   parseSchemaAssessment,
   parseSubmissionAssessment,
+  parseWholeProblem,
   type ActionCoverage,
   type FollowUpContext,
   type FollowUpQuestion,
   type GenerationContext,
   type ParsedGeneration,
+  type ParsedWholeProblem,
   type ProbeCase,
   type ProbeContext,
   type SchemaAssessment,
@@ -24,6 +27,7 @@ import {
   type SchemaReviewLike,
   type SubmissionAssessment,
   type SubmissionAssessmentContext,
+  type WholeProblemContext,
 } from '@sds/driver';
 import type { ProblemDef, ProblemSchema } from '@sds/problems';
 import {
@@ -630,16 +634,35 @@ export interface GenerationOutcome {
   viaUserChoice: boolean;
 }
 
+export interface WholeProblemOutcome {
+  data: ParsedWholeProblem;
+  model: string;
+  profileName: string;
+  viaUserChoice: boolean;
+}
+
+interface GenerationCallOutcome<T> {
+  data: T;
+  model: string;
+  profileName: string;
+  viaUserChoice: boolean;
+}
+
 /**
- * The generator's ONE model call, through the same logged, profile-
- * resolved, retrying path as every evaluation (kind 'generate' in the
- * call log). Unlike evaluations it never falls back to the scripted
- * driver — failures throw GenerationLlmError with the cause.
+ * The generator's ONE model call, shared by both generation modes
+ * (extension + whole-problem), through the same logged, profile-resolved,
+ * retrying path as every evaluation (kind 'generate' in the call log).
+ * Unlike evaluations it never falls back to the scripted driver —
+ * failures throw GenerationLlmError with the cause. `note` is recorded
+ * on the log record so the mode (and, for whole-problem, the source
+ * type) is visible in the admin call log.
  */
-export async function generateProblemContent(
-  ctx: GenerationContext,
-  profileId?: string,
-): Promise<GenerationOutcome> {
+async function runGenerationCall<T>(
+  build: () => { system: string; user: string },
+  parse: (json: unknown) => T,
+  profileId: string | undefined,
+  note?: string,
+): Promise<GenerationCallOutcome<T>> {
   const { profile: cfg, viaUserChoice } = await resolveProfileForCall(profileId);
   if (!cfg.apiKey) {
     throw new GenerationLlmError(
@@ -647,7 +670,7 @@ export async function generateProblemContent(
       `生成题目需要可用的 LLM 档案：当前档案「${cfg.name}」没有配置 API key。脚本模式不会伪造题目——请在 admin「模型配置」里给档案填上 key，或切换到已配置的档案后重试。`,
     );
   }
-  const prompt = buildGenerationPrompt(ctx);
+  const prompt = build();
   const requestBody = {
     model: cfg.model,
     messages: [
@@ -663,6 +686,7 @@ export async function generateProblemContent(
     attempts.length > 1
       ? `共尝试 ${attempts.length} 次${result ? '，重试后成功' : '，全部失败'}；失败尝试：${attemptErrors.join('；')}`
       : undefined;
+  const logNote = [note, retrySummary].filter(Boolean).join('；') || undefined;
   if (!result) {
     const error = attemptErrors[attemptErrors.length - 1] ?? 'LLM call failed';
     appendCall({
@@ -678,17 +702,14 @@ export async function generateProblemContent(
       error,
       attempts: attempts.length,
       attemptErrors,
-      ...(retrySummary ? { note: retrySummary } : {}),
+      ...(logNote ? { note: logNote } : {}),
     });
     throw new GenerationLlmError('llm_call_failed', `生成调用失败：${error}`);
   }
   const raw = result.content;
   try {
     const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-    const data = parseGeneration(JSON.parse(cleaned) as unknown, {
-      baselineRps: ctx.baselineRps,
-      defaultReadRatio: ctx.defaultReadRatio,
-    });
+    const data = parse(JSON.parse(cleaned) as unknown);
     appendCall({
       kind: 'generate',
       source: 'llm',
@@ -704,7 +725,7 @@ export async function generateProblemContent(
       responseParsed: data,
       attempts: attempts.length,
       ...(attemptErrors.length ? { attemptErrors } : {}),
-      ...(retrySummary ? { note: retrySummary } : {}),
+      ...(logNote ? { note: logNote } : {}),
     });
     return { data, model: cfg.model, profileName: cfg.name, viaUserChoice };
   } catch (err) {
@@ -723,10 +744,44 @@ export async function generateProblemContent(
       error: message,
       attempts: attempts.length,
       ...(attemptErrors.length ? { attemptErrors } : {}),
-      ...(retrySummary ? { note: retrySummary } : {}),
+      ...(logNote ? { note: logNote } : {}),
     });
     throw new GenerationLlmError('llm_bad_output', `生成结果不可用：${message}`);
   }
+}
+
+/** Extension mode: new cases + a reference solution for an EXISTING problem. */
+export async function generateProblemContent(
+  ctx: GenerationContext,
+  profileId?: string,
+): Promise<GenerationOutcome> {
+  return runGenerationCall(
+    () => buildGenerationPrompt(ctx),
+    (json) =>
+      parseGeneration(json, {
+        baselineRps: ctx.baselineRps,
+        defaultReadRatio: ctx.defaultReadRatio,
+      }),
+    profileId,
+    `扩充生成：为已有题目「${ctx.problemName}」生成 ${ctx.caseCount} 个新用例 + 参考解`,
+  );
+}
+
+/**
+ * Whole-problem mode: an ENTIRE new problem from the author's source
+ * material (URL / pasted text / uploaded doc). Same honest-failure
+ * contract — no key, no draft; nothing is ever fabricated.
+ */
+export async function generateWholeProblemContent(
+  ctx: WholeProblemContext,
+  profileId?: string,
+): Promise<WholeProblemOutcome> {
+  return runGenerationCall(
+    () => buildWholeProblemPrompt(ctx),
+    parseWholeProblem,
+    profileId,
+    `整题生成：来源=${ctx.sourceType}（${ctx.sourceLabel}）${ctx.sourceTruncated ? '，来源已截断' : ''}`,
+  );
 }
 
 // ------------------------------------------------- schema context assembly -

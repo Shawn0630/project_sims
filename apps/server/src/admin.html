@@ -82,18 +82,52 @@ summary { cursor: pointer; color: var(--accent); font-size: 13px;}
 <div class="card" id="problemDetail" style="display:none"></div>
 
 <div class="card">
-<b>➕ 新建题目（种子）</b>
+<b>➕ 新建题目（LLM 整题生成）</b>
 <p class="muted small" style="margin:6px 0 0">
-全新题目仍走手动路径：先把种子 <b>存为草稿 pack</b>（最小合法题目包，难度默认「中等」，空用例集），再在上方列表里用 JSON 编辑器补全。
-LLM 扩充（第四套系统）针对<b>已有题目</b>：打开任一题目详情，用里面的「🤖 生成待审」让 LLM 生成新用例 + 参考解，系统逐例仿真验证后再由你采纳。
+给一个<b>题目链接</b>、<b>粘贴一段题面</b>，或<b>上传一份 .md/.txt 文档</b>，LLM 读完后生成<b>整道题</b>：题面 / 量级 / workload / 起始 schema / 可见+隐藏用例 / 朴素起始设计 / 参考解。
+系统会整题验证（参考解逐例真跑自己出的用例、起始设计测区分度、题包形状校验），生成结果进下方「生成待审（全部）」等你裁决，采纳后才写成正式题目。
+链接由服务端抓取（15s 超时，正文截断到约 3 万字）；抓不到 / 登录墙会<b>诚实报错</b>，不会假装读到。未配置 LLM 时同样诚实失败——脚本模式不伪造整题。
 </p>
+<label>来源类型
+<select id="npSourceType">
+<option value="url">🔗 题目链接（URL）</option>
+<option value="text">📝 粘贴文本</option>
+<option value="file">📄 上传 .md / .txt 文件</option>
+</select></label>
+<div id="npUrlBox">
+<label>题目链接 <input id="npUrl" placeholder="https://… 一篇题面 / 博客 / 文档页" /></label>
+</div>
+<div id="npTextBox" style="display:none">
+<label>题面文本 <textarea id="npText" rows="8" placeholder="把题面、需求、量级说明整段贴进来…"></textarea></label>
+</div>
+<div id="npFileBox" style="display:none">
+<label>选择文件（.md / .txt，浏览器读为文本后随请求发出）
+<input id="npFile" type="file" accept=".md,.txt,text/markdown,text/plain" /></label>
+<span class="small muted" id="npFileInfo"></span>
+</div>
+<label>标题提示（可选） <input id="npTitleHint" placeholder="例如：Design a Like System（点赞系统）" /></label>
+<div class="row" style="margin-top:10px">
+<button class="btn primary" id="npGenerate">🤖 生成整题（进待审）</button>
+<span class="small" id="npMsg"></span>
+</div>
+<details style="margin-top:12px">
+<summary>手动种子（离线兜底：不经 LLM，先存最小草稿 pack 再用 JSON 编辑器补全）</summary>
 <label>标题 <input id="seedTitle" placeholder="例如：Design a Rate Limiter" /></label>
 <label>题面 <textarea id="seedStatement" rows="4" placeholder="题目描述、核心流程…"></textarea></label>
 <label>规模说明 <input id="seedScale" placeholder="例如：100 万 DAU，读:写 ≈ 100:1" /></label>
 <div class="row" style="margin-top:10px">
-<button class="btn primary" id="seedDraft">💾 存为草稿 pack</button>
+<button class="btn" id="seedDraft">💾 存为草稿 pack</button>
 <span class="small" id="seedMsg"></span>
 </div>
+</details>
+</div>
+
+<div class="card" id="wholeGenCard">
+<div class="row"><b>🤖 生成待审（全部）</b>
+<span class="muted small">LLM 整题生成的草稿在这里审：整道新题的题包摘要 + 用例验证徽章 + 参考解/起始设计摘要 + 验证报告。扩充型草稿（给已有题目加用例）在对应题目详情里审。</span>
+<span class="grow"></span>
+<button class="btn" id="reloadWholeGen">↻ 刷新</button></div>
+<div id="wholeGenList" style="margin-top:10px">正在加载…</div>
 </div>
 </section>
 
@@ -269,6 +303,192 @@ msg.innerHTML = `<span class="err">失败（${r.status}）：${esc(r.json?.messa
 }
 };
 
+// ------------------------------------------- whole-problem generation（整题）--
+let npFileContent = null; // { name, text } once the picked file is read
+
+$('#npSourceType').addEventListener('change', () => {
+const t = $('#npSourceType').value;
+$('#npUrlBox').style.display = t === 'url' ? '' : 'none';
+$('#npTextBox').style.display = t === 'text' ? '' : 'none';
+$('#npFileBox').style.display = t === 'file' ? '' : 'none';
+});
+
+$('#npFile').addEventListener('change', async () => {
+const f = $('#npFile').files?.[0];
+npFileContent = null;
+if (!f) { $('#npFileInfo').textContent = ''; return; }
+if (!/\.(md|txt)$/i.test(f.name)) {
+$('#npFileInfo').innerHTML = '<span class="err">只支持 .md / .txt 文件</span>';
+return;
+}
+try {
+const text = await f.text();
+npFileContent = { name: f.name, text };
+$('#npFileInfo').textContent = `已读取 ${f.name}（${text.length} 字，发出时服务端会截断到约 3 万字）`;
+} catch (err) {
+$('#npFileInfo').innerHTML = `<span class="err">读取文件失败：${esc(err.message)}</span>`;
+}
+});
+
+$('#npGenerate').onclick = async () => {
+const msg = $('#npMsg');
+const btn = $('#npGenerate');
+const sourceType = $('#npSourceType').value;
+const body = { sourceType, titleHint: $('#npTitleHint').value.trim() || undefined };
+if (sourceType === 'url') {
+body.url = $('#npUrl').value.trim();
+if (!body.url) { msg.innerHTML = '<span class="err">先填题目链接</span>'; return; }
+} else if (sourceType === 'text') {
+body.text = $('#npText').value;
+if (!body.text.trim()) { msg.innerHTML = '<span class="err">先粘贴题面文本</span>'; return; }
+} else {
+if (!npFileContent) { msg.innerHTML = '<span class="err">先选一个 .md / .txt 文件</span>'; return; }
+body.text = npFileContent.text;
+body.fileName = npFileContent.name;
+}
+btn.disabled = true;
+msg.textContent = sourceType === 'url'
+? '抓取链接 + LLM 整题生成 + 仿真验证中（要跑完整套新用例，可能要一会儿）…'
+: 'LLM 整题生成 + 仿真验证中（要跑完整套新用例，可能要一会儿）…';
+const r = await api('/api/problems/generate-from-source', {
+method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+});
+btn.disabled = false;
+if (r.status === 201 && r.json?.draft) {
+const d = r.json.draft;
+msg.innerHTML = d.status === 'rejected'
+? `<span class="err">已生成但被系统驳回：${esc(d.rejectReason || '')}（草稿已留在待审里可查看）</span>`
+: '<span class="ok-text">整题生成完成并通过验证，见下方「生成待审（全部）」。</span>';
+loadWholeGenerations();
+} else {
+msg.innerHTML = `<span class="err">生成失败（${r.status}）：${esc(r.json?.message || r.text || '')}</span>`;
+}
+};
+
+// ------------------------------------------------- whole drafts（整题待审）--
+async function loadWholeGenerations() {
+const box = document.getElementById('wholeGenList');
+if (!box) return;
+const { json } = await api('/api/admin/generations');
+const drafts = (Array.isArray(json) ? json : []).filter((d) => d.kind === 'new-problem');
+if (!drafts.length) { box.innerHTML = '<p class="muted small">暂无整题待审草稿。用上方「新建题目（LLM 整题生成）」生成第一道。</p>'; return; }
+box.innerHTML = '';
+for (const d of drafts) {
+const el = document.createElement('div');
+el.style.cssText = 'border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:10px';
+el.innerHTML = `
+<div class="row">
+<b>${esc(d.problemName)}</b> <code class="muted">${esc(d.problemId)}</code>
+${d.status === 'rejected' ? '<span class="badge bad">已驳回</span>' : '<span class="badge draft">待审</span>'}
+${d.idConflict ? '<span class="badge bad">id 与现有题包冲突</span>' : ''}
+<span class="muted small">${esc(new Date(d.createdAt).toLocaleString('zh-CN', { hour12: false }))} · 来源 ${d.sourceType === 'url' ? '🔗' : d.sourceType === 'file' ? '📄' : '📝'} ${esc(d.sourceLabel)} · 模型 ${esc(d.model)} · 档案「${esc(d.profileName)}」</span>
+<span class="grow"></span>
+<button class="btn" data-wholeview="${esc(d.id)}">查看整题</button>
+</div>
+<div class="small" style="margin-top:4px">
+用例 ${d.caseCount} 个 · 有效 ${d.validCaseCount} · 弱区分度 ${d.weakCount} ·
+参考解通过率 ${Math.round((d.referencePassRate ?? 0) * 100)}%
+${d.rejectReason ? `<div class="err">驳回原因：${esc(d.rejectReason)}</div>` : ''}
+</div>
+<div data-wholedetail="${esc(d.id)}" style="margin-top:8px"></div>`;
+box.appendChild(el);
+el.querySelector('[data-wholeview]').onclick = () => renderWholeDraftDetail(d.id);
+}
+}
+document.getElementById('reloadWholeGen').onclick = () => loadWholeGenerations();
+
+async function renderWholeDraftDetail(draftId) {
+const slot = document.querySelector(`[data-wholedetail="${draftId}"]`);
+if (!slot) return;
+const { json: d, status } = await api('/api/admin/generations/' + encodeURIComponent(draftId));
+if (status !== 200 || !d || d.kind !== 'new-problem') { slot.innerHTML = '<span class="err">草稿加载失败</span>'; return; }
+const p = d.problem || {};
+const rep = d.report || {};
+const vById = new Map((rep.cases || []).map((v) => [v.caseId, v]));
+const visible = (p.testCases || []).filter((t) => !t.hidden).length;
+const refNodes = (p.referenceSolution?.design?.nodes || []);
+const sampleNodes = (p.sampleDesign?.nodes || []);
+const canAccept = d.status !== 'rejected';
+slot.innerHTML = `
+<div class="small">
+<div style="background:#451a03;border:1px solid #9a3412;color:#fed7aa;border-radius:8px;padding:6px 10px;margin-bottom:8px">
+⚠️ <b>由 LLM 据来源生成，请人工核对题面</b>——来源：${d.source?.type === 'url' ? '🔗 链接' : d.source?.type === 'file' ? '📄 文件' : '📝 粘贴文本'} ${esc(d.source?.label || '')}（${d.source?.chars ?? 0} 字${d.source?.truncated ? '，已截断' : ''}）。题面文本来自作者提供的来源，生成可能有改写或遗漏，采纳前逐项核对。
+</div>
+<div class="row"><b style="font-size:14.5px">${esc(p.name)}</b><span class="muted">${esc(p.nameEn || '')}</span>
+<span class="badge">${esc(p.difficulty || '')}</span>${(p.tags || []).map((t) => `<span class="badge">${esc(t)}</span>`).join('')}
+${d.idConflict ? '<span class="badge bad">id 冲突：题库已有同 id 题目</span>' : ''}</div>
+<p style="margin:6px 0">${esc(p.statement || '')}</p>
+<div class="muted">
+量级：${esc(p.scale?.dau)} · 基线 ${p.scale?.baselineRps} req/s · 峰值 ×${p.scale?.peakMultiplier} · 预算 $${p.scale?.budgetCostPerHour}/h · 读占比 ${Math.round((p.scale?.readRatio ?? 0) * 100)}%<br/>
+功能需求：${(p.functionalRequirements || []).join('；') || '（无）'}<br/>
+用例：共 ${(p.testCases || []).length}（可见 ${visible} / 隐藏 ${(p.testCases || []).length - visible}）· 起始 schema ${(p.schema?.tables || []).length} 张表 / ${(p.schema?.accessPatterns || []).length} 条访问模式 · workload ${(p.workload?.patterns || []).length} 条模式
+</div>
+<details><summary>题包结构（起始 schema / workload 模式 / 用例清单）</summary><pre>${esc(
+'起始 schema：\n' + (p.schema?.tables || []).map((t) => `  ${t.name}（${t.engine}，${Number(t.rows).toLocaleString()} 行）主键 ${t.primaryKey}/${t.primaryKeyGen}，分片键 ${t.shardKey ?? '无'}，字段 ${(t.fields || []).map((f) => f.name + (f.indexed ? '(idx)' : '')).join(', ')}`).join('\n') +
+'\n访问模式：\n' + (p.schema?.accessPatterns || []).map((a) => `  ${a.name}（${a.kind}，表 ${a.table}，按 ${a.byField}，${a.perSec}/s）`).join('\n') +
+'\nworkload：\n' + (p.workload?.patterns || []).map((w) => `  ${w.name}（${w.kind}，占 ${Math.round(w.share * 100)}%）${w.path.join(' → ')}${w.table ? '，落表 ' + w.table : ''}`).join('\n') +
+'\n用例：\n' + (p.testCases || []).map((t) => `  ${t.hidden ? '🔒' : '👁'} ${t.name}（${t.id}，权重 ${t.weight}）`).join('\n'))}</pre></details>
+<div style="margin-top:6px"><b>验证报告</b>：参考解活性 ${rep.livenessOk ? '<span class="ok-text">有可达流量路径</span>' : '<span class="err">无可达路径</span>'} ·
+参考解过自出用例 <b>${rep.referencePassedCount}/${rep.referenceTotalCount}</b>（${Math.round((rep.referencePassRate ?? 0) * 100)}%）·
+可见基线用例：${rep.baselineCasePresent ? (rep.baselineCasePassedByReference ? '<span class="ok-text">存在且参考解通过</span>' : '<span class="err">存在但参考解未过</span>') : '<span class="err">缺失</span>'} ·
+结构筛查 high ${rep.highSeverityCount ?? 0} 条
+${(rep.warnings || []).map((w) => `<div style="color:var(--warn)">⚠ ${esc(w)}</div>`).join('')}
+${(d.notes || []).length ? `<div class="muted" style="margin-top:4px">归一化说明：${d.notes.map(esc).join('；')}</div>` : ''}
+${(rep.structuralFindings || []).length ? `<details><summary>参考解结构筛查（${rep.structuralFindings.length} 条）</summary>${rep.structuralFindings.map((f) => `<div>[${esc(f.severity)}] ${esc(f.title)}<br/><span class="muted">${esc(f.detail)}</span></div>`).join('')}</details>` : ''}
+</div>
+<div style="margin-top:6px">参考解：${refNodes.length} 个节点 · ${(p.referenceSolution?.design?.edges || []).length} 条连线
+<span class="muted">${refNodes.map((n) => `${esc(n.type)}「${esc(n.id)}」`).join('、') || '（无）'}</span><br/>
+参考 schema：${(p.referenceSolution?.schema?.tables || []).map((t) => `${esc(t.name)}（${esc(t.engine)}）主键 ${esc(t.primaryKey)}/${esc(t.primaryKeyGen)}，分片键 ${esc(t.shardKey ?? '无')}`).join('；') || '（无表）'}<br/>
+起始设计（故意朴素）：${sampleNodes.length} 个节点 <span class="muted">${sampleNodes.map((n) => esc(n.type)).join('、') || '（无）'}</span> ·
+可见基线实测通过 ${rep.sampleBaselinePassedCount}/${rep.sampleBaselineTotalCount}${rep.sampleAllBaselineFailed ? ' <span style="color:var(--warn)">（全军覆没，坏教学警告）</span>' : ''}</div>
+<table style="margin-top:8px"><thead><tr><th>用例</th><th>参考解实测</th><th>起始设计</th><th>裁决</th></tr></thead>
+<tbody>${(p.testCases || []).map((tc) => { const v = vById.get(tc.id); return `
+<tr>
+<td>${tc.hidden ? '🔒' : '👁'} <b>${esc(tc.name)}</b><br/><code class="muted">${esc(tc.id)}</code>
+<div class="muted">${esc(tc.description || '')}</div>
+<div class="muted">${tc.traffic.rps} rps · 读 ${Math.round(tc.traffic.readRatio * 100)}% · ${tc.durationTicks} tick${(tc.events || []).length ? ` · 事件 ${(tc.events).map((e) => esc(e.type)).join('/')}` : ''}${(tc.kills || []).length ? ` · 杀 ${(tc.kills).map((k) => esc(k.componentType)).join('/')}` : ''}</div></td>
+<td>${v ? (v.referencePassed ? '<span class="badge ok">通过</span>' : `<span class="badge bad">失败</span><div class="err">${esc((v.referenceFailures || []).join('；'))}</div>`) : '—'}
+${v ? `<div class="muted">错误率 ${(v.referenceMeasured.errorRate * 100).toFixed(2)}% · P99 ${Math.round(v.referenceMeasured.p99Ms)}ms · $${v.referenceMeasured.costPerHour.toFixed(0)}/h · 最热 ${(v.referenceMeasured.hottestUtil * 100).toFixed(0)}%</div>` : ''}</td>
+<td>${v ? (v.baselinePassed === null ? '<span class="muted">未测</span>' : v.baselinePassed ? '<span class="badge warn">通过</span>' : '<span class="muted">失败</span>') : '—'}</td>
+<td>${v ? (v.acceptable
+? '<span class="badge ok">有效</span>' + (v.weakDiscrimination ? ' <span class="badge warn">弱区分度</span>' : '')
+: '<span class="badge bad">无效用例（采纳时剔除）</span>') : '—'}</td>
+</tr>`; }).join('')}</tbody></table>
+${d.idConflict ? `<label style="margin-top:8px">新题目 id（与现有题包冲突，必须改名才能采纳） <input data-wholerename value="" placeholder="例如：${esc(p.id)}-v2" style="max-width:280px" /></label>` : ''}
+<div class="row" style="margin-top:10px">
+<button class="btn primary" data-wholeaccept="${esc(d.id)}" ${canAccept ? '' : 'disabled'}>✅ 采纳为正式题目（写入题库）</button>
+<button class="btn danger" data-wholediscard="${esc(d.id)}">🗑 丢弃</button>
+<span class="small" data-wholeopmsg></span>
+</div>
+${canAccept ? '' : '<div class="muted small" style="margin-top:4px">不可采纳：这份整题生成已被系统驳回。</div>'}
+</div>`;
+const acceptBtn = slot.querySelector('[data-wholeaccept]');
+if (acceptBtn) acceptBtn.onclick = async () => {
+const opMsg = slot.querySelector('[data-wholeopmsg]');
+const renameInput = slot.querySelector('[data-wholerename]');
+const rename = renameInput ? renameInput.value.trim() : '';
+if (d.idConflict && !rename) { opMsg.innerHTML = '<span class="err">id 与现有题包冲突：先在上方填一个新 id 再采纳。</span>'; return; }
+if (!confirm(`采纳后整道题以 id「${rename || p.id}」写入题库（只收有效用例），答题端立即可见；参考解存为 admin-only 字段（答题端永远看不到）。继续？`)) return;
+opMsg.textContent = '采纳中（写盘前复验参考解）…';
+const r = await api('/api/admin/generations/' + encodeURIComponent(draftId) + '/accept', {
+method: 'POST', headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify(rename ? { problemId: rename } : {}),
+});
+if (r.status === 200 && r.json?.ok) {
+opMsg.innerHTML = `<span class="ok-text">已采纳为正式题目「${esc(r.json.problemId)}」：入库用例 ${esc((r.json.acceptedCaseIds || []).join('、'))}${(r.json.droppedCaseIds || []).length ? `；剔除无效 ${(r.json.droppedCaseIds).join('、')}` : ''}。</span>`;
+loadWholeGenerations(); loadProblems(); loadStatus();
+} else {
+opMsg.innerHTML = `<span class="err">采纳失败（${r.status}）：${esc(r.json?.message || r.text || '')}</span>`;
+}
+};
+slot.querySelector('[data-wholediscard]').onclick = async () => {
+if (!confirm('丢弃这份整题草稿？不可恢复。')) return;
+const r = await api('/api/admin/generations/' + encodeURIComponent(draftId), { method: 'DELETE' });
+if (r.status === 200) loadWholeGenerations();
+else alert('丢弃失败：' + (r.json?.message || r.text || r.status));
+};
+}
+
 // ------------------------------------------------- generations（生成待审）--
 // The fourth system, author side: trigger an LLM generation for THIS
 // problem, review the simulator-validated draft （每例的参考解/弱设计实测 +
@@ -406,6 +626,7 @@ else alert('丢弃失败：' + (r.json?.message || r.text || r.status));
 
 loadStatus();
 loadProblems();
+loadWholeGenerations();
 </script>
 <script>
 /* ================================================= 组件（注册表 + 覆盖层）== */
