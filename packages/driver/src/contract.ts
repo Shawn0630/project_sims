@@ -117,6 +117,105 @@ export type EditOp =
 
 export const MAX_EDIT_OPS = 3;
 
+// ------------------------------------------------- action guarantee -------
+//
+// The action-guarantee ladder (server-side, apps/server actions.ts): EVERY
+// finding / probe fix / schema suggestion that reaches the UI must carry
+// at least one server-validated, applicable action. Actions are tagged
+// with their provenance so the UI can show the user where a fix came from:
+//
+//   llm      — proposed by the model in its first pass, validated as-is;
+//   repaired — produced by the ONE bounded action-repair re-prompt after
+//              the first pass's actions were missing or failed validation;
+//   rule     — synthesized deterministically from the finding's category
+//              (the same spirit as the checker's canned fixes; scripted-
+//              mode findings also land here — they derive from rules);
+//   fallback — the universal, always-constructible remedy (one capacity
+//              step on the most-implicated node / first table's key).
+
+export type ActionSource = 'llm' | 'repaired' | 'rule' | 'fallback';
+
+export const ACTION_SOURCES: readonly ActionSource[] = ['llm', 'repaired', 'rule', 'fallback'];
+
+/**
+ * Per-evaluation action accounting, carried on evaluate responses and in
+ * the call log. `findings` counts the items that were assessed (probe
+ * predictions count only when they predict failure — a passing prediction
+ * needs no fix); `withActions` how many of them ship ≥1 validated action;
+ * `bySource` breaks the covered ones down by provenance (sums to
+ * withActions); `nonMechanical` counts the narrow escape below — items
+ * the model explicitly declared non-mechanical whose declaration SURVIVED
+ * (pure tradeoff/explanation commentary with no load/correctness signal).
+ * Those are excluded from `findings`, so findings === withActions is the
+ * guarantee for everything that remains.
+ */
+export interface ActionCoverage {
+  findings: number;
+  withActions: number;
+  bySource: { llm: number; repaired: number; rule: number; fallback: number };
+  nonMechanical: number;
+}
+
+/**
+ * The non-mechanical escape hatch — deliberately narrow. A finding may
+ * declare itself non-mechanical ONLY with one of these reasons, and the
+ * declaration survives only when the finding carries no load/correctness
+ * signal (the ladder's synthesis runs first for anything recognizable;
+ * see actions.ts). Everything else receives an action by construction.
+ */
+export const NON_MECHANICAL_REASONS = ['tradeoff', 'explanation', 'process'] as const;
+export type NonMechanicalReason = (typeof NON_MECHANICAL_REASONS)[number];
+
+// ------------------------------------------------------- schema operations -
+//
+// The schema-side sibling of the edit-op vocabulary: the small set of
+// mutations a schema suggestion may propose against the submitted schema
+// draft. Same two-layer defense as edit-ops: sanitizeSchemaOps (here)
+// checks SHAPE; validateSchemaOps (@sds/checker) checks SEMANTICS against
+// the concrete schema (table/field existence, legal enums, no-op drops).
+
+export type SchemaOp =
+  | { op: 'setShardKey'; table: string; field: string | null }
+  | { op: 'addIndex'; table: string; field: string }
+  | { op: 'setPrimaryKeyGen'; table: string; gen: 'auto' | 'snowflake' | 'uuid' | 'business' }
+  | { op: 'setEngine'; table: string; engine: 'relational' | 'nosql' };
+
+export const MAX_SCHEMA_OPS = 3;
+
+const SCHEMA_PK_GENS: readonly string[] = ['auto', 'snowflake', 'uuid', 'business'];
+const SCHEMA_ENGINES: readonly string[] = ['relational', 'nosql'];
+
+/** Shape-level sanitation of a raw schema-actions array. */
+export function sanitizeSchemaOps(raw: unknown): SchemaOp[] {
+  if (!Array.isArray(raw)) return [];
+  const out: SchemaOp[] = [];
+  for (const item of raw) {
+    if (out.length >= MAX_SCHEMA_OPS) break;
+    const o = item as Record<string, unknown> | null;
+    if (!o || typeof o !== 'object' || typeof o.table !== 'string' || !o.table.trim()) continue;
+    const table = o.table.trim();
+    if (o.op === 'setShardKey') {
+      if (o.field === null) out.push({ op: 'setShardKey', table, field: null });
+      else if (typeof o.field === 'string' && o.field.trim()) {
+        out.push({ op: 'setShardKey', table, field: o.field.trim() });
+      }
+    } else if (o.op === 'addIndex') {
+      if (typeof o.field === 'string' && o.field.trim()) {
+        out.push({ op: 'addIndex', table, field: o.field.trim() });
+      }
+    } else if (o.op === 'setPrimaryKeyGen') {
+      if (SCHEMA_PK_GENS.includes(String(o.gen))) {
+        out.push({ op: 'setPrimaryKeyGen', table, gen: String(o.gen) as SchemaOp extends { gen: infer G } ? G : never });
+      }
+    } else if (o.op === 'setEngine') {
+      if (SCHEMA_ENGINES.includes(String(o.engine))) {
+        out.push({ op: 'setEngine', table, engine: String(o.engine) as 'relational' | 'nosql' });
+      }
+    }
+  }
+  return out;
+}
+
 const isId = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
 
 /** Shape-level sanitation of a raw actions array (see the note above). */
@@ -175,10 +274,20 @@ export interface DriverFinding {
   detail: string;
   componentId?: string;
   /**
-   * Optional one-click fix in the edit-op vocabulary. Present only after
-   * server-side validation against the submitted design (see EditOp).
+   * One-click fix in the edit-op vocabulary. Under the action guarantee
+   * (see the ladder note at ActionSource) a finding ships with ≥1 action
+   * whenever one is constructible at all: the model is REQUIRED to
+   * propose actions, and the server repairs / synthesizes / falls back
+   * until one validates against the submitted design.
    */
   actions?: EditOp[];
+  /** Provenance of `actions` (the UI renders it next to the apply button). */
+  actionSource?: ActionSource;
+  /**
+   * The model's non-mechanical declaration, when it made one and the
+   * declaration survived the ladder (see NON_MECHANICAL_REASONS).
+   */
+  nonMechanicalReason?: NonMechanicalReason;
 }
 
 export interface DriverReview {
@@ -339,11 +448,16 @@ export interface ProbePrediction {
   rationale: string;
   fixHint: string;
   /**
-   * Optional structured form of fixHint, in the edit-op vocabulary. The
-   * server validates these against the submitted design when the probe is
-   * verified; only surviving ops are offered as a one-click fix.
+   * Structured form of fixHint, in the edit-op vocabulary. Required by
+   * the action guarantee whenever willFail is true: the server validates
+   * these against the submitted design (at propose time AND again when
+   * the probe is verified), and repairs / synthesizes / falls back until
+   * a failing prediction carries ≥1 applicable action. Predictions of a
+   * pass carry no fix and are excluded from the coverage accounting.
    */
   actions?: EditOp[];
+  /** Provenance of `actions` (the UI renders it next to the apply button). */
+  actionSource?: ActionSource;
 }
 
 /** One LLM-proposed probe case, in the friendly (relative) wire shape. */
@@ -438,10 +552,25 @@ export interface SchemaAssessmentContext {
   signals: SchemaReviewLike;
 }
 
+/** One schema improvement suggestion, with its (guaranteed) schema-ops. */
+export interface SchemaSuggestion {
+  text: string;
+  /**
+   * The suggestion's executable form, in the schema-op vocabulary. Under
+   * the action guarantee every suggestion ships with ≥1 action validated
+   * against the submitted schema whenever one is constructible at all.
+   */
+  actions?: SchemaOp[];
+  /** Provenance of `actions` (the UI renders it next to the apply button). */
+  actionSource?: ActionSource;
+  /** Surviving non-mechanical declaration, when the ladder allowed one. */
+  nonMechanicalReason?: NonMechanicalReason;
+}
+
 export interface SchemaAssessment {
   conclusion: string;
   dimensionNotes: { dimension: '需求覆盖' | '延迟风险' | '扩展性'; note: string }[];
-  suggestions: string[];
+  suggestions: SchemaSuggestion[];
 }
 
 export interface Driver {
@@ -710,11 +839,11 @@ export function buildSubmissionPrompt(ctx: SubmissionAssessmentContext): { syste
       `代码判卷结果：${ctx.passed}/${ctx.total} 通过，得分 ${ctx.scorePct}` +
       evidence +
       `\n\n结构缺陷（确定性规则，可信）：\n${ctx.structuralFindings.map((f) => `- [${f.severity}] ${f.title}：${f.detail}`).join('\n') || '（无）'}\n\n` +
-      `每条 finding 可选附带 actions：一键可应用的结构化改法（用户预览确认后由系统执行），只能用这三种操作，且 nodeId 必须引用上面设计摘要里出现的 id：\n` +
+      `【动作保证 · 硬性要求】每条 finding 都必须附带 actions：一键可应用的结构化改法（用户预览确认后由系统执行），只能用这三种操作，且 nodeId 必须引用上面设计摘要里出现的 id：\n` +
       `- {"op":"setSetting","nodeId":"节点id","key":"参数名","value":值}：参数名只能是该组件类型合法的参数——通用 replicas（整数）/ capacityScale；网关 rateLimitPerSec；缓存 mutexRebuild（布尔）/ eviction；负载均衡 lbAlgorithm；关系型 DB 与 NoSQL 的 sharded（布尔）/ shardKey（字符串）/ readReplicas（整数）/ consistency。\n` +
       `- {"op":"addComponent","componentType":"cache","connectFromId":"上游节点id","connectToId":"下游节点id"}：在两个已有节点之间插入一个新组件（两端 id 至少给一个）。要把两个新组件串成链（例如先插队列、再插消费它的 Worker），给第一个 addComponent 写 "newNodeId":"自取的id"，后续操作用这个 id 引用新节点。\n` +
       `- {"op":"addEdge","fromId":"节点id","toId":"节点id"}：新增一条连线。\n` +
-      `修法无法用这三种操作准确表达时，省略 actions，不要硬凑；每条 finding 最多 3 个操作。\n\n` +
+      `没有 actions 的 finding 会被系统判为不合格并触发修复轮（把校验错误回传给你重写），所以第一次就给对：id 抄准、参数名用合法的、值落在范围内；每条 finding 最多 3 个操作。唯一的例外：纯权衡/解释类评论（不涉及负载、容量、正确性、故障）可以不给 actions，但必须显式声明 "nonMechanical":"tradeoff|explanation|process" 说明理由——涉及错误率/P99/成本/过载/单点/一致性/积压的问题一律不许用这个声明逃避，系统也不会接受。\n\n` +
       `输出 JSON：{"summary":"2-3 句总评","scoreRationale":"为什么是这个分数：失分集中在哪、先修哪个涨分最快","findings":[{"severity":"high|medium|low","title":"…","detail":"…","actions":[{"op":"setSetting","nodeId":"…","key":"replicas","value":2}]}]}`,
   };
 }
@@ -725,14 +854,25 @@ export function parseSubmissionAssessment(json: unknown): SubmissionAssessment {
   const findings: DriverFinding[] = [];
   if (Array.isArray(o.findings)) {
     for (const f of o.findings) {
-      const g = f as { severity?: unknown; title?: unknown; detail?: unknown; actions?: unknown };
+      const g = f as {
+        severity?: unknown;
+        title?: unknown;
+        detail?: unknown;
+        actions?: unknown;
+        componentId?: unknown;
+        nonMechanical?: unknown;
+      };
       if (typeof g.title !== 'string') continue;
       const actions = sanitizeEditOps(g.actions);
       findings.push({
         severity: (['high', 'medium', 'low'].includes(String(g.severity)) ? String(g.severity) : 'medium') as DriverFinding['severity'],
         title: g.title,
         detail: String(g.detail ?? ''),
+        ...(typeof g.componentId === 'string' && g.componentId ? { componentId: g.componentId } : {}),
         ...(actions.length ? { actions } : {}),
+        ...((NON_MECHANICAL_REASONS as readonly string[]).includes(String(g.nonMechanical))
+          ? { nonMechanicalReason: String(g.nonMechanical) as NonMechanicalReason }
+          : {}),
       });
     }
   }
@@ -752,7 +892,13 @@ export function buildSchemaPrompt(ctx: SchemaAssessmentContext): { system: strin
       `代码规则信号：得分 ${ctx.signals.score}，${ctx.signals.coverage}\n逐条访问模式：\n` +
       ctx.signals.perPattern.map((p) => `- ${p.pattern}：${p.path} · 约 ${p.latencyMs}ms · ${p.verdict}${p.note ? `（${p.note}）` : ''}`).join('\n') +
       `\n规则发现：\n${ctx.signals.findings.map((f) => `- [${f.dimension}/${f.severity}] ${f.text}`).join('\n') || '（无）'}\n\n` +
-      `输出 JSON：{"conclusion":"2-3 句总评","dimensionNotes":[{"dimension":"需求覆盖|延迟风险|扩展性","note":"…"}],"suggestions":["具体可执行的改进，按优先级"]}`,
+      `【动作保证 · 硬性要求】每条 suggestion 必须是一个对象 {"text":"…","actions":[…]}，actions 是这条建议的结构化形式（用户一键应用到 schema 草稿），只能用这四种 schema 操作，table 必须是上面 schema 里真实存在的表名，field 必须是该表真实存在的字段：\n` +
+      `- {"op":"setShardKey","table":"表名","field":"字段名或 null"}：设定（或清除）分片键。\n` +
+      `- {"op":"addIndex","table":"表名","field":"字段名"}：给字段加索引（已索引的字段不要重复给）。\n` +
+      `- {"op":"setPrimaryKeyGen","table":"表名","gen":"auto|snowflake|uuid|business"}：换主键生成方式。\n` +
+      `- {"op":"setEngine","table":"表名","engine":"relational|nosql"}：换存储引擎。\n` +
+      `没有 actions 的建议会被判不合格并触发修复轮。每条最多 3 个操作。唯一的例外：纯权衡/解释类建议（不涉及延迟、覆盖、扩展性问题本身）可以只给 text 并声明 "nonMechanical":"tradeoff|explanation|process"。\n\n` +
+      `输出 JSON：{"conclusion":"2-3 句总评","dimensionNotes":[{"dimension":"需求覆盖|延迟风险|扩展性","note":"…"}],"suggestions":[{"text":"具体可执行的改进，按优先级","actions":[{"op":"addIndex","table":"…","field":"…"}]}]}`,
   };
 }
 
@@ -772,11 +918,29 @@ export function parseSchemaAssessment(json: unknown): SchemaAssessment {
       }
     }
   }
-  return {
-    conclusion: o.conclusion,
-    dimensionNotes,
-    suggestions: Array.isArray(o.suggestions) ? o.suggestions.map(String).slice(0, 6) : [],
-  };
+  // Suggestions are structured { text, actions? } under the action
+  // guarantee; plain strings from older/other emitters are accepted and
+  // normalized to { text } (the server ladder then synthesizes actions).
+  const suggestions: SchemaSuggestion[] = [];
+  if (Array.isArray(o.suggestions)) {
+    for (const s of o.suggestions.slice(0, 6)) {
+      if (typeof s === 'string') {
+        if (s.trim()) suggestions.push({ text: s });
+        continue;
+      }
+      const g = s as { text?: unknown; actions?: unknown; nonMechanical?: unknown } | null;
+      if (!g || typeof g.text !== 'string' || !g.text.trim()) continue;
+      const actions = sanitizeSchemaOps(g.actions);
+      suggestions.push({
+        text: g.text,
+        ...(actions.length ? { actions } : {}),
+        ...((NON_MECHANICAL_REASONS as readonly string[]).includes(String(g.nonMechanical))
+          ? { nonMechanicalReason: String(g.nonMechanical) as NonMechanicalReason }
+          : {}),
+      });
+    }
+  }
+  return { conclusion: o.conclusion, dimensionNotes, suggestions };
 }
 
 // ------------------------------------------------------ probe prompts ---
@@ -799,7 +963,7 @@ export function buildProbePrompt(ctx: ProbeContext): { system: string; user: str
       `${PROBE_CRITERIA}\n\n` +
       `输出 JSON：{"cases":[{"name":"用例名（点明场景）","scenario":{"trafficMultiplier":3,"durationSec":40,"readRatio":0.9,"events":[{"type":"viral_post","targetType":"feedservice","magnitude":3}],"kills":["appserver"]},"thresholds":{"p99Ms":1000,"maxErrorRatePct":1,"maxCostPerHour":900},"prediction":{"willFail":true,"primaryBreach":"错误率超标","rationale":"为什么这个场景会先打爆这一层","fixHint":"候选人该怎么改","actions":[{"op":"addComponent","componentType":"queue","connectFromId":"发帖节点id","connectToId":"存储节点id"}]}}]}\n` +
       `scenario 的 events/kills 可省略或为空数组；thresholds 至少给一项（可选项：p99Ms / maxErrorRatePct / maxCostPerHour / maxStorageQps / maxHottestUtilPct / maxStaleReadPct / maxQueueDepth）；prediction.willFail=false 时 primaryBreach 必须为「无」。\n` +
-      `prediction.actions 是 fixHint 的结构化版本（可选，用户一键应用）：只能用 setSetting / addComponent / addEdge 三种操作，nodeId 只能引用设计摘要里出现的 id，setSetting 的 key 只能是该组件类型合法的参数（replicas / capacityScale / rateLimitPerSec / mutexRebuild / eviction / lbAlgorithm / sharded / shardKey / readReplicas / consistency）。需要串联两个新组件时，给第一个 addComponent 写 newNodeId 并在后续操作中引用它。表达不了就省略，不要硬凑；每条最多 3 个操作。`,
+      `prediction.actions 是 fixHint 的结构化版本：【动作保证 · 硬性要求】willFail=true 的预测必须给 actions（用户一键应用）：只能用 setSetting / addComponent / addEdge 三种操作，nodeId 只能引用设计摘要里出现的 id，setSetting 的 key 只能是该组件类型合法的参数（replicas / capacityScale / rateLimitPerSec / mutexRebuild / eviction / lbAlgorithm / sharded / shardKey / readReplicas / consistency）。需要串联两个新组件时，给第一个 addComponent 写 newNodeId 并在后续操作中引用它。没有合法 actions 的失败预测会被判不合格并触发修复轮；willFail=false 的预测不要给 actions。每条最多 3 个操作。`,
   };
 }
 
@@ -888,6 +1052,7 @@ export function normalizeProbeCase(raw: unknown): ProbeCase | null {
     primaryBreach = String(p.primaryBreach) as BreachCategory;
   }
   const predActions = sanitizeEditOps((p as { actions?: unknown }).actions);
+  const predSource = (p as { actionSource?: unknown }).actionSource;
   return {
     name: o.name.trim().slice(0, 60),
     scenario,
@@ -898,6 +1063,11 @@ export function normalizeProbeCase(raw: unknown): ProbeCase | null {
       rationale: typeof p.rationale === 'string' ? p.rationale.slice(0, 400) : '',
       fixHint: typeof p.fixHint === 'string' ? p.fixHint.slice(0, 300) : '',
       ...(predActions.length ? { actions: predActions } : {}),
+      // Provenance must survive the client round-trip (propose → client
+      // → verify-probes) so the verified card can label its fix's source.
+      ...(predActions.length && (ACTION_SOURCES as readonly string[]).includes(String(predSource))
+        ? { actionSource: String(predSource) as ActionSource }
+        : {}),
     },
   };
 }
@@ -917,6 +1087,84 @@ export function parseProbeCases(json: unknown): ProbeCase[] {
     const pc = normalizeProbeCase(raw);
     if (pc) out.push(pc);
     if (out.length >= 4) break;
+  }
+  return out;
+}
+
+// ------------------------------------------------------ action repair ---
+//
+// Ladder step 2. When a first-pass evaluation ships findings whose actions
+// are missing or fail server-side validation, the lacking items go into
+// ONE bounded follow-up call: the same model profile, the same logging
+// plumbing, the validation errors quoted verbatim, and the legal vocab
+// spelled out again. Whatever validates this time attaches with
+// actionSource 'repaired'; the rest fall through to deterministic rule
+// synthesis and the universal fallback (server-side, no more calls).
+
+export interface ActionRepairItem {
+  /** Index of the item within its batch — the reply refers back by it. */
+  index: number;
+  kind: 'finding' | 'probe' | 'schema';
+  title: string;
+  detail: string;
+  /** Why the first pass's actions did not survive (verbatim-ish). */
+  errors: string[];
+}
+
+export interface ActionRepairContext {
+  problemName: string;
+  items: ActionRepairItem[];
+  /** Legal architecture vocabulary, rendered (nodes + per-type settings). */
+  legalArch?: string;
+  /** Legal schema vocabulary, rendered (tables + fields + current keys). */
+  legalSchema?: string;
+  designSummary?: string;
+  schemaSummary?: string;
+}
+
+export function buildActionRepairPrompt(ctx: ActionRepairContext): { system: string; user: string } {
+  const archItems = ctx.items.filter((i) => i.kind !== 'schema');
+  const schemaItems = ctx.items.filter((i) => i.kind === 'schema');
+  const itemLine = (i: ActionRepairItem) =>
+    `- [${i.index}] ${i.kind === 'schema' ? 'schema 建议' : i.kind === 'probe' ? '探测用例的修复' : '评审发现'}「${i.title}」：${i.detail}\n  上一轮动作的问题：${i.errors.join('；') || '（没有给 actions）'}`;
+  return {
+    system:
+      '你是一位资深系统设计面试官，正在执行【动作修复轮】。上一轮评审里有几条发现没有给出合法的一键修复动作（或给的动作没通过服务端校验）。你的唯一任务：为列出的每一条补出合法的结构化动作。不要改写发现的文字，不要新增发现，不要解释——只输出 JSON。',
+    user:
+      `题目：${ctx.problemName}\n` +
+      (ctx.designSummary ? `\n候选人设计：\n${ctx.designSummary}\n` : '') +
+      (ctx.schemaSummary ? `\n候选人 schema：\n${ctx.schemaSummary}\n` : '') +
+      (archItems.length && ctx.legalArch ? `\n架构侧合法词表（nodeId 与参数只能取这里列出的）：\n${ctx.legalArch}\n` : '') +
+      (schemaItems.length && ctx.legalSchema ? `\nSchema 侧合法词表（表名/字段名只能取这里列出的）：\n${ctx.legalSchema}\n` : '') +
+      `\n需要补动作的条目：\n${ctx.items.map(itemLine).join('\n')}\n\n` +
+      `架构动作（finding/probe 条目）只能用三种操作：{"op":"setSetting","nodeId":"合法节点id","key":"该类型合法参数","value":值} / {"op":"addComponent","componentType":"组件类型","connectFromId":"合法节点id","connectToId":"合法节点id","newNodeId":"串联时给第一个新节点取的id"} / {"op":"addEdge","fromId":"合法节点id","toId":"合法节点id"}。\n` +
+      `Schema 动作（schema 条目）只能用四种操作：{"op":"setShardKey","table":"表名","field":"字段名或 null"} / {"op":"addIndex","table":"表名","field":"字段名"} / {"op":"setPrimaryKeyGen","table":"表名","gen":"auto|snowflake|uuid|business"} / {"op":"setEngine","table":"表名","engine":"relational|nosql"}。\n` +
+      `每条最多 3 个操作；动作要对症这条发现说的问题，不要给无关的通用扩容。\n\n` +
+      `输出 JSON：{"repairs":[{"index":0,"actions":[{"op":"setSetting","nodeId":"…","key":"replicas","value":2}]},{"index":2,"schemaActions":[{"op":"addIndex","table":"…","field":"…"}]}]}（finding/probe 条目用 actions，schema 条目用 schemaActions）`,
+  };
+}
+
+export interface ParsedRepair {
+  archActions?: EditOp[];
+  schemaActions?: SchemaOp[];
+}
+
+/** Parse the repair reply into a per-index map (shape-sanitized only;
+ *  semantic validation happens server-side, exactly like the first pass). */
+export function parseActionRepair(json: unknown): Map<number, ParsedRepair> {
+  const out = new Map<number, ParsedRepair>();
+  const arr = (json as { repairs?: unknown })?.repairs;
+  if (!Array.isArray(arr)) return out;
+  for (const r of arr) {
+    const o = r as { index?: unknown; actions?: unknown; schemaActions?: unknown } | null;
+    if (!o || typeof o.index !== 'number' || !Number.isInteger(o.index)) continue;
+    const arch = sanitizeEditOps(o.actions);
+    const schema = sanitizeSchemaOps(o.schemaActions);
+    if (!arch.length && !schema.length) continue;
+    out.set(o.index, {
+      ...(arch.length ? { archActions: arch } : {}),
+      ...(schema.length ? { schemaActions: schema } : {}),
+    });
   }
   return out;
 }

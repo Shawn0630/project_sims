@@ -436,9 +436,17 @@ export class ScriptedDriver implements Driver {
               : '没有发现扩展性雷区：分片键、主键生成与索引数量都在安全区。',
       };
     });
-    const suggestions = s.findings.slice(0, 5).map((f) => `「${f.dimension}」${f.text}`);
+    // Structured suggestions (action guarantee): the text derives from
+    // the deterministic findings, exactly as before; the executable
+    // schema-ops are attached by the server ladder, which synthesizes
+    // them from these same signals against the submitted schema.
+    const suggestions: SchemaAssessment['suggestions'] = s.findings
+      .slice(0, 5)
+      .map((f) => ({ text: `「${f.dimension}」${f.text}` }));
     if (!suggestions.length) {
-      suggestions.push('保持当前 schema；下一步可以去挑战更大的数据量级档位，看哪条访问模式先变风险。');
+      suggestions.push({
+        text: '保持当前 schema；下一步可以去挑战更大的数据量级档位，看哪条访问模式先变风险。',
+      });
     }
     return { conclusion, dimensionNotes, suggestions };
   }
