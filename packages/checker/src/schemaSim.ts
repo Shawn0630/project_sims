@@ -78,6 +78,26 @@ export const SCHEMA_SIM_GROWTH_FACTOR = 10;
 export type SchemaSimPath = '主键直查' | '索引查询' | '分片内定位' | '跨分片广播' | '全表扫描';
 export type SchemaSimVerdict = '通过' | '风险' | '不通过';
 
+/**
+ * The pattern as a REAL statement a developer would run, generated next
+ * to the engine from the same facts (path, rows examined, table shape):
+ * SQL for relational tables, a document/KV idiom for NoSQL, an
+ * EXPLAIN-style plan line priced from the sim's own numbers, and a few
+ * synthesized sample rows so the result set is visible, not abstract.
+ * The frontend's latency playback renders exactly this block — it
+ * invents no statements and no numbers of its own.
+ */
+export interface SchemaSimQuery {
+  /** The statement text (mono-ready, may be multi-line). */
+  text: string;
+  /** EXPLAIN-style plan line, computed from the sim's own numbers. */
+  explain: string;
+  /** Rows the statement returns (reads) or affects (writes / counts). */
+  resultRows: number;
+  /** 2–3 synthesized sample rows （样例数据）, keyed by field name. */
+  sampleRows: Record<string, string | number>[];
+}
+
 export interface SchemaSimPattern {
   patternId: string;
   name: string;
@@ -91,6 +111,8 @@ export interface SchemaSimPattern {
   budgetMs: number;
   verdict: SchemaSimVerdict;
   note: string;
+  /** The real statement + plan + sample rows for this pattern. */
+  query: SchemaSimQuery;
 }
 
 export interface SchemaSimTable {
@@ -229,6 +251,169 @@ function classify(pattern: AccessPattern, table: SchemaTable): PathClass {
   return '全表扫描';
 }
 
+// -------------------------------------------------- query rendering ---
+// The statement text + EXPLAIN line for one pattern, generated from the
+// engine's own facts. Deterministic: same schema + pattern → same text.
+
+const SAMPLE_STRINGS: Record<string, string[]> = {
+  email: ['alice@example.com', 'bob@example.com', 'carol@example.com'],
+  code: ['aX9kQ2', 'mZ41pL', 'Qw77eR'],
+  name: ['alice', 'bob', 'carol'],
+  url: ['https://example.com/posts/123', 'https://example.com/posts/124', 'https://example.com/posts/125'],
+  ts: ['2026-10-18 09:41:07', '2026-10-18 09:34:52', '2026-10-18 09:27:15'],
+};
+
+/** A representative literal for a field, by name + type. Deterministic. */
+function literalFor(table: SchemaTable, fieldName: string, rowIdx = 0): string | number {
+  const f = table.fields.find((x) => x.name === fieldName);
+  const type = (f?.type ?? '').toLowerCase();
+  const pick = (arr: string[]) => arr[Math.min(rowIdx, arr.length - 1)]!;
+  if (/email/.test(fieldName)) return pick(SAMPLE_STRINGS.email!);
+  if (/code|token|slug/.test(fieldName)) return pick(SAMPLE_STRINGS.code!);
+  if (/url|link/.test(fieldName)) return pick(SAMPLE_STRINGS.url!);
+  if (/timestamp|datetime|date|time/.test(type) || /_at$/.test(fieldName)) return pick(SAMPLE_STRINGS.ts!);
+  if (fieldName === table.primaryKey) {
+    return /int|float|double|decimal/.test(type) || type === '' ? 1001 + rowIdx : pick(SAMPLE_STRINGS.code!);
+  }
+  if (fieldName.endsWith('_id')) return 42 + rowIdx;
+  if (/count|num|total/.test(fieldName)) return 128 + rowIdx * 17;
+  if (/int|float|double|decimal/.test(type)) return 7 + rowIdx * 3;
+  if (/bool/.test(type)) return rowIdx % 2 === 0 ? 'true' : 'false';
+  if (/username|handle|name|title/.test(fieldName)) return pick(SAMPLE_STRINGS.name!);
+  if (/text|content|bio|desc/.test(fieldName)) return `示例文本 ${rowIdx + 1}`;
+  if (/blob/.test(type) || f?.blob) return '(二进制数据)';
+  return `${fieldName}_${rowIdx + 1}`;
+}
+
+const sqlLit = (v: string | number) => (typeof v === 'number' ? String(v) : `'${v}'`);
+const docLit = (v: string | number) => (typeof v === 'number' ? String(v) : `'${v}'`);
+
+function sampleRowsFor(
+  pattern: AccessPattern,
+  table: SchemaTable,
+  resultRows: number,
+): Record<string, string | number>[] {
+  const n = Math.min(3, Math.max(1, resultRows));
+  const rows: Record<string, string | number>[] = [];
+  for (let i = 0; i < n; i += 1) {
+    const row: Record<string, string | number> = {};
+    for (const f of table.fields) {
+      row[f.name] =
+        f.name === pattern.byField ? literalFor(table, f.name, 0) : literalFor(table, f.name, i);
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+function buildQuery(
+  pattern: AccessPattern,
+  table: SchemaTable,
+  cls: PathClass,
+  examined: number,
+  matched: number,
+  shards: number,
+): SchemaSimQuery {
+  const rel = table.engine === 'relational';
+  const unit = rel ? 'rows' : 'documents';
+  const byField = pattern.byField;
+  const field = table.fields.find((f) => f.name === byField);
+  const indexCount = table.fields.filter((f) => f.indexed).length;
+  const writeAmp = round3(1 + 0.35 * indexCount);
+  const idxName = rel ? `idx_${table.name}_${byField}` : `${byField}_1`;
+  const countField = table.fields.find((f) => /count/.test(f.name))?.name;
+  const lit = literalFor(table, byField, 0);
+  const sortField = table.fields.some((f) => f.name === 'created_at') ? 'created_at' : table.primaryKey;
+  const cols = table.fields.map((f) => f.name).join(', ');
+  const perShard = Math.ceil(examined / Math.max(1, shards));
+  const probeScatter =
+    cls === '索引查询' && !!table.shardKey && byField !== table.shardKey;
+
+  let text: string;
+  let explain: string;
+  let resultRows: number;
+
+  if (pattern.kind === 'count') {
+    // The engine prices a count pattern as a hot-row counter update
+    // (row lock on one key), so the faithful statement is the UPDATE;
+    // tables without a counter field fall back to the COUNT read.
+    resultRows = 1;
+    if (rel) {
+      text = countField
+        ? `UPDATE ${table.name} SET ${countField} = ${countField} + 1 WHERE ${byField} = ${sqlLit(lit)};`
+        : `SELECT COUNT(*) AS cnt FROM ${table.name} WHERE ${byField} = ${sqlLit(lit)};`;
+      explain = countField
+        ? `Update on ${table.name} · hot row located by ${byField} (${byField === table.primaryKey ? 'PRIMARY' : field?.indexed ? idxName : 'no index'}) · ${unit} examined 1`
+        : `Aggregate on ${table.name} · ${unit} examined ${Math.round(examined).toLocaleString()}`;
+    } else {
+      text = countField
+        ? `db.${table.name}.updateOne({ ${byField}: ${docLit(lit)} }, { $inc: { ${countField}: 1 } })`
+        : `db.${table.name}.countDocuments({ ${byField}: ${docLit(lit)} })`;
+      explain = countField
+        ? `Atomic $inc on ${table.name} · hot document located by ${byField} · ${unit} examined 1`
+        : `Count on ${table.name} · ${unit} examined ${Math.round(examined).toLocaleString()}`;
+    }
+    const sample = countField
+      ? [{ [byField]: lit, [countField]: 129 }]
+      : [{ cnt: matched }];
+    return { text, explain, resultRows, sampleRows: sample };
+  }
+
+  if (pattern.kind === 'write') {
+    resultRows = 1;
+    if (rel) {
+      const vals = table.fields.map((f) => sqlLit(literalFor(table, f.name, 0))).join(', ');
+      text = `INSERT INTO ${table.name} (${cols}) VALUES (${vals});`;
+      explain = `Insert into ${table.name} · 1 row · ${indexCount} index entries maintained (write amp ×${writeAmp})`;
+    } else {
+      const doc = table.fields.map((f) => `${f.name}: ${docLit(literalFor(table, f.name, 0))}`).join(', ');
+      text = `db.${table.name}.insertOne({ ${doc} })`;
+      explain = `Insert into ${table.name} · 1 document · ${indexCount} index entries maintained (write amp ×${writeAmp})`;
+    }
+    return { text, explain, resultRows, sampleRows: sampleRowsFor(pattern, table, 1) };
+  }
+
+  // Reads.
+  resultRows = matched;
+  if (rel) {
+    text =
+      `SELECT ${cols} FROM ${table.name} WHERE ${byField} = ${sqlLit(lit)}` +
+      (pattern.needsSort ? ` ORDER BY ${sortField} DESC LIMIT 20` : '') +
+      ';';
+  } else if (byField === table.primaryKey) {
+    text = `db.${table.name}.findOne({ ${byField}: ${docLit(lit)} })`;
+  } else {
+    text =
+      `db.${table.name}.find({ ${byField}: ${docLit(lit)} })` +
+      (pattern.needsSort ? `.sort({ ${sortField}: -1 }).limit(20)` : '');
+  }
+  const ex = Math.round(examined).toLocaleString();
+  switch (cls) {
+    case '主键直查':
+      explain = rel
+        ? `Index Scan using PRIMARY on ${table.name} · ${unit} examined ${ex}`
+        : `Partition key GET on ${table.name} · ${unit} examined ${ex}`;
+      break;
+    case '分片内定位':
+      explain = field?.indexed
+        ? `Index Scan using ${idxName} on ${table.name} · shard routed by ${table.shardKey} · ${unit} examined ${ex}`
+        : `${rel ? 'Seq Scan' : 'Collection Scan'} on ${table.name} (single shard slice) · ${unit} examined ${ex}`;
+      break;
+    case '索引查询':
+      explain = probeScatter
+        ? `Index Scan using ${idxName} on ${table.name} · scatter across ${shards} shards (shard key is ${table.shardKey}) · ${unit} examined ${ex}`
+        : `Index Scan using ${idxName} on ${table.name} · ${unit} examined ${ex}`;
+      break;
+    case '跨分片广播':
+      explain = `Scatter-gather across ${shards} shards · ${unit} examined ${ex} (${perShard.toLocaleString()} per shard)`;
+      break;
+    default: // 全表扫描
+      explain = `${rel ? 'Seq Scan' : 'Collection Scan'} on ${table.name} · ${unit} examined ${ex}`;
+      break;
+  }
+  return { text, explain, resultRows, sampleRows: sampleRowsFor(pattern, table, resultRows) };
+}
+
 interface ScaleRun {
   patterns: SchemaSimPattern[];
   /** Hottest-shard utilization per table name at this scale (all demand). */
@@ -238,11 +423,38 @@ interface ScaleRun {
   shardCountByTable: Map<string, number>;
 }
 
+/**
+ * Scenario knobs for ONE scale run (the probe pipeline's adversarial
+ * what-ifs). Everything optional; with no opts the run is exactly the
+ * plain simulateSchema run — same inputs, byte-identical outputs.
+ */
+export interface SchemaSimScenario {
+  /** Row-count multiplier for this run (data growth / shrinkage). */
+  growthFactor?: number;
+  /** Global traffic multiplier over every pattern's declared perSec. */
+  trafficMultiplier?: number;
+  /** Per-pattern traffic multipliers (override the global one per id). */
+  patternTraffic?: Record<string, number>;
+  /**
+   * Data/traffic skew: this pattern's traffic concentrates on ONE
+   * byField value — fraction `concentration` (0..1) of it lands on a
+   * single shard / hot row instead of spreading by the shard model.
+   */
+  skew?: { patternId: string; concentration: number };
+}
+
+interface ScaleOpts {
+  trafficOf?: (p: AccessPattern) => number;
+  skewPatternId?: string;
+  skewConcentration?: number;
+}
+
 function runScale(
   tables: SchemaTable[],
   patterns: AccessPattern[],
   budgetMs: number,
   ownerPopulation: number,
+  opts: ScaleOpts = {},
 ): ScaleRun {
   const tableByName = new Map(tables.map((t) => [t.name, t]));
   const shardCountByTable = new Map(tables.map((t) => [t.name, shardCountOf(t, t.rows)]));
@@ -255,6 +467,8 @@ function runScale(
     cls: PathClass;
     examined: number;
     baseAvgMs: number;
+    /** Effective perSec for this run (scenario multipliers applied). */
+    perSec: number;
   }
   const partials: Partial[] = [];
   const demandByTable = new Map<string, number>(); // shard-ms per second on the hottest shard
@@ -269,8 +483,13 @@ function runScale(
 
   for (const pattern of patterns) {
     const table = tableByName.get(pattern.table);
+    const perSec = opts.trafficOf ? opts.trafficOf(pattern) : pattern.perSec;
+    const skewed =
+      opts.skewPatternId === pattern.id
+        ? Math.min(1, Math.max(0, opts.skewConcentration ?? 0))
+        : 0;
     if (!table) {
-      partials.push({ pattern, cls: '全表扫描', examined: 0, baseAvgMs: 0 });
+      partials.push({ pattern, cls: '全表扫描', examined: 0, baseAvgMs: 0, perSec });
       continue;
     }
     const eng = ENGINE[table.engine];
@@ -294,19 +513,24 @@ function runScale(
         table.primaryKeyGen === 'auto' ? 0.5 : table.primaryKeyGen === 'uuid' ? 0.3 : 0;
       baseAvgMs = eng.writeBaseMs * writeAmp + blobMs + pkGenMs;
       const model = shardLoadModel(table.shardKey, !!table.shardKey, shards);
-      svcPerShardMs = eng.writeSvcMs * writeAmp * model.hottestWriteShare;
-      partials.push({ pattern, table, cls, examined, baseAvgMs });
-      addDemand(table, cls, pattern.perSec * svcPerShardMs);
+      // Skew: a fraction of this pattern's writes pile onto ONE key —
+      // the hottest shard carries at least that share.
+      const share = skewed > 0 ? Math.max(model.hottestWriteShare, skewed) : model.hottestWriteShare;
+      svcPerShardMs = eng.writeSvcMs * writeAmp * share;
+      partials.push({ pattern, table, cls, examined, baseAvgMs, perSec });
+      addDemand(table, cls, perSec * svcPerShardMs);
       continue;
     }
     if (pattern.kind === 'count') {
       examined = 1;
-      baseAvgMs = 4 + Math.min(24, pattern.perSec * 0.004);
+      baseAvgMs = 4 + Math.min(24, perSec * 0.004);
       const model = shardLoadModel(table.shardKey, !!table.shardKey, shards);
-      // A hot-row lock is held on the one shard owning that key.
-      svcPerShardMs = 0.2 * model.hottestWriteShare;
-      partials.push({ pattern, table, cls, examined, baseAvgMs });
-      addDemand(table, cls, pattern.perSec * svcPerShardMs);
+      // A hot-row lock is held on the one shard owning that key; skew
+      // concentrates even more of the counter traffic on that one row.
+      const share = skewed > 0 ? Math.max(model.hottestWriteShare, skewed) : model.hottestWriteShare;
+      svcPerShardMs = 0.2 * share;
+      partials.push({ pattern, table, cls, examined, baseAvgMs, perSec });
+      addDemand(table, cls, perSec * svcPerShardMs);
       continue;
     }
 
@@ -314,7 +538,10 @@ function runScale(
       case '主键直查': {
         examined = 1;
         baseAvgMs = eng.pkBaseMs;
-        svcPerShardMs = eng.readSvcMs / shards;
+        // Skew: the concentrated fraction of queries all hit the one
+        // shard owning that key, so it carries readSvcMs × concentration
+        // per query instead of the even 1/shards share.
+        svcPerShardMs = skewed > 0 ? eng.readSvcMs * skewed : eng.readSvcMs / shards;
         break;
       }
       case '分片内定位': {
@@ -326,7 +553,7 @@ function runScale(
           examined = Math.ceil(table.rows / shards);
           baseAvgMs = eng.indexBaseMs + examined / eng.scanRowsPerMs;
         }
-        svcPerShardMs = eng.readSvcMs / shards;
+        svcPerShardMs = skewed > 0 ? eng.readSvcMs * skewed : eng.readSvcMs / shards;
         break;
       }
       case '索引查询': {
@@ -338,7 +565,7 @@ function runScale(
           baseAvgMs += shards * 1.2;
           svcPerShardMs = eng.readSvcMs; // each shard works on every query
         } else {
-          svcPerShardMs = eng.readSvcMs / shards;
+          svcPerShardMs = skewed > 0 ? eng.readSvcMs * skewed : eng.readSvcMs / shards;
         }
         if (pattern.needsSort && matched > 20) {
           baseAvgMs += matched * Math.log2(matched) * 0.002;
@@ -361,8 +588,8 @@ function runScale(
         break; // handled above the switch (kind-based cost model)
       }
     }
-    partials.push({ pattern, table, cls, examined, baseAvgMs });
-    addDemand(table, cls, pattern.perSec * svcPerShardMs);
+    partials.push({ pattern, table, cls, examined, baseAvgMs, perSec });
+    addDemand(table, cls, perSec * svcPerShardMs);
   }
 
   const utilByTable = new Map<string, number>();
@@ -374,13 +601,19 @@ function runScale(
   }
 
   // Pass 2 — p99 (tail × queueing) and verdicts.
-  const out: SchemaSimPattern[] = partials.map(({ pattern, table, cls, examined, baseAvgMs }) => {
+  const out: SchemaSimPattern[] = partials.map(({ pattern, table, cls, examined, baseAvgMs, perSec }) => {
     if (!table) {
       return {
         patternId: pattern.id, name: pattern.name, table: pattern.table, kind: pattern.kind,
-        path: '全表扫描', qps: pattern.perSec, rowsExaminedPerQuery: 0,
+        path: '全表扫描', qps: perSec, rowsExaminedPerQuery: 0,
         avgMs: 0, p99Ms: 0, budgetMs, verdict: '不通过',
         note: `引用的表 ${pattern.table} 不存在。`,
+        query: {
+          text: `-- 访问模式引用的表 ${pattern.table} 不存在，无法生成语句`,
+          explain: '—',
+          resultRows: 0,
+          sampleRows: [],
+        },
       };
     }
     const util = queueUtilByTable.get(table.name) ?? 0;
@@ -433,10 +666,18 @@ function runScale(
       floor('风险');
       note += `（表 ${table.name} 最热分片已饱和，利用率 ${round3(util)}，排队会进一步放大延迟。）`;
     }
+    const query = buildQuery(
+      pattern,
+      table,
+      cls,
+      examined,
+      matchedRows(table, pattern.byField, ownerPopulation),
+      shardCountByTable.get(table.name) ?? 1,
+    );
     return {
       patternId: pattern.id, name: pattern.name, table: table.name, kind: pattern.kind,
-      path, qps: pattern.perSec, rowsExaminedPerQuery: Math.round(examined),
-      avgMs: round1(avgMs), p99Ms: round1(p99Ms), budgetMs, verdict, note,
+      path, qps: perSec, rowsExaminedPerQuery: Math.round(examined),
+      avgMs: round1(avgMs), p99Ms: round1(p99Ms), budgetMs, verdict, note, query,
     };
   });
 
@@ -453,15 +694,20 @@ function runScale(
  * schema), falling back to the problem pack's when the submission
  * carries none.
  */
+/** The per-pattern P99 budget for a problem — one derivation (the
+ *  tightest architecture-case P99 threshold in the pack), shared by the
+ *  plain run, scenario runs and schema judging so thresholds never drift. */
+export function schemaSimBudgetMs(problem: ProblemDef): number {
+  const budgets = problem.testCases
+    .map((tc) => tc.thresholds.maxP99Ms)
+    .filter((v): v is number => typeof v === 'number' && v > 0);
+  return budgets.length ? Math.min(...budgets) : 500;
+}
+
 export function simulateSchema(problem: ProblemDef, schema: ProblemSchema): SchemaSimResult {
   const patterns =
     schema.accessPatterns.length > 0 ? schema.accessPatterns : problem.schema.accessPatterns;
-  const budgetMs = (() => {
-    const budgets = problem.testCases
-      .map((tc) => tc.thresholds.maxP99Ms)
-      .filter((v): v is number => typeof v === 'number' && v > 0);
-    return budgets.length ? Math.min(...budgets) : 500;
-  })();
+  const budgetMs = schemaSimBudgetMs(problem);
   const usersTable = schema.tables.find((t) => t.name === 'users') ?? problem.schema.tables.find((t) => t.name === 'users');
   const ownerPopulation = usersTable?.rows ?? 1_000_000;
 
@@ -553,6 +799,65 @@ export function simulateSchema(problem: ProblemDef, schema: ProblemSchema): Sche
       bottleneckTable: bottleneck?.table ?? null,
       bottleneckPatternId: bottleneckPattern?.id ?? null,
     },
+  };
+}
+
+/** Result of ONE scenario run — the probe pipeline's verification substrate. */
+export interface SchemaScenarioRun {
+  growthFactor: number;
+  perPattern: SchemaSimPattern[];
+  perTable: { table: string; hottestShardUtil: number; shardCount: number }[];
+  totalQps: number;
+  /** totalQps / hottest table util — how much traffic this schema shape
+   *  sustains under the scenario before its first table saturates. */
+  maxSustainableQps: number;
+}
+
+/**
+ * Run the schema sim under ONE adversarial scenario: data growth, a
+ * traffic multiplier (global or per-pattern — the patternTrafficMap mode
+ * is how a "structure flip" is expressed), and/or a skew concentration on
+ * one pattern. With an empty scenario the measured numbers equal the
+ * plain simulateSchema run at current scale (same engine, same inputs).
+ */
+export function runSchemaScenario(
+  problem: ProblemDef,
+  schema: ProblemSchema,
+  scenario: SchemaSimScenario = {},
+): SchemaScenarioRun {
+  const patterns =
+    schema.accessPatterns.length > 0 ? schema.accessPatterns : problem.schema.accessPatterns;
+  const budgetMs = schemaSimBudgetMs(problem);
+  const growth = Math.max(0.01, scenario.growthFactor ?? 1);
+  const tables =
+    growth === 1
+      ? schema.tables
+      : schema.tables.map((t) => ({ ...t, rows: Math.round(t.rows * growth) }));
+  const usersTable =
+    tables.find((t) => t.name === 'users') ?? problem.schema.tables.find((t) => t.name === 'users');
+  const ownerPopulation = usersTable?.rows ?? 1_000_000;
+  const globalMult = scenario.trafficMultiplier ?? 1;
+  const trafficOf = (p: AccessPattern) =>
+    p.perSec * (scenario.patternTraffic?.[p.id] ?? globalMult);
+  const run = runScale(tables, patterns, budgetMs, ownerPopulation, {
+    trafficOf,
+    ...(scenario.skew
+      ? { skewPatternId: scenario.skew.patternId, skewConcentration: scenario.skew.concentration }
+      : {}),
+  });
+  const totalQps = patterns.reduce((s, p) => s + trafficOf(p), 0);
+  const perTable = tables.map((t) => ({
+    table: t.name,
+    hottestShardUtil: round3(run.utilByTable.get(t.name) ?? 0),
+    shardCount: run.shardCountByTable.get(t.name) ?? 1,
+  }));
+  const maxUtil = perTable.reduce((m, t) => Math.max(m, t.hottestShardUtil), 0);
+  return {
+    growthFactor: growth,
+    perPattern: run.patterns,
+    perTable,
+    totalQps,
+    maxSustainableQps: maxUtil > 0 ? Math.round(totalQps / maxUtil) : totalQps,
   };
 }
 
