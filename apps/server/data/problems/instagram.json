@@ -504,6 +504,107 @@
       "hint": "读副本 + 最终一致在高写入下会读到旧数据。关键读改强一致（走主库），或减少副本延迟来源。"
     }
   ],
+  "schemaTestCases": [
+    {
+      "id": "ig-sc1",
+      "name": "按作者查照片不能走灾难路径",
+      "description": "照片流是核心读路径：不许全表扫描，也不许跨分片广播。",
+      "hidden": false,
+      "weight": 1,
+      "scale": "now",
+      "assertion": {
+        "kind": "pattern-path",
+        "patternId": "ig-p2",
+        "forbiddenPaths": [
+          "全表扫描",
+          "跨分片广播"
+        ]
+      }
+    },
+    {
+      "id": "ig-sc2",
+      "name": "查用户资料延迟达标",
+      "description": "主键直查的 P99 应 ≤ 50ms。",
+      "hidden": false,
+      "weight": 1,
+      "scale": "now",
+      "assertion": {
+        "kind": "pattern",
+        "patternId": "ig-p1",
+        "metric": "p99Ms",
+        "max": 50
+      }
+    },
+    {
+      "id": "ig-sc3",
+      "name": "photos 表负载要摊开",
+      "description": "隐藏用例：50 亿行的 photos 若不分片，全部读写压在一台机器上——最热分片利用率必须 ≤ 0.2。",
+      "hidden": true,
+      "weight": 2,
+      "scale": "now",
+      "assertion": {
+        "kind": "table",
+        "table": "photos",
+        "metric": "hottestShardUtil",
+        "max": 0.2
+      }
+    },
+    {
+      "id": "ig-sc4",
+      "name": "follows 表在 ×10 数据量下仍摊得开",
+      "description": "隐藏用例：关注关系涨到 1000 亿行后，follows 的最热分片利用率仍要 ≤ 0.2。",
+      "hidden": true,
+      "weight": 2,
+      "scale": "grown",
+      "assertion": {
+        "kind": "table",
+        "table": "follows",
+        "metric": "hottestShardUtil",
+        "max": 0.2
+      }
+    },
+    {
+      "id": "ig-sc5",
+      "name": "整体可持续流量下限",
+      "description": "隐藏用例：按当前结构，第一张表饱和前要能撑起至少 60,000 次/s 的总流量。",
+      "hidden": true,
+      "weight": 1,
+      "scale": "now",
+      "assertion": {
+        "kind": "global",
+        "metric": "sustainableQps",
+        "min": 60000
+      }
+    },
+    {
+      "id": "ig-sc6",
+      "name": "查点赞者在 ×10 后仍是小扫描",
+      "description": "数据量 ×10 后，按照片查点赞者每次扫描行数仍应是千级以内。",
+      "hidden": false,
+      "weight": 1,
+      "scale": "grown",
+      "assertion": {
+        "kind": "pattern",
+        "patternId": "ig-p7",
+        "metric": "rowsExamined",
+        "max": 1000
+      }
+    },
+    {
+      "id": "ig-sc7",
+      "name": "点赞者查询别被错误分片键拖慢",
+      "description": "隐藏用例：如果给 likes 选了会让查询逐分片探测的分片键（如按时间单调递增的键），×10 后这一查的 P99 会飙到百毫秒级。要求 ≤ 60ms。",
+      "hidden": true,
+      "weight": 1,
+      "scale": "grown",
+      "assertion": {
+        "kind": "pattern",
+        "patternId": "ig-p7",
+        "metric": "p99Ms",
+        "max": 60
+      }
+    }
+  ],
   "sampleDesign": {
     "nodes": [
       {

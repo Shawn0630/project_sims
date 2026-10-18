@@ -291,6 +291,92 @@
       "hint": "应用层至少两个节点。"
     }
   ],
+  "schemaTestCases": [
+    {
+      "id": "us-sc1",
+      "name": "「我的链接」不能全表扫描",
+      "description": "按用户查链接是核心读路径：user_id 上没有索引时，每次查询都要把 10 亿行 urls 全扫一遍。",
+      "hidden": false,
+      "weight": 1,
+      "scale": "now",
+      "assertion": {
+        "kind": "pattern-path",
+        "patternId": "us-p2",
+        "forbiddenPaths": [
+          "全表扫描"
+        ]
+      }
+    },
+    {
+      "id": "us-sc2",
+      "name": "短码跳转延迟达标",
+      "description": "短码跳转是全站最高频的读：走 short_code 索引时 P99 应稳稳落在 100ms 内。",
+      "hidden": false,
+      "weight": 1,
+      "scale": "now",
+      "assertion": {
+        "kind": "pattern",
+        "patternId": "us-p1",
+        "metric": "p99Ms",
+        "max": 100
+      }
+    },
+    {
+      "id": "us-sc3",
+      "name": "数据量 ×10 后「我的链接」仍是小扫描",
+      "description": "隐藏用例：urls 涨到 100 亿行后，按用户查链接每次扫描的行数必须仍是千级，而不是随表一起涨。",
+      "hidden": true,
+      "weight": 2,
+      "scale": "grown",
+      "assertion": {
+        "kind": "pattern",
+        "patternId": "us-p2",
+        "metric": "rowsExamined",
+        "max": 10000
+      }
+    },
+    {
+      "id": "us-sc4",
+      "name": "urls 表最热分片不过载",
+      "description": "隐藏用例：全表扫描的代价不只是慢——它会把 urls 所在分片的利用率顶到饱和，其他查询一起陪葬。要求最热分片利用率 ≤ 1。",
+      "hidden": true,
+      "weight": 2,
+      "scale": "now",
+      "assertion": {
+        "kind": "table",
+        "table": "urls",
+        "metric": "hottestShardUtil",
+        "max": 1.0
+      }
+    },
+    {
+      "id": "us-sc5",
+      "name": "整体可持续流量下限",
+      "description": "隐藏用例：按当前结构，这套 schema 在第一张表饱和前要能撑起至少 5,000 次/s 的总流量。",
+      "hidden": true,
+      "weight": 1,
+      "scale": "now",
+      "assertion": {
+        "kind": "global",
+        "metric": "sustainableQps",
+        "min": 5000
+      }
+    },
+    {
+      "id": "us-sc6",
+      "name": "点击计数更新延迟达标",
+      "description": "计数更新打在单个热点行上：5000/s 的行锁竞争下，P99 仍应 ≤ 400ms。",
+      "hidden": false,
+      "weight": 1,
+      "scale": "now",
+      "assertion": {
+        "kind": "pattern",
+        "patternId": "us-p3",
+        "metric": "p99Ms",
+        "max": 400
+      }
+    }
+  ],
   "sampleDesign": {
     "nodes": [
       {

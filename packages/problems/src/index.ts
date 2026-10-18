@@ -51,6 +51,42 @@ export interface TestCase {
   hint?: string;
 }
 
+// ------------------------------------------------------- schema judging ---
+
+/**
+ * One assertion of a schema test case, phrased directly over the schema
+ * simulator's measured output (simulateSchema), so a case is judged by
+ * running the sim — no second cost model:
+ *  - pattern:      one access pattern's P99 / rows-examined at a scale;
+ *  - pattern-path: one pattern's execution path must avoid the named
+ *                  catastrophic routes （全表扫描 / 跨分片广播）;
+ *  - table:        one table's hottest-shard utilization or write
+ *                  amplification at a scale;
+ *  - global:       the schema's max sustainable QPS floor.
+ */
+export type SchemaCaseAssertion =
+  | { kind: 'pattern'; patternId: string; metric: 'p99Ms' | 'rowsExamined'; max: number }
+  | { kind: 'pattern-path'; patternId: string; forbiddenPaths: Array<'全表扫描' | '跨分片广播'> }
+  | { kind: 'table'; table: string; metric: 'hottestShardUtil' | 'writeAmp'; max: number }
+  | { kind: 'global'; metric: 'sustainableQps'; min: number };
+
+/**
+ * A test case for the DATABASE design — the schema-side mirror of
+ * TestCase. Judged deterministically by the schema simulator at submit
+ * time and scored independently in the 「数据库评审」 tab; the score
+ * never merges into the architecture total.
+ */
+export interface SchemaTestCase {
+  id: string;
+  name: string;
+  description: string;
+  hidden: boolean;
+  weight: number;
+  /** Which sim scale the assertion reads: current rows or ×10 grown. */
+  scale: 'now' | 'grown';
+  assertion: SchemaCaseAssertion;
+}
+
 // ----------------------------------------------------------------- schema ---
 
 export interface SchemaField {
@@ -152,6 +188,12 @@ export interface ProblemDef {
   /** This problem's own read/write demand profile — drives every deep dive. */
   workload: WorkloadProfile;
   testCases: TestCase[];
+  /**
+   * Test cases for the database design itself, judged by the schema
+   * simulator at submit time (independent score — see SchemaTestCase).
+   * Optional: packs authored before schema judging simply have none.
+   */
+  schemaTestCases?: SchemaTestCase[];
   /** A decent-but-flawed starting design (the interview "sample answer"). */
   sampleDesign: Design;
   /**

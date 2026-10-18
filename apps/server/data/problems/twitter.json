@@ -436,6 +436,93 @@
       "hint": "写路径单独核算容量，别只按读优化。"
     }
   ],
+  "schemaTestCases": [
+    {
+      "id": "tw-sc1",
+      "name": "按作者查推文不能走灾难路径",
+      "description": "作者时间线是核心读路径：不许全表扫描，也不许跨分片广播。",
+      "hidden": false,
+      "weight": 1,
+      "scale": "now",
+      "assertion": {
+        "kind": "pattern-path",
+        "patternId": "tw-p2",
+        "forbiddenPaths": [
+          "全表扫描",
+          "跨分片广播"
+        ]
+      }
+    },
+    {
+      "id": "tw-sc2",
+      "name": "时间线查关注列表延迟达标",
+      "description": "按 follower_id 路由到单个分片后，P99 应 ≤ 50ms。",
+      "hidden": false,
+      "weight": 1,
+      "scale": "now",
+      "assertion": {
+        "kind": "pattern",
+        "patternId": "tw-p3",
+        "metric": "p99Ms",
+        "max": 50
+      }
+    },
+    {
+      "id": "tw-sc3",
+      "name": "tweets 表负载要摊开",
+      "description": "隐藏用例：500 亿行的 tweets 若不分片，读写与计数全压在一台机器上——最热分片利用率必须 ≤ 0.1。",
+      "hidden": true,
+      "weight": 2,
+      "scale": "now",
+      "assertion": {
+        "kind": "table",
+        "table": "tweets",
+        "metric": "hottestShardUtil",
+        "max": 0.1
+      }
+    },
+    {
+      "id": "tw-sc4",
+      "name": "整体可持续流量下限",
+      "description": "隐藏用例：按当前结构，第一张表饱和前要能撑起至少 100,000 次/s 的总流量。",
+      "hidden": true,
+      "weight": 1,
+      "scale": "now",
+      "assertion": {
+        "kind": "global",
+        "metric": "sustainableQps",
+        "min": 100000
+      }
+    },
+    {
+      "id": "tw-sc5",
+      "name": "作者时间线别被错误分片键拖慢",
+      "description": "隐藏用例：若给 tweets 选了让作者查询逐分片探测的分片键，×10 后 P99 会飙到数百毫秒。要求 ≤ 60ms。",
+      "hidden": true,
+      "weight": 1,
+      "scale": "grown",
+      "assertion": {
+        "kind": "pattern",
+        "patternId": "tw-p2",
+        "metric": "p99Ms",
+        "max": 60
+      }
+    },
+    {
+      "id": "tw-sc6",
+      "name": "点赞计数更新延迟达标",
+      "description": "计数更新打在单个热点文档上：3000/s 的竞争下，P99 仍应 ≤ 200ms。",
+      "hidden": false,
+      "weight": 1,
+      "scale": "now",
+      "assertion": {
+        "kind": "pattern",
+        "patternId": "tw-p4",
+        "metric": "p99Ms",
+        "max": 200
+      }
+    }
+  ],
   "sampleDesign": {
     "nodes": [
       {
