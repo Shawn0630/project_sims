@@ -142,6 +142,22 @@ export interface ProblemPack {
 
 // ------------------------------------------------------------ judging DTOs -
 
+/**
+ * One structured fix action, in the edit-op vocabulary the backend
+ * validates (driver contract). Actions arrive ALREADY validated against
+ * the design snapshot they were generated for; the UI offers them as
+ * one-click fixes behind a highlighted preview + explicit confirm.
+ */
+export type EditOpDTO =
+  | { op: 'setSetting'; nodeId: string; key: string; value: string | number | boolean }
+  | {
+      op: 'addComponent';
+      componentType: ComponentTypeId;
+      connectFromId?: string;
+      connectToId?: string;
+    }
+  | { op: 'addEdge'; fromId: string; toId: string };
+
 export interface CaseMeasuredDTO {
   errorRate: number;
   p99Ms: number;
@@ -176,6 +192,8 @@ export interface StructuralFindingDTO {
   detail: string;
   componentIds: string[];
   exposedBy?: string;
+  /** Canned one-click fix (server-validated), when the rule implies one. */
+  actions?: EditOpDTO[];
 }
 
 export interface SchemaFindingDTO {
@@ -224,6 +242,8 @@ export interface AssessmentFindingDTO {
   title: string;
   detail: string;
   componentId?: string;
+  /** One-click fix actions (server-validated against the submitted design). */
+  actions?: EditOpDTO[];
 }
 
 export interface SubmissionAssessmentDTO {
@@ -313,6 +333,7 @@ export interface ProbeCaseDTO {
     primaryBreach: string;
     rationale: string;
     fixHint: string;
+    actions?: EditOpDTO[];
   };
 }
 
@@ -329,6 +350,25 @@ export interface ProbeContextDTO {
   nodes: { id: string; type: ComponentTypeId; name: string }[];
 }
 
+/**
+ * A concrete executable scenario in checker units — what the simulator
+ * ran for a probe, or a judged suite case's full scenario. Powers the
+ * local quick re-simulation (visual preview only, never a re-judge).
+ */
+export interface ExecutedScenarioDTO {
+  traffic: TrafficConfig;
+  durationTicks: number;
+  events: {
+    atTick: number;
+    type: EventType;
+    targetType?: ComponentTypeId;
+    magnitude?: number;
+    durationTicks?: number;
+  }[];
+  kills: { componentType: ComponentTypeId; atTick: number }[];
+  thresholds: CaseThresholdsDTO;
+}
+
 export interface VerifiedProbeDTO {
   name: string;
   scenarioSummary: string;
@@ -338,6 +378,8 @@ export interface VerifiedProbeDTO {
   failures: string[];
   actualBreach: string | null;
   verdict: 'hit' | 'held' | 'miss';
+  /** The scenario exactly as executed — for local quick re-simulation. */
+  scenario?: ExecutedScenarioDTO;
 }
 
 export interface EvaluateResponseDTO<T> {
@@ -438,10 +480,12 @@ export function judgeOnServer(body: {
 export function evaluateOnServer<T>(
   kind: 'submission' | 'followups',
   context: SubmissionAssessmentContextDTO | FollowUpContextDTO,
+  design?: Design,
 ): Promise<EvaluateResponseDTO<T>>;
 export function evaluateOnServer<T>(
   kind: 'probe',
   context: ProbeContextDTO,
+  design?: Design,
 ): Promise<EvaluateResponseDTO<T>>;
 export function evaluateOnServer<T>(
   kind: 'schema',
@@ -450,13 +494,21 @@ export function evaluateOnServer<T>(
 export function evaluateOnServer<T>(
   kind: 'submission' | 'schema' | 'followups' | 'probe',
   context: unknown,
+  design?: Design,
 ): Promise<EvaluateResponseDTO<T>> {
   // The user's model pick rides along as a bare profile id; the server
   // honors it only if the admin opened that profile to end users.
   const profileId = chosenEvalProfileId();
   return request<EvaluateResponseDTO<T>>('/api/evaluate', {
     method: 'POST',
-    body: JSON.stringify({ kind, context, ...(profileId ? { profileId } : {}) }),
+    body: JSON.stringify({
+      kind,
+      context,
+      ...(profileId ? { profileId } : {}),
+      // The design snapshot the assessment is about: the server uses it
+      // ONLY to validate fix actions before returning them as applicable.
+      ...(design ? { design } : {}),
+    }),
   });
 }
 
@@ -473,4 +525,20 @@ export function verifyProbesOnServer(body: {
     '/api/submissions/verify-probes',
     { method: 'POST', body: JSON.stringify(body) },
   );
+}
+
+/**
+ * One judged case's executable scenario, fetched on demand. Visible cases
+ * already carry theirs in the pack; hidden cases are served one at a time
+ * here — only for cases a submission has revealed — so the local quick
+ * re-simulation can run them.
+ */
+export function fetchCaseScenario(
+  problemId: string,
+  caseId: string,
+): Promise<{ problemId: string; caseId: string; scenario: ExecutedScenarioDTO }> {
+  return request('/api/submissions/case-scenario', {
+    method: 'POST',
+    body: JSON.stringify({ problemId, caseId }),
+  });
 }

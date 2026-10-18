@@ -2,6 +2,7 @@ import { useRef } from 'react';
 import { componentDef } from '@sds/components';
 import type { Design, MetricsSnapshot } from '@sds/sim-core';
 import { IconGlyph } from './icons';
+import type { PreviewMarks } from './edits';
 
 const NODE_W = 118;
 const NODE_H = 68;
@@ -21,6 +22,8 @@ interface CanvasProps {
   running: boolean;
   connectMode: boolean;
   connectFrom: string | null;
+  /** Fix-preview marks: nodes/edges the previewed edit would add or change. */
+  marks?: PreviewMarks | null;
   onNodePress: (id: string) => void;
   onMove: (id: string, x: number, y: number) => void;
   onBackgroundPress: () => void;
@@ -34,6 +37,7 @@ export function Canvas({
   running,
   connectMode,
   connectFrom,
+  marks,
   onNodePress,
   onMove,
   onBackgroundPress,
@@ -85,17 +89,22 @@ export function Canvas({
         const targetIn = snapshot?.nodes[edge.to]?.inQps ?? 0;
         const particles = running && targetIn > 20 ? 3 : running && targetIn > 2 ? 2 : 0;
         const dur = targetIn > 500 ? '0.8s' : targetIn > 100 ? '1.3s' : '2s';
+        const isNew = marks?.addedEdgeIds.has(edge.id) ?? false;
         return (
           <g key={edge.id}>
             <path
               id={`path-${edge.id}`}
               d={`M ${from.x} ${from.y} L ${to.x} ${to.y}`}
-              stroke="#475569"
-              strokeWidth={1.6}
+              stroke={isNew ? '#22c55e' : '#475569'}
+              strokeWidth={isNew ? 3 : 1.6}
               fill="none"
               markerEnd="url(#arrow)"
               opacity={0.75}
-            />
+            >
+              {isNew && (
+                <animate attributeName="opacity" values="1;0.35;1" dur="1.1s" repeatCount="indefinite" />
+              )}
+            </path>
             {Array.from({ length: particles }, (_, i) => (
               <circle key={i} r={3} fill={componentDef(to.type).color} opacity={0.9}>
                 <animateMotion dur={dur} begin={`${-i * 0.55}s`} repeatCount="indefinite">
@@ -157,6 +166,46 @@ export function Canvas({
               >
                 <title>{hl}</title>
               </rect>
+            )}
+            {marks?.addedNodeIds.has(node.id) && (
+              <g>
+                <rect
+                  x={-NODE_W / 2 - 7}
+                  y={-NODE_H / 2 - 7}
+                  width={NODE_W + 14}
+                  height={NODE_H + 14}
+                  rx={13}
+                  fill="rgba(34,197,94,0.10)"
+                  stroke="#22c55e"
+                  strokeWidth={3}
+                >
+                  <animate attributeName="opacity" values="1;0.4;1" dur="1.1s" repeatCount="indefinite" />
+                </rect>
+                <circle cx={NODE_W / 2 + 2} cy={-NODE_H / 2 - 2} r={10} fill="#16a34a" stroke="#052e16" strokeWidth={1}>
+                </circle>
+                <text x={NODE_W / 2 + 2} y={-NODE_H / 2 + 2.5} fill="#fff" fontSize={11} fontWeight={700} textAnchor="middle">
+                  新
+                </text>
+              </g>
+            )}
+            {marks?.modifiedNodeIds.has(node.id) && !marks?.addedNodeIds.has(node.id) && (
+              <g>
+                <rect
+                  x={-NODE_W / 2 - 5}
+                  y={-NODE_H / 2 - 5}
+                  width={NODE_W + 10}
+                  height={NODE_H + 10}
+                  rx={12}
+                  fill="none"
+                  stroke="#f59e0b"
+                  strokeWidth={2.6}
+                />
+                <circle cx={NODE_W / 2 + 2} cy={-NODE_H / 2 - 2} r={10} fill="#d97706" stroke="#451a03" strokeWidth={1}>
+                </circle>
+                <text x={NODE_W / 2 + 2} y={-NODE_H / 2 + 2.5} fill="#fff" fontSize={11} fontWeight={700} textAnchor="middle">
+                  改
+                </text>
+              </g>
             )}
             <rect
               x={-NODE_W / 2}

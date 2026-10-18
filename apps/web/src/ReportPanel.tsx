@@ -1,4 +1,5 @@
 import type {
+  EditOpDTO,
   ProblemCaseDTO,
   ProblemPack,
   StructuralFindingDTO,
@@ -26,15 +27,21 @@ export function scoreColor(scorePct: number): string {
 interface CaseListProps {
   problem: ProblemPack;
   suite: SuiteResultDTO | null;
-  replayingId: string | null;
-  onReplay: (tc: ProblemCaseDTO) => void;
-  onStopReplay: () => void;
+  /** Id of the scenario currently quick-simulating ('case:<caseId>'). */
+  quickSimId: string | null;
+  /** Scenario ids pinned to the scenario bar. */
+  pinnedIds: Set<string>;
+  onQuickSim: (tc: ProblemCaseDTO) => void;
+  onStopSim: () => void;
+  onPinToggle: (tc: ProblemCaseDTO) => void;
 }
 
 /**
  * The per-case rows: visible cases with thresholds up front; hidden edge
  * cases stay locked until a submission reveals them. Once judged, each row
- * shows measured-vs-threshold, failure explanations and a replay action.
+ * shows measured-vs-threshold, failure explanations, and the fix-loop
+ * actions: ▶ 快速模拟 (local visual re-run of this case's scenario on the
+ * current design — never a re-judge) and 📌 pinning to the scenario bar.
  */
 export function CaseList(props: CaseListProps) {
   const { problem, suite } = props;
@@ -54,6 +61,8 @@ export function CaseList(props: CaseListProps) {
             </div>
           );
         }
+        const simActive = props.quickSimId === `case:${tc.id}`;
+        const pinned = props.pinnedIds.has(`case:${tc.id}`);
         return (
           <div key={tc.id} className={`case-row ${r ? (r.passed ? 'case-pass' : 'case-fail') : ''}`}>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -67,15 +76,18 @@ export function CaseList(props: CaseListProps) {
               {tc.hidden && <span className="chip chip-hidden-tag">隐藏 · 已揭示</span>}
               <b>{r ? r.name : tc.name}</b>
               <span style={{ color: '#94a3b8', fontSize: 12.5 }}>{thresholdSummary(tc)}</span>
-              {r && !tc.locked && (
-                <button
-                  onClick={() =>
-                    props.replayingId === tc.id ? props.onStopReplay() : props.onReplay(tc)
-                  }
-                  style={{ marginLeft: 'auto' }}
-                >
-                  {props.replayingId === tc.id ? '⏹ 结束回放' : '🎬 回放这一例'}
-                </button>
+              {r && (
+                <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+                  <button onClick={() => (simActive ? props.onStopSim() : props.onQuickSim(tc))}>
+                    {simActive ? '⏹ 停止模拟' : '▶ 快速模拟'}
+                  </button>
+                  <button
+                    onClick={() => props.onPinToggle(tc)}
+                    title={pinned ? '已在快捷栏，点此取消固定' : '把这一例固定到画布上方的场景快捷栏'}
+                  >
+                    {pinned ? '📌 已固定' : '📌 固定到快捷栏'}
+                  </button>
+                </span>
               )}
             </div>
             {!tc.locked && (
@@ -113,6 +125,14 @@ interface ProbeSectionProps {
   results: VerifiedProbeDTO[] | null;
   /** Attribution of the proposer （云端 LLM / 本地脚本）. */
   sourceLabel: string;
+  /** Id of the scenario currently quick-simulating ('probe:<name>'). */
+  quickSimId: string | null;
+  pinnedIds: Set<string>;
+  onQuickSim: (r: VerifiedProbeDTO) => void;
+  onStopSim: () => void;
+  onPinToggle: (r: VerifiedProbeDTO) => void;
+  /** Enter the fix preview for a finding's validated actions. */
+  onApplyFix: (title: string, actions: EditOpDTO[]) => void;
 }
 
 const VERDICT_META: Record<VerifiedProbeDTO['verdict'], { text: string; cls: string }> = {
@@ -172,6 +192,36 @@ export function ProbeSection(props: ProbeSectionProps) {
                 {r.prediction.fixHint && (
                   <div style={{ fontSize: 12.5, marginTop: 3, color: '#facc15' }}>💡 {r.prediction.fixHint}</div>
                 )}
+                <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+                  {r.scenario && (
+                    <>
+                      <button
+                        onClick={() =>
+                          props.quickSimId === `probe:${r.name}`
+                            ? props.onStopSim()
+                            : props.onQuickSim(r)
+                        }
+                      >
+                        {props.quickSimId === `probe:${r.name}` ? '⏹ 停止模拟' : '▶ 快速模拟'}
+                      </button>
+                      <button
+                        onClick={() => props.onPinToggle(r)}
+                        title={
+                          props.pinnedIds.has(`probe:${r.name}`)
+                            ? '已在快捷栏，点此取消固定'
+                            : '把这一例固定到画布上方的场景快捷栏'
+                        }
+                      >
+                        {props.pinnedIds.has(`probe:${r.name}`) ? '📌 已固定' : '📌 固定到快捷栏'}
+                      </button>
+                    </>
+                  )}
+                  {r.prediction.actions && r.prediction.actions.length > 0 && (
+                    <button onClick={() => props.onApplyFix(r.name, r.prediction.actions!)}>
+                      ✨ 应用此改进
+                    </button>
+                  )}
+                </div>
               </div>
             );
           })}
@@ -184,6 +234,8 @@ export function ProbeSection(props: ProbeSectionProps) {
 interface StructuralListProps {
   structural: StructuralFindingDTO[];
   onSelectNode: (id: string) => void;
+  /** Enter the fix preview for a finding's canned actions (optional). */
+  onApplyFix?: (title: string, actions: EditOpDTO[]) => void;
 }
 
 /** Deterministic structural bug findings (no LLM involved). */
@@ -202,11 +254,18 @@ export function StructuralList(props: StructuralListProps) {
         <div key={i} className="finding-row">
           <span className={`chip chip-${f.severity}`}>{f.severity}</span> <b>{f.title}</b>
           <div style={{ color: '#cbd5e1', fontSize: 13, marginTop: 3 }}>{f.detail}</div>
-          {f.componentIds.length > 0 && (
-            <button onClick={() => props.onSelectNode(f.componentIds[0]!)} style={{ marginTop: 5 }}>
-              在画布上看这个组件 →
-            </button>
-          )}
+          <div style={{ display: 'flex', gap: 6, marginTop: 5, flexWrap: 'wrap' }}>
+            {f.componentIds.length > 0 && (
+              <button onClick={() => props.onSelectNode(f.componentIds[0]!)}>
+                在画布上看这个组件 →
+              </button>
+            )}
+            {props.onApplyFix && f.actions && f.actions.length > 0 && (
+              <button onClick={() => props.onApplyFix!(f.title, f.actions!)}>
+                ✨ 应用此改进
+              </button>
+            )}
+          </div>
         </div>
       ))}
     </div>
@@ -218,10 +277,12 @@ interface ReportPanelProps {
   phase: 'design' | 'run' | 'report';
   suite: SuiteResultDTO | null;
   structural: StructuralFindingDTO[];
-  replayingId: string | null;
+  quickSimId: string | null;
+  pinnedIds: Set<string>;
   onRunSuite: () => void;
-  onReplay: (tc: ProblemCaseDTO) => void;
-  onStopReplay: () => void;
+  onQuickSim: (tc: ProblemCaseDTO) => void;
+  onStopSim: () => void;
+  onPinToggle: (tc: ProblemCaseDTO) => void;
   onSelectNode: (id: string) => void;
 }
 
@@ -252,9 +313,11 @@ export function ReportPanel(props: ReportPanelProps) {
         <CaseList
           problem={problem}
           suite={suite}
-          replayingId={props.replayingId}
-          onReplay={props.onReplay}
-          onStopReplay={props.onStopReplay}
+          quickSimId={props.quickSimId}
+          pinnedIds={props.pinnedIds}
+          onQuickSim={props.onQuickSim}
+          onStopSim={props.onStopSim}
+          onPinToggle={props.onPinToggle}
         />
       </div>
 

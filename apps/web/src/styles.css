@@ -292,6 +292,55 @@ fieldset { margin: 0; padding: 10px; }
 
 .canvas-area { flex: 1 1 380px; min-height: 300px; }
 
+/* Scenario bar: quick local simulations + pinned case scenarios. */
+.scenario-bar {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 5px 10px; flex: 0 0 auto;
+}
+.scenario-label { font-size: 12px; font-weight: 700; color: var(--text); margin-right: 2px; }
+.scenario-note { font-size: 11.5px; color: var(--muted); margin-left: auto; }
+.scenario-bar button.scenario-active { background: #0369a1; border-color: #38bdf8; color: #fff; }
+.scenario-pin { display: inline-flex; gap: 0; align-items: stretch; }
+.scenario-pin > button:first-child { border-radius: 7px 0 0 7px; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scenario-unpin {
+  border-radius: 0 7px 7px 0; border-left: none; padding: 5px 7px; color: var(--muted);
+}
+
+/* Fix preview / undo / notice bars (fix loop). */
+.preview-bar {
+  border: 1px solid #16a34a; border-radius: 10px; background: #052e16;
+  padding: 9px 12px; flex: 0 0 auto;
+}
+.preview-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; font-size: 13.5px; }
+.preview-head span { color: #bbf7d0; font-size: 12.5px; }
+.preview-changes { margin: 6px 0 8px; padding-left: 18px; font-size: 13px; line-height: 1.65; color: #dcfce7; }
+.preview-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.preview-note { font-size: 12px; color: #86efac; }
+.undo-bar {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  border: 1px solid #a16207; border-radius: 10px; background: #422006;
+  padding: 6px 12px; font-size: 13px; flex: 0 0 auto;
+}
+.fix-notice {
+  display: flex; gap: 8px; align-items: center; justify-content: space-between;
+  border: 1px solid #1d4ed8; border-radius: 10px; background: #172554;
+  padding: 7px 12px; font-size: 13px; color: #dbeafe; flex: 0 0 auto;
+}
+
+/* Quick-sim live readout strip. */
+.sim-readout {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  border: 1px solid #0e7490; border-radius: 10px; background: #082f3a;
+  padding: 6px 12px; font-size: 12.5px; flex: 0 0 auto;
+}
+.sim-readout-title { font-weight: 600; color: #a5f3fc; }
+.sim-readout-item { color: var(--muted); }
+.sim-readout-item b { color: var(--text); }
+.sim-readout-item.ok b { color: #4ade80; }
+.sim-readout-item.over b { color: #f87171; }
+.sim-readout-close { margin-left: auto; padding: 2px 8px; }
+
 .metrics-strip { display: flex; gap: 6px; flex-wrap: wrap; align-items: stretch; flex: 0 0 auto; }
 .metric.compact { min-width: 88px; padding: 5px 10px; }
 .metric.compact b { font-size: 14px; }

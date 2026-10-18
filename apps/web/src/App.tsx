@@ -12,10 +12,12 @@ import {
 import {
   API_URL,
   evaluateOnServer,
+  fetchCaseScenario,
   fetchHealth,
   fetchProblems,
   judgeOnServer,
   verifyProbesOnServer,
+  type EditOpDTO,
   type FollowUpContextDTO,
   type FollowUpQuestionDTO,
   type HealthDTO,
@@ -30,6 +32,17 @@ import {
   type SuiteResultDTO,
   type VerifiedProbeDTO,
 } from './api';
+import { applyActions, recheckActions, type PreviewPlan } from './edits';
+import {
+  MAX_PINS_PER_PROBLEM,
+  builtinScenarios,
+  loadPins,
+  savePins,
+  scenarioFromCase,
+  scenarioFromExecuted,
+  scenarioFromProbe,
+  type QuickScenario,
+} from './scenarios';
 import { Canvas } from './Canvas';
 import { DeepDive } from './DeepDive';
 import { SettingsPanel } from './SettingsPanel';
@@ -77,6 +90,38 @@ const RIGHT_VIEWS: { id: RightView; label: string }[] = [
   { id: 'arch', label: '架构设计' },
   { id: 'schema', label: '数据库设计' },
 ];
+
+/** Live measured-vs-threshold rows for the quick-sim readout strip. */
+function readoutRows(
+  sc: QuickScenario,
+  snap: MetricsSnapshot,
+  queueDepthMax: number,
+): { label: string; text: string; ok?: boolean }[] {
+  const t = sc.thresholds;
+  const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
+  const rows: { label: string; text: string; ok?: boolean }[] = [];
+  const add = (
+    label: string,
+    value: number,
+    limit: number | undefined,
+    fmt: (x: number) => string,
+    lowerIsBetter = true,
+  ) => {
+    rows.push({
+      label,
+      text: limit !== undefined ? `${fmt(value)} / 阈值 ${fmt(limit)}` : fmt(value),
+      ok: limit !== undefined ? (lowerIsBetter ? value <= limit : value >= limit) : undefined,
+    });
+  };
+  add('错误率', snap.errorRate, t?.maxErrorRate, pct);
+  add('P99', snap.p99Ms, t?.maxP99Ms, (x) => `${Math.round(x)}ms`);
+  add('成本', snap.costPerHour, t?.maxCostPerHour, (x) => `$${x.toFixed(0)}/h`);
+  add('存储入站', snap.maxStorageQps, t?.maxStorageQps, (x) => `${Math.round(x)} QPS`);
+  add('读旧', snap.staleReadRate, t?.maxStaleReadRate, pct);
+  add('最热利用率', snap.hottestUtil, t?.maxHottestUtil, pct);
+  add('队列积压', queueDepthMax, t?.maxQueueDepth, (x) => `${Math.round(x).toLocaleString()} 条`);
+  return rows;
+}
 
 // ------------------------------------------- shared summary builders -----
 // One design snapshot, several consumers: the submission assessment and the
@@ -151,7 +196,6 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   );
   const [structural, setStructural] = useState<StructuralFindingDTO[]>([]);
   const [judgeError, setJudgeError] = useState<string | null>(null);
-  const [replayingId, setReplayingId] = useState<string | null>(null);
   const [queueHistory, setQueueHistory] = useState<number[]>([]);
   const [activeTab, setActiveTab] = useState<LeftTab>('desc');
   const [rightView, setRightView] = useState<RightView>('arch');
@@ -182,6 +226,30 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   const [probeNote, setProbeNote] = useState<string | null>(null);
   const [probeLabel, setProbeLabel] = useState('');
 
+  // ---------------------------------------------------------- fix loop ---
+  // Findings may carry server-validated fix actions. Applying one is a
+  // three-step dance: preview (pure computation — the committed design is
+  // NOT touched, the canvas shows the would-be design with every change
+  // highlighted) → confirm (commit + one-step undo) or abandon (Esc).
+  const [preview, setPreview] = useState<{ title: string; plan: PreviewPlan } | null>(null);
+  const [undoFix, setUndoFix] = useState<{ design: Design; title: string } | null>(null);
+  const [fixNotice, setFixNotice] = useState<string | null>(null);
+
+  // ------------------------------------------------------ quick scenarios -
+  // The scenario bar: built-in presets + scenarios pinned from judged
+  // case rows / verified probe cards. A quick run is a LOCAL visual
+  // preview on the current design (animated flow + live readout against
+  // the case's thresholds) — it never re-judges and never changes the
+  // score; only a fresh submission does.
+  const [activeSim, setActiveSim] = useState<QuickScenario | null>(null);
+  const [simReadout, setSimReadout] = useState<{
+    sc: QuickScenario;
+    snap: MetricsSnapshot;
+    queueDepthMax: number;
+    done: boolean;
+  } | null>(null);
+  const [pins, setPins] = useState<Record<string, QuickScenario[]>>(loadPins);
+
   const engineRef = useRef<SimulationEngine | null>(null);
   if (!engineRef.current) {
     engineRef.current = new SimulationEngine(structuredClone(problem.sampleDesign), {
@@ -196,12 +264,13 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   problemRef.current = problem;
   const schemasRef = useRef(schemas);
   schemasRef.current = schemas;
-  const replayRef = useRef<{
-    tc: ProblemCaseDTO;
+  const simRef = useRef<{
+    sc: QuickScenario;
     tick: number;
-    events: NonNullable<ProblemCaseDTO['events']>;
-    kills: NonNullable<ProblemCaseDTO['kills']>;
+    events: QuickScenario['events'];
+    kills: QuickScenario['kills'];
   } | null>(null);
+  const queueMaxRef = useRef(0);
   const structuralSeq = useRef(0);
 
   const selectedNode = design.nodes.find((n) => n.id === selectedId) ?? null;
@@ -225,6 +294,20 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     }
   }, [submissions]);
 
+  useEffect(() => {
+    savePins(pins);
+  }, [pins]);
+
+  // Esc abandons a fix preview without touching the design.
+  useEffect(() => {
+    if (!preview) return;
+    const h = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPreview(null);
+    };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [preview]);
+
   // Structural findings are computed by the backend, not here. While
   // designing, refresh them (debounced) through the judge endpoint and
   // consume only its structural slice; a real submission re-judges
@@ -247,11 +330,11 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   useEffect(() => {
     if (!running) return;
     const iv = window.setInterval(() => {
-      const replay = replayRef.current;
-      if (replay) {
-        replay.tick += 1;
-        while (replay.events.length && replay.events[0]!.atTick <= replay.tick) {
-          const ev = replay.events.shift()!;
+      const sim = simRef.current;
+      if (sim) {
+        sim.tick += 1;
+        while (sim.events.length && sim.events[0]!.atTick <= sim.tick) {
+          const ev = sim.events.shift()!;
           engine.injectEvent({
             type: ev.type,
             targetType: ev.targetType,
@@ -259,16 +342,22 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
             durationTicks: ev.durationTicks,
           });
         }
-        while (replay.kills.length && replay.kills[0]!.atTick <= replay.tick) {
-          engine.killByType(replay.kills.shift()!.componentType);
-        }
-        if (replay.tick >= replay.tc.durationTicks) {
-          stopReplay();
-          return;
+        while (sim.kills.length && sim.kills[0]!.atTick <= sim.tick) {
+          engine.killByType(sim.kills.shift()!.componentType);
         }
       }
       const snap = engine.step(1);
       setSnapshot(snap);
+      if (sim) {
+        const q = Math.max(
+          queueMaxRef.current,
+          ...Object.values(snap.nodes).map((m) => m.queueDepth ?? 0),
+        );
+        queueMaxRef.current = q;
+        const done = sim.tick >= sim.sc.durationTicks;
+        setSimReadout({ sc: sim.sc, snap, queueDepthMax: q, done });
+        if (done) finishQuickSim();
+      }
       setQueueHistory((h) => {
         const sel = designRef.current.nodes.find((n) => n.id === selectedId);
         const q =
@@ -310,8 +399,12 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setFollowUps(null);
     setHighlights(new Map());
     setSelectedId(null);
-    setReplayingId(null);
-    replayRef.current = null;
+    setActiveSim(null);
+    setSimReadout(null);
+    setPreview(null);
+    setUndoFix(null);
+    setFixNotice(null);
+    simRef.current = null;
     engineRef.current = new SimulationEngine(structuredClone(p.sampleDesign), {
       rps: p.scale.baselineRps,
       readRatio: p.scale.readRatio,
@@ -325,7 +418,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   };
 
   const addComponent = (type: ComponentTypeId) => {
-    if (locked) return;
+    if (locked || preview) return;
     const count = design.nodes.length;
     const node = {
       id: newId(type),
@@ -347,6 +440,8 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   };
 
   const onNodePress = (id: string) => {
+    // While a fix preview is up, canvas interaction is paused entirely.
+    if (preview) return;
     if (connectMode && !locked) {
       if (!connectFrom) {
         setConnectFrom(id);
@@ -366,6 +461,8 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   };
 
   const submitDesign = () => {
+    simRef.current = null;
+    setActiveSim(null);
     setPhase('run');
     setRunning(true);
     engine.reviveAll();
@@ -385,8 +482,11 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setProbeNote(null);
     setProbeLabel('');
     setHighlights(new Map());
-    setReplayingId(null);
-    replayRef.current = null;
+    setActiveSim(null);
+    setSimReadout(null);
+    setPreview(null);
+    setUndoFix(null);
+    simRef.current = null;
     engine.reviveAll();
     engine.clearEvents();
   };
@@ -456,21 +556,25 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setProbeBusy(true);
     let verified: VerifiedProbeDTO[] = [];
     try {
-      const pr = await evaluateOnServer<ProbeCaseDTO[]>('probe', {
-        problemName: p.name,
-        designSummary: buildDesignSummary(designRef.current),
-        schemaSummary: schemaSummaryOf(schemasRef.current[p.id]!),
-        workloadSummary: workloadSummaryOf(p),
-        structuralFindings,
-        baselineRps: p.scale.baselineRps,
-        readRatio: p.scale.readRatio,
-        budgetCostPerHour: p.scale.budgetCostPerHour,
-        nodes: designRef.current.nodes.map((n) => ({
-          id: n.id,
-          type: n.type,
-          name: componentDef(n.type).name,
-        })),
-      });
+      const pr = await evaluateOnServer<ProbeCaseDTO[]>(
+        'probe',
+        {
+          problemName: p.name,
+          designSummary: buildDesignSummary(designRef.current),
+          schemaSummary: schemaSummaryOf(schemasRef.current[p.id]!),
+          workloadSummary: workloadSummaryOf(p),
+          structuralFindings,
+          baselineRps: p.scale.baselineRps,
+          readRatio: p.scale.readRatio,
+          budgetCostPerHour: p.scale.budgetCostPerHour,
+          nodes: designRef.current.nodes.map((n) => ({
+            id: n.id,
+            type: n.type,
+            name: componentDef(n.type).name,
+          })),
+        },
+        designRef.current,
+      );
       setProbeLabel(pr.label);
       if (pr.data.length > 0) {
         const vr = await verifyProbesOnServer({
@@ -504,19 +608,23 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setAssessmentError(null);
     try {
       const probes = probeOverride ?? probeResults ?? [];
-      const r = await evaluateOnServer<SubmissionAssessmentDTO>('submission', {
-        problemName: problemRef.current.name,
-        designSummary: buildDesignSummary(designRef.current),
-        workloadSummary: workloadSummaryOf(problemRef.current),
-        scorePct: s.scorePct,
-        passed: s.passedCount,
-        total: s.totalCount,
-        // With verified probes, the static per-case results are NOT sent:
-        // the review grounds on the probe verification instead.
-        cases: probes.length ? [] : s.results,
-        structuralFindings: structuralOverride ?? structural,
-        ...(probes.length ? { probeResults: probes } : {}),
-      });
+      const r = await evaluateOnServer<SubmissionAssessmentDTO>(
+        'submission',
+        {
+          problemName: problemRef.current.name,
+          designSummary: buildDesignSummary(designRef.current),
+          workloadSummary: workloadSummaryOf(problemRef.current),
+          scorePct: s.scorePct,
+          passed: s.passedCount,
+          total: s.totalCount,
+          // With verified probes, the static per-case results are NOT sent:
+          // the review grounds on the probe verification instead.
+          cases: probes.length ? [] : s.results,
+          structuralFindings: structuralOverride ?? structural,
+          ...(probes.length ? { probeResults: probes } : {}),
+        },
+        designRef.current,
+      );
       setAssessorLabel(r.label);
       setAssessment(r.data);
     } catch {
@@ -532,6 +640,8 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
 
   /** LeetCode's green Submit: lock the design, judge everything, show results. */
   const onSubmit = () => {
+    if (preview) return; // a preview must be confirmed or abandoned first
+    setUndoFix(null);
     if (phase === 'design') submitDesign();
     void runSuiteNow();
     setBottomOpen(true);
@@ -539,6 +649,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
 
   /** LeetCode's Run: start the live simulation (or pause/resume it). */
   const onRun = () => {
+    if (preview) return;
     if (phase === 'design') {
       submitDesign();
     } else {
@@ -546,29 +657,148 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     }
   };
 
-  const startReplay = (tc: ProblemCaseDTO) => {
-    // Hidden cases arrive stripped (locked): their scenario data never left
-    // the server, so there is nothing local to replay.
-    if (tc.locked) return;
+  // ------------------------------------------------------- quick sim ---
+  /** Start a quick scenario on the CURRENT design: local visual preview. */
+  const startQuickSim = (sc: QuickScenario) => {
+    setPreview(null);
     engine.reviveAll();
     engine.clearEvents();
-    engine.setTraffic(tc.traffic);
-    replayRef.current = {
-      tc,
+    engine.setTraffic(sc.traffic);
+    simRef.current = {
+      sc,
       tick: 0,
-      events: [...(tc.events ?? [])].sort((a, b) => a.atTick - b.atTick),
-      kills: [...(tc.kills ?? [])].sort((a, b) => a.atTick - b.atTick),
+      events: [...sc.events].sort((a, b) => a.atTick - b.atTick),
+      kills: [...sc.kills].sort((a, b) => a.atTick - b.atTick),
     };
-    setReplayingId(tc.id);
+    queueMaxRef.current = 0;
+    setActiveSim(sc);
+    setSimReadout(null);
+    if (phase === 'design') setPhase('run');
     setRunning(true);
   };
 
-  const stopReplay = () => {
-    replayRef.current = null;
-    setReplayingId(null);
+  /** Wind a quick sim down: restore the user's traffic, revive everything. */
+  const finishQuickSim = () => {
+    simRef.current = null;
+    setActiveSim(null);
     engine.reviveAll();
     engine.clearEvents();
     engine.setTraffic(traffic);
+  };
+
+  const stopQuickSim = () => {
+    finishQuickSim();
+    setSimReadout((r) => (r ? { ...r, done: true } : r));
+  };
+
+  /** The scenario behind a judged case row (hidden ones fetched on demand). */
+  const scenarioForCase = async (tc: ProblemCaseDTO): Promise<QuickScenario> => {
+    if (!tc.locked) return scenarioFromCase(tc);
+    const name = suite?.results.find((r) => r.caseId === tc.id)?.name ?? tc.name;
+    const { scenario } = await fetchCaseScenario(problemRef.current.id, tc.id);
+    return scenarioFromExecuted(`case:${tc.id}`, name, '🧪', scenario);
+  };
+
+  const quickSimCase = async (tc: ProblemCaseDTO) => {
+    try {
+      startQuickSim(await scenarioForCase(tc));
+    } catch {
+      setFixNotice('快速模拟启动失败：后端未返回该用例的场景数据，请确认后端在运行。');
+    }
+  };
+
+  const quickSimProbe = (r: VerifiedProbeDTO) => {
+    const sc = scenarioFromProbe(r);
+    if (sc) startQuickSim(sc);
+  };
+
+  // ------------------------------------------------------------- pins ----
+  const pinnedList = pins[problemId] ?? [];
+  const pinnedIds = new Set(pinnedList.map((p) => p.id));
+
+  const togglePin = (sc: QuickScenario) => {
+    setPins((prev) => {
+      const list = prev[problemId] ?? [];
+      const exists = list.some((p) => p.id === sc.id);
+      const next = exists
+        ? list.filter((p) => p.id !== sc.id)
+        : [...list, sc].slice(-MAX_PINS_PER_PROBLEM);
+      return { ...prev, [problemId]: next };
+    });
+  };
+
+  const pinCase = async (tc: ProblemCaseDTO) => {
+    if (pinnedIds.has(`case:${tc.id}`)) {
+      togglePin(scenarioFromCase(tc)); // id is what matters for unpinning
+      return;
+    }
+    try {
+      togglePin(await scenarioForCase(tc));
+    } catch {
+      setFixNotice('固定失败：后端未返回该用例的场景数据。');
+    }
+  };
+
+  const pinProbe = (r: VerifiedProbeDTO) => {
+    const sc = scenarioFromProbe(r);
+    if (sc) togglePin(sc);
+  };
+
+  // ---------------------------------------------------------- fix loop ---
+  /**
+   * Enter preview mode for one finding's actions. The actions were
+   * validated server-side against the design snapshot they were generated
+   * for; re-check them against the CURRENT design first — if the user has
+   * since deleted a referenced node, refuse gracefully instead of
+   * applying a stale fix.
+   */
+  const enterPreview = (title: string, actions: EditOpDTO[]) => {
+    const valid = recheckActions(actions, designRef.current);
+    if (!valid.length) {
+      setFixNotice('这条改进引用的组件在当前设计里已不存在（设计已被改动），无法应用。');
+      return;
+    }
+    stopQuickSim();
+    setFixNotice(null);
+    setPreview({ title, plan: applyActions(designRef.current, valid) });
+    setSelectedId(null);
+    setConnectMode(false);
+    setConnectFrom(null);
+    setRightView('arch');
+  };
+
+  const cancelPreview = () => setPreview(null);
+
+  /**
+   * Commit the previewed design. The score does NOT move: suite results
+   * on screen stay the last submission's until a re-submit re-judges.
+   * Applying from the report phase returns to the design phase with the
+   * results kept visible (now labelled stale by the notice).
+   */
+  const confirmApply = () => {
+    if (!preview) return;
+    setUndoFix({ design: designRef.current, title: preview.title });
+    setDesign(preview.plan.design);
+    setPreview(null);
+    if (phase !== 'design') {
+      setPhase('design');
+      setRunning(false);
+      setSnapshot(null);
+      setActiveSim(null);
+      simRef.current = null;
+      engine.reviveAll();
+      engine.clearEvents();
+    }
+    setFixNotice(
+      `已应用改进「${preview.title}」。分数不会自动变化——当前成绩仍是上次提交的结果，重新提交后才重新判卷；想先看效果，点上方场景快捷栏试跑。`,
+    );
+  };
+
+  const undoApply = () => {
+    if (!undoFix) return;
+    setDesign(undoFix.design);
+    setUndoFix(null);
+    setFixNotice('已撤销刚才应用的改进，设计已恢复。');
   };
 
   const injectLive = (type: 'viral_post' | 'cache_stampede' | 'hot_key' | 'rw_flip') => {
@@ -678,6 +908,33 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
 
   // -------------------------------------------------------------- render ---
   const categories = ['流量入口', '计算', '存储', '异步'] as const;
+  // The built-in node-failure scenario kills the busiest node type: by
+  // live utilization when the sim has run, else the first app-tier node.
+  const busiestType: ComponentTypeId = (() => {
+    if (snapshot) {
+      let best: ComponentTypeId | undefined;
+      let bestUtil = -1;
+      for (const n of design.nodes) {
+        if (n.type === 'client') continue;
+        const u = snapshot.nodes[n.id]?.util ?? 0;
+        if (u > bestUtil) {
+          bestUtil = u;
+          best = n.type;
+        }
+      }
+      if (best) return best;
+    }
+    return (
+      design.nodes.find((n) => ['appserver', 'feedservice', 'searchservice'].includes(n.type))
+        ?.type ??
+      design.nodes.find((n) => n.type !== 'client')?.type ??
+      'appserver'
+    );
+  })();
+  const builtins = builtinScenarios(problem, busiestType);
+  // During a fix preview the canvas renders the WOULD-BE design; the
+  // committed design state (and the engine) stay untouched until confirm.
+  const displayDesign = preview ? preview.plan.design : design;
   const stepIndex = phase === 'design' ? 0 : phase === 'run' ? 1 : 2;
   const nextHint =
     phase === 'design'
@@ -726,10 +983,10 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
               ↩ 返回设计
             </button>
           )}
-          <button className="lc-run-btn" onClick={onRun}>
+          <button className="lc-run-btn" onClick={onRun} disabled={!!preview} title={preview ? '先确认或放弃改进预览' : undefined}>
             {phase !== 'design' && running ? '⏸ 暂停' : '▶ 运行'}
           </button>
-          <button className="lc-submit-btn" onClick={onSubmit}>
+          <button className="lc-submit-btn" onClick={onSubmit} disabled={!!preview} title={preview ? '先确认或放弃改进预览' : undefined}>
             提交设计
           </button>
           <button className="lc-gear-btn" onClick={() => setSettingsOpen(true)} title="设置（后端连接状态）">
@@ -814,12 +1071,18 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                 <CaseList
                   problem={problem}
                   suite={suite}
-                  replayingId={replayingId}
-                  onReplay={startReplay}
-                  onStopReplay={stopReplay}
+                  quickSimId={activeSim?.id ?? null}
+                  pinnedIds={pinnedIds}
+                  onQuickSim={(tc) => void quickSimCase(tc)}
+                  onStopSim={stopQuickSim}
+                  onPinToggle={(tc) => void pinCase(tc)}
                 />
                 <h4 style={{ margin: '18px 0 8px' }}>🧱 结构检查（确定性规则，不依赖 LLM）</h4>
-                <StructuralList structural={structural} onSelectNode={(id) => setSelectedId(id)} />
+                <StructuralList
+                  structural={structural}
+                  onSelectNode={(id) => setSelectedId(id)}
+                  onApplyFix={enterPreview}
+                />
               </div>
             )}
 
@@ -881,7 +1144,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                     key={c.type}
                     className="palette-chip"
                     onClick={() => addComponent(c.type)}
-                    disabled={locked}
+                    disabled={locked || !!preview}
                     title={c.blurb}
                   >
                     <svg width="20" height="20" viewBox="0 0 48 48" style={{ color: c.color }}>
@@ -899,33 +1162,121 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                   setConnectMode(!connectMode);
                   setConnectFrom(null);
                 }}
-                disabled={locked}
+                disabled={locked || !!preview}
                 title="连线模式：点起点再点终点"
               >
                 {connectMode ? '连线中…' : '🔗 连线'}
               </button>
-              <button onClick={() => setDesign(structuredClone(problem.sampleDesign))} disabled={locked}>
+              <button onClick={() => setDesign(structuredClone(problem.sampleDesign))} disabled={locked || !!preview}>
                 示例
               </button>
-              <button onClick={() => setDesign({ nodes: [], edges: [] })} disabled={locked}>
+              <button onClick={() => setDesign({ nodes: [], edges: [] })} disabled={locked || !!preview}>
                 清空
               </button>
             </div>
           </div>
 
+          {/* scenario bar: one-click quick simulations on the current
+              design — built-in presets + scenarios pinned from judged
+              case rows / verified probe cards. Local preview only. */}
+          <div className="scenario-bar">
+            <span className="scenario-label">⚡ 场景快捷</span>
+            {builtins.map((sc) => (
+              <button
+                key={sc.id}
+                className={activeSim?.id === sc.id ? 'scenario-active' : ''}
+                onClick={() => (activeSim?.id === sc.id ? stopQuickSim() : startQuickSim(sc))}
+                title="在当前设计上本地试跑这个场景（只看现象，不判卷）"
+              >
+                {sc.icon} {sc.label}
+              </button>
+            ))}
+            {pinnedList.map((sc) => (
+              <span key={sc.id} className="scenario-pin">
+                <button
+                  className={activeSim?.id === sc.id ? 'scenario-active' : ''}
+                  onClick={() => (activeSim?.id === sc.id ? stopQuickSim() : startQuickSim(sc))}
+                  title="已固定的用例场景：在当前设计上本地试跑（只看现象，不判卷）"
+                >
+                  📌 {sc.label}
+                </button>
+                <button className="scenario-unpin" onClick={() => togglePin(sc)} title="取消固定">
+                  ✕
+                </button>
+              </span>
+            ))}
+            {activeSim && <button onClick={stopQuickSim}>⏹ 停止</button>}
+            <span className="scenario-note">本地预览 · 不判卷不改分</span>
+          </div>
+
+          {/* one-step undo for the last applied fix */}
+          {undoFix && !preview && (
+            <div className="undo-bar">
+              <span>已应用改进「{undoFix.title}」</span>
+              <button onClick={undoApply}>↩ 撤销</button>
+              <button onClick={() => setUndoFix(null)}>忽略</button>
+            </div>
+          )}
+
+          {/* fix preview: what will change, highlighted on the canvas */}
+          {preview && (
+            <div className="preview-bar">
+              <div className="preview-head">
+                <b>👀 改进预览：{preview.title}</b>
+                <span>尚未应用——画布上发光的是新增、带「改」徽章的是参数变更，确认后才真正生效。</span>
+              </div>
+              <ul className="preview-changes">
+                {preview.plan.descriptions.map((d, i) => (
+                  <li key={i}>{d}</li>
+                ))}
+              </ul>
+              <div className="preview-actions">
+                <button className="primary" onClick={confirmApply}>
+                  ✔ 确认应用
+                </button>
+                <button onClick={cancelPreview}>放弃（Esc）</button>
+                <span className="preview-note">
+                  应用不改分：成绩仍是上次提交的结果，重新提交后才重新判卷。
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* quick-sim live readout: measured vs the case's thresholds */}
+          {simReadout && (
+            <div className="sim-readout">
+              <span className="sim-readout-title">
+                {simReadout.sc.icon} {simReadout.sc.label} · 本地快速模拟
+                {simReadout.done ? '（已结束）' : '进行中'} — 只看现象，不判卷不改分
+              </span>
+              {readoutRows(simReadout.sc, simReadout.snap, simReadout.queueDepthMax).map((r) => (
+                <span
+                  key={r.label}
+                  className={`sim-readout-item ${r.ok === undefined ? '' : r.ok ? 'ok' : 'over'}`}
+                >
+                  {r.label} <b>{r.text}</b>
+                </span>
+              ))}
+              <button className="sim-readout-close" onClick={() => setSimReadout(null)} title="关闭读数">
+                ✕
+              </button>
+            </div>
+          )}
+
           {/* canvas: the dominant area */}
           <div className="canvas-area">
             <Canvas
-              design={design}
+              design={displayDesign}
               snapshot={snapshot}
               selectedId={selectedId}
               highlighted={highlights}
               running={running && phase !== 'design'}
               connectMode={connectMode}
               connectFrom={connectFrom}
+              marks={preview?.plan.marks ?? null}
               onNodePress={onNodePress}
               onMove={(id, x, y) => {
-                if (locked) return;
+                if (locked || preview) return;
                 setDesign({
                   ...design,
                   nodes: design.nodes.map((n) => (n.id === id ? { ...n, x, y } : n)),
@@ -959,10 +1310,10 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                 <b>{snapshot.activeEvents.map((e) => e.type).join(' · ')}</b>
               </div>
             )}
-            {replayingId && (
+            {activeSim && (
               <div className="metric compact event-metric">
-                <span>回放中</span>
-                <b>{problem.testCases.find((c) => c.id === replayingId)?.name}</b>
+                <span>快速模拟中</span>
+                <b>{activeSim.icon} {activeSim.label}</b>
               </div>
             )}
             <span className="metrics-hint">
@@ -1057,6 +1408,16 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
             />
           </div>
 
+          {/* fix-loop notice (applied / refused / undone) */}
+          {fixNotice && (
+            <div className="fix-notice">
+              <span>ℹ️ {fixNotice}</span>
+              <button onClick={() => setFixNotice(null)} title="关闭">
+                ✕
+              </button>
+            </div>
+          )}
+
           {/* ------------------------- bottom results panel (collapsible) --- */}
           <div className="lc-bottom panel">
             <button className="lc-bottom-head" onClick={() => setBottomOpen(!bottomOpen)}>
@@ -1099,9 +1460,11 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                     <CaseList
                       problem={problem}
                       suite={suite}
-                      replayingId={replayingId}
-                      onReplay={startReplay}
-                      onStopReplay={stopReplay}
+                      quickSimId={activeSim?.id ?? null}
+                      pinnedIds={pinnedIds}
+                      onQuickSim={(tc) => void quickSimCase(tc)}
+                      onStopSim={stopQuickSim}
+                      onPinToggle={(tc) => void pinCase(tc)}
                     />
                     {/* Probe step: LLM-proposed cases, simulator-verified. */}
                     <ProbeSection
@@ -1109,6 +1472,12 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                       note={probeNote}
                       results={probeResults}
                       sourceLabel={probeLabel}
+                      quickSimId={activeSim?.id ?? null}
+                      pinnedIds={pinnedIds}
+                      onQuickSim={quickSimProbe}
+                      onStopSim={stopQuickSim}
+                      onPinToggle={pinProbe}
+                      onApplyFix={enterPreview}
                     />
                     {/* Qualitative review — backend evaluate call only. */}
                     <div style={{ marginTop: 14, border: '1px solid #1e293b', borderRadius: 8, padding: '10px 12px', background: '#0b1220' }}>
@@ -1155,6 +1524,14 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                                     {f.title}
                                   </b>
                                   <span style={{ color: '#cbd5e1' }}> — {f.detail}</span>
+                                  {f.actions && f.actions.length > 0 && (
+                                    <button
+                                      style={{ marginLeft: 8 }}
+                                      onClick={() => enterPreview(f.title, f.actions!)}
+                                    >
+                                      ✨ 应用此改进
+                                    </button>
+                                  )}
                                 </li>
                               ))}
                             </ul>
@@ -1163,7 +1540,11 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                       )}
                     </div>
                     <h4 style={{ margin: '16px 0 8px' }}>🧱 结构检查（确定性规则，不依赖 LLM）</h4>
-                    <StructuralList structural={structural} onSelectNode={(id) => setSelectedId(id)} />
+                    <StructuralList
+                      structural={structural}
+                      onSelectNode={(id) => setSelectedId(id)}
+                      onApplyFix={enterPreview}
+                    />
                   </>
                 ) : (
                   <div className="lc-bottom-hint">
