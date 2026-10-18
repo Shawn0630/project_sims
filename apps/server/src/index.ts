@@ -58,10 +58,15 @@ import { registerGenerationRoutes } from './generate';
  *   POST /api/schema/simulate     run the problem's requirement workload
  *                                 against a candidate schema (the schema
  *                                 simulator: paths, measured latencies,
- *                                 shard load, ×10 growth) — display-grade
- *                                 evidence, NOT part of submission scoring
+ *                                 shard load, ×10 growth, real query text)
+ *                                 — design-time display; submission-time
+ *                                 schema judging lives in the judge route
  *   POST /api/submissions/verify-probes
  *                                 run LLM-proposed probe cases through the
+ *                                 simulator and grade their predictions
+ *   POST /api/submissions/verify-schema-probes
+ *                                 the database mirror: re-run LLM-proposed
+ *                                 data scenarios through the schema
  *                                 simulator and grade their predictions
  *   POST /api/submissions/case-scenario
  *                                 the executable scenario of ONE judged case
@@ -70,7 +75,10 @@ import { registerGenerationRoutes } from './generate';
  *   POST /api/evaluate            ONE LLM call (or scripted fallback) →
  *                                 structured assessment / follow-ups / probes /
  *                                 next-steps (one pinned action per failed
- *                                 case, ladder-guaranteed like the rest).
+ *                                 case, ladder-guaranteed like the rest) /
+ *                                 schema-probe (adversarial data scenarios
+ *                                 for the schema) / schema-next-steps (one
+ *                                 pinned action per failed schema anchor).
  *                                 Optional body.profileId: an end user's pick
  *                                 among admin-opened (userSelectable) model
  *                                 profiles — honored for that call only
@@ -212,9 +220,9 @@ app.post('/api/submissions/judge', async (c) => {
 // access patterns at their declared rates) against the candidate schema
 // and report measured paths / latencies / rows examined / shard load at
 // current scale and at ×10 data growth. One code path (@sds/checker
-// simulateSchema) serves the design-time panel and the submit-time
-// review evidence alike. Design-time instrument only — submission
-// scoring does not consume it.
+// simulateSchema) serves the design-time panel, the submit-time review
+// evidence, the schema test-case judging (judge route) and the schema
+// probe verification alike — a single arbiter for every DB-side number.
 function isSchema(v: unknown): v is ProblemSchema {
   const s = v as ProblemSchema | null;
   return !!s && Array.isArray(s.tables);
