@@ -1,6 +1,15 @@
+import type { ComponentTypeId } from '@sds/components';
 import type { EditOp } from '@sds/driver';
 import type { ProblemDef, TestCase } from '@sds/problems';
 import { SimulationEngine, type Design, type MetricsSnapshot } from '@sds/sim-core';
+
+/** The single hottest node of a run, as measured (not inferred). */
+export interface HottestNode {
+  nodeId: string;
+  type: ComponentTypeId;
+  /** Peak utilization over the measured window, 0..>1. */
+  util: number;
+}
 
 export interface CaseMeasured {
   errorRate: number;
@@ -10,14 +19,23 @@ export interface CaseMeasured {
   staleReadRate: number;
   hottestUtil: number;
   queueDepthMax: number;
+  /**
+   * Which node was the hottest, and how hot it peaked — the measured
+   * bottleneck, so fix synthesis (caseFixes.ts) can size a capacity fix
+   * from evidence instead of guessing. Null when no node registered any
+   * load (e.g. everything was killed before sampling).
+   */
+  hottestNode: HottestNode | null;
 }
 
 /**
- * A one-click improvement attached to a FAILED case: a structural finding
- * that plausibly explains the failure, with its fix expressed as
- * already-validated edit ops (see caseFixes.ts for the linking rules and
- * edits.ts for validation). `findingId` is `<ruleId>#<index>` — the
- * finding's position in the same judge response's structural array.
+ * A one-click improvement attached to a FAILED case: either a structural
+ * finding that plausibly explains the failure (`findingId` is
+ * `<ruleId>#<index>` — the finding's position in the same judge response's
+ * structural array), or the synthesized bottleneck-capacity fix
+ * (`findingId` is `capacity#<nodeId>`, sized from the measured hottest
+ * node — see caseFixes.ts). Actions are already-validated edit ops in
+ * both cases (edits.ts).
  */
 export interface CaseFix {
   findingId: string;
@@ -87,6 +105,22 @@ export function runTestCase(problem: ProblemDef, design: Design, tc: TestCase): 
 
   const avg = (pick: (s: MetricsSnapshot) => number) =>
     samples.length ? samples.reduce((a, s) => a + pick(s), 0) / samples.length : 0;
+  // Per-node PEAK utilization over the same measured window: the argmax
+  // node's peak equals hottestUtil below (max over samples of the
+  // per-snapshot max), so the pair never disagrees.
+  const peakUtilByNode = new Map<string, number>();
+  for (const s of samples) {
+    for (const [id, m] of Object.entries(s.nodes)) {
+      if (m.util > (peakUtilByNode.get(id) ?? 0)) peakUtilByNode.set(id, m.util);
+    }
+  }
+  let hottestNode: HottestNode | null = null;
+  for (const n of design.nodes) {
+    const util = peakUtilByNode.get(n.id) ?? 0;
+    if (util > 0 && (!hottestNode || util > hottestNode.util)) {
+      hottestNode = { nodeId: n.id, type: n.type, util };
+    }
+  }
   const measured: CaseMeasured = {
     errorRate: avg((s) => s.errorRate),
     p99Ms: avg((s) => s.p99Ms),
@@ -95,6 +129,7 @@ export function runTestCase(problem: ProblemDef, design: Design, tc: TestCase): 
     staleReadRate: avg((s) => s.staleReadRate),
     hottestUtil: Math.max(0, ...samples.map((s) => s.hottestUtil)),
     queueDepthMax,
+    hottestNode,
   };
 
   const t = tc.thresholds;

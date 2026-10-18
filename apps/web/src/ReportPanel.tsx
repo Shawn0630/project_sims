@@ -1,3 +1,4 @@
+import { componentDef } from '@sds/components';
 import type {
   ActionCoverageDTO,
   ActionSourceDTO,
@@ -137,6 +138,8 @@ export function CaseList(props: CaseListProps) {
                 实测：错误率 {(r.measured.errorRate * 100).toFixed(1)}% · P99 {Math.round(r.measured.p99Ms)}ms ·
                 成本 ${r.measured.costPerHour.toFixed(0)}/h · 存储入站 {Math.round(r.measured.maxStorageQps)} QPS ·
                 最热利用率 {Math.round(r.measured.hottestUtil * 100)}%
+                {r.measured.hottestNode &&
+                  `（最热：${componentDef(r.measured.hottestNode.type).name}）`}
                 {r.measured.queueDepthMax > 0 && ` · 最大积压 ${Math.round(r.measured.queueDepthMax).toLocaleString()}`}
               </div>
             )}

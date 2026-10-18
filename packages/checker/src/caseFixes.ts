@@ -1,5 +1,5 @@
-import type { ComponentTypeId } from '@sds/components';
-import type { BreachCategory } from '@sds/driver';
+import { componentDef, type ComponentTypeId } from '@sds/components';
+import type { BreachCategory, EditOp } from '@sds/driver';
 import type { ProblemDef, TestCase } from '@sds/problems';
 import type { Design } from '@sds/sim-core';
 import { validateEditOps } from './edits';
@@ -27,9 +27,22 @@ import type { StructuralFinding } from './structural';
  *                      engine's per-event target semantics (a cache
  *                      stampede collapses CACHE hit rates; a viral post
  *                      multiplies FEED-service writes), hit the component
- *                      types of the finding's target nodes. CaseResult
- *                      carries no per-node measured data, so no measured
- *                      node signal is claimed — only the case definition's.
+ *                      types of the finding's target nodes. Rule LINKING
+ *                      still claims no measured per-node signal — only
+ *                      the case definition's.
+ *
+ * One signal beyond the linking rules IS measured: the bottleneck. When a
+ * case fails and its measured hottest node (runner.ts CaseMeasured.
+ * hottestNode) ran over 100% — or over the case's own hottest-util
+ * threshold — a pure CAPACITY fix is synthesized for that node, sized
+ * from the measurement (see synthesizeCapacityFix): the bottleneck moved
+ * there, so the loop's next step is "give it headroom", whoever's rule
+ * got the user here. It is appended AFTER the rule fixes (they keep
+ * priority) and only when no accepted rule fix already targets that
+ * node, so a case may carry up to MAX_FIXES_PER_CASE + 1 fixes in that
+ * situation. A failure whose hottest node stayed ≤100% (stale reads,
+ * consistency, semantics) gains NO capacity fix — capacity is not a
+ * plausible remedy there, and a fake fix is worse than none.
  *
  * A finding qualifies when it has an explicit link, or a shared breach
  * category backed by type overlap or by ≥2 shared categories (a single
@@ -37,8 +50,8 @@ import type { StructuralFinding } from './structural';
  * surfaces as an error-rate breach, and it would pin a generic spof fix
  * on every failing row). Its canned actions must also survive validation
  * against the design (re-validated here — a fix without applicable ops
- * is not a fix). At most MAX_FIXES_PER_CASE are attached, best signal
- * first. Passed cases are returned untouched (no fixes field at all).
+ * is not a fix). At most MAX_FIXES_PER_CASE rule fixes are attached, best
+ * signal first. Passed cases are returned untouched (no fixes field).
  */
 
 const MAX_FIXES_PER_CASE = 2;
@@ -89,6 +102,105 @@ function breachCategoriesOf(tc: TestCase, m: CaseMeasured): BreachCategory[] {
 const SEVERITY_RANK = { high: 0, medium: 1, low: 2 } as const;
 
 /**
+ * Headroom target for the synthesized capacity fix: size the node so the
+ * same load would run at this utilization. Engine capacity is linear in
+ * both replicas and capacityScale (capacity = per-replica × replicas ×
+ * capacityScale, and storage's effective-capacity modifiers multiply
+ * that same base), so util / target is the exact growth factor — one
+ * application lands the node at ≈target under the measured load.
+ */
+const CAPACITY_TARGET_UTIL = 0.8;
+/** Legal ceilings from the edit-op setting rules (edits.ts). */
+const MAX_REPLICAS = 16;
+const MAX_CAPACITY_SCALE = 4;
+/** capacityScale snaps UP to this step so the offer never under-sizes. */
+const CAPACITY_SCALE_STEP = 0.25;
+
+/**
+ * Synthesize the "scale the measured bottleneck" fix for one failed case,
+ * or null when capacity is not the measured problem:
+ *
+ *   - the case's measured hottest node must have run over 100% (or over
+ *     the case's own hottest-util threshold, when it declares one);
+ *   - the node must still exist in the design and be a kind whose
+ *     capacity a setting actually scales: queues report a backlog gauge
+ *     the engine caps below 100% and no setting changes, and the client
+ *     source has no capacity at all — both are skipped, never faked;
+ *   - stateless service tiers (service / worker behavior) scale by
+ *     replicas = ceil(current × util / target); everything else —
+ *     storage included — scales by capacityScale snapped up to a legal
+ *     step. Storage NEVER gets a semantic change (shard key, replicas of
+ *     data, consistency) from this fix: it is purely capacity. A knob
+ *     already at its legal ceiling falls back to the other knob; both
+ *     maxed (or a computed no-op) means no fix.
+ *
+ * The single op is run through validateEditOps like every other fix.
+ */
+function synthesizeCapacityFix(design: Design, tc: TestCase, r: CaseResult): CaseFix | null {
+  const hot = r.measured.hottestNode;
+  if (!hot) return null;
+  const overOwnThreshold =
+    tc.thresholds.maxHottestUtil !== undefined && hot.util > tc.thresholds.maxHottestUtil;
+  if (!(hot.util > 1 || overOwnThreshold)) return null;
+  const node = design.nodes.find((n) => n.id === hot.nodeId);
+  if (!node) return null;
+  const behavior = componentDef(node.type).behavior;
+  if (behavior === 'source' || behavior === 'queue') return null;
+
+  const factor = hot.util / CAPACITY_TARGET_UTIL;
+  let op: EditOp | null = null;
+  const scaleOp = (): EditOp | null => {
+    const cur = node.settings.capacityScale;
+    const next = Math.min(
+      MAX_CAPACITY_SCALE,
+      Math.ceil((cur * factor) / CAPACITY_SCALE_STEP) * CAPACITY_SCALE_STEP,
+    );
+    // Clean float dust from the step snap (e.g. 2.7500000004).
+    const snapped = Math.round(next * 100) / 100;
+    return snapped > cur
+      ? { op: 'setSetting', nodeId: node.id, key: 'capacityScale', value: snapped }
+      : null;
+  };
+  if (behavior === 'service' || behavior === 'worker') {
+    const cur = node.settings.replicas;
+    const next = Math.min(MAX_REPLICAS, Math.ceil(cur * factor));
+    op =
+      next > cur
+        ? { op: 'setSetting', nodeId: node.id, key: 'replicas', value: next }
+        : scaleOp();
+  } else {
+    op = scaleOp();
+  }
+  if (!op) return null;
+  const actions = validateEditOps([op], design);
+  if (!actions.length) return null;
+  return {
+    findingId: `capacity#${node.id}`,
+    title:
+      `扩容瓶颈节点（实测最热：${componentDef(node.type).name}` +
+      `${node.label ? `「${node.label}」` : ''}，利用率 ${Math.round(hot.util * 100)}%）`,
+    actions,
+  };
+}
+
+/** Node ids a fix's ops touch (targets, insertion endpoints, creations). */
+function fixTargetNodeIds(fix: CaseFix): Set<string> {
+  const ids = new Set<string>();
+  for (const op of fix.actions) {
+    if (op.op === 'setSetting') ids.add(op.nodeId);
+    else if (op.op === 'addComponent') {
+      if (op.connectFromId) ids.add(op.connectFromId);
+      if (op.connectToId) ids.add(op.connectToId);
+      if (op.newNodeId) ids.add(op.newNodeId);
+    } else {
+      ids.add(op.fromId);
+      ids.add(op.toId);
+    }
+  }
+  return ids;
+}
+
+/**
  * Return a copy of the suite whose failed results carry `fixes` (possibly
  * empty). Inputs are never mutated.
  */
@@ -108,12 +220,6 @@ export function attachCaseFixes(
       actions: validateEditOps(f.actions, design),
     }))
     .filter((c) => c.actions.length > 0);
-  if (!candidates.length) {
-    return {
-      ...suite,
-      results: suite.results.map((r) => (r.passed ? r : { ...r, fixes: [] })),
-    };
-  }
 
   const caseById = new Map(problem.testCases.map((tc) => [tc.id, tc]));
   const nodeTypeById = new Map(design.nodes.map((n) => [n.id, n.type]));
@@ -156,7 +262,18 @@ export function attachCaseFixes(
       });
     }
     scored.sort((a, b) => b.score - a.score || a.sev - b.sev || a.index - b.index);
-    return { ...r, fixes: scored.slice(0, MAX_FIXES_PER_CASE).map((s) => s.fix) };
+    const fixes = scored.slice(0, MAX_FIXES_PER_CASE).map((s) => s.fix);
+    // The measured-bottleneck capacity fix rides along AFTER the rule
+    // fixes — unless an accepted rule fix already targets that node (then
+    // the rule's own remedy owns the next step and capacity waits a
+    // round). This is the one way a case carries MAX_FIXES_PER_CASE + 1.
+    const capFix = synthesizeCapacityFix(design, tc, r);
+    if (capFix) {
+      const hotId = r.measured.hottestNode!.nodeId;
+      const alreadyTargeted = fixes.some((f) => fixTargetNodeIds(f).has(hotId));
+      if (!alreadyTargeted) fixes.push(capFix);
+    }
+    return { ...r, fixes };
   });
   return { ...suite, results };
 }

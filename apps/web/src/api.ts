@@ -170,11 +170,17 @@ export interface CaseMeasuredDTO {
   staleReadRate: number;
   hottestUtil: number;
   queueDepthMax: number;
+  /** The measured bottleneck: which node peaked hottest this run. */
+  hottestNode: { nodeId: string; type: ComponentTypeId; util: number } | null;
 }
 
-/** A one-click fix linked to a failed case (a structural finding + its validated ops). */
+/** A one-click fix linked to a failed case (validated ops, preview + confirm). */
 export interface CaseFixDTO {
-  /** `<ruleId>#<index>` — the finding's slot in the judge response's structural array. */
+  /**
+   * `<ruleId>#<index>` — a structural finding's slot in the judge
+   * response's structural array; or `capacity#<nodeId>` — the synthesized
+   * bottleneck-capacity fix sized from the measured hottest node.
+   */
   findingId: string;
   title: string;
   actions: EditOpDTO[];
