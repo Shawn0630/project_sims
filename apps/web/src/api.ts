@@ -280,6 +280,64 @@ export interface SubmissionAssessmentContextDTO {
     measured: CaseMeasuredDTO;
   }[];
   structuralFindings: StructuralFindingDTO[];
+  /** Verified probe results — when present, the review grounds on these
+   *  and the static per-case list above is sent empty on purpose. */
+  probeResults?: VerifiedProbeDTO[];
+}
+
+// ------------------------------------------------------------- probe DTOs -
+// The LLM proposes probe cases from the judging criteria alone (it never
+// sees the static suite); the backend converts each proposal into a real
+// test case, runs it through the simulator and grades the prediction.
+
+export interface ProbeCaseDTO {
+  name: string;
+  scenario: {
+    trafficMultiplier: number;
+    durationSec: number;
+    readRatio?: number;
+    events: { type: EventType; targetType?: ComponentTypeId; magnitude?: number }[];
+    kills: ComponentTypeId[];
+  };
+  thresholds: {
+    p99Ms?: number;
+    maxErrorRatePct?: number;
+    maxCostPerHour?: number;
+    maxStorageQps?: number;
+    maxHottestUtilPct?: number;
+    maxStaleReadPct?: number;
+    maxQueueDepth?: number;
+  };
+  prediction: {
+    willFail: boolean;
+    primaryBreach: string;
+    rationale: string;
+    fixHint: string;
+  };
+}
+
+/** Context for probe generation — design + criteria inputs, NO cases. */
+export interface ProbeContextDTO {
+  problemName: string;
+  designSummary: string;
+  schemaSummary?: string;
+  workloadSummary: string;
+  structuralFindings: StructuralFindingDTO[];
+  baselineRps: number;
+  readRatio: number;
+  budgetCostPerHour: number;
+  nodes: { id: string; type: ComponentTypeId; name: string }[];
+}
+
+export interface VerifiedProbeDTO {
+  name: string;
+  scenarioSummary: string;
+  prediction: ProbeCaseDTO['prediction'];
+  passed: boolean;
+  measured: CaseMeasuredDTO;
+  failures: string[];
+  actualBreach: string | null;
+  verdict: 'hit' | 'held' | 'miss';
 }
 
 export interface EvaluateResponseDTO<T> {
@@ -343,15 +401,34 @@ export function evaluateOnServer<T>(
   context: SubmissionAssessmentContextDTO | FollowUpContextDTO,
 ): Promise<EvaluateResponseDTO<T>>;
 export function evaluateOnServer<T>(
+  kind: 'probe',
+  context: ProbeContextDTO,
+): Promise<EvaluateResponseDTO<T>>;
+export function evaluateOnServer<T>(
   kind: 'schema',
   context: { problemName: string; schema: ProblemSchemaDTO; loadFactor?: number },
 ): Promise<EvaluateResponseDTO<T>>;
 export function evaluateOnServer<T>(
-  kind: 'submission' | 'schema' | 'followups',
+  kind: 'submission' | 'schema' | 'followups' | 'probe',
   context: unknown,
 ): Promise<EvaluateResponseDTO<T>> {
   return request<EvaluateResponseDTO<T>>('/api/evaluate', {
     method: 'POST',
     body: JSON.stringify({ kind, context }),
   });
+}
+
+/**
+ * The simulator as arbiter: the backend executes each proposed probe case
+ * against the submitted design and grades the LLM's prediction.
+ */
+export function verifyProbesOnServer(body: {
+  problemId: string;
+  design: Design;
+  cases: ProbeCaseDTO[];
+}): Promise<{ problemId: string; results: VerifiedProbeDTO[] }> {
+  return request<{ problemId: string; results: VerifiedProbeDTO[] }>(
+    '/api/submissions/verify-probes',
+    { method: 'POST', body: JSON.stringify(body) },
+  );
 }

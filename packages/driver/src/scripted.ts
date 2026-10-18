@@ -6,6 +6,8 @@ import type {
   DriverReview,
   FollowUpContext,
   FollowUpQuestion,
+  ProbeCase,
+  ProbeContext,
   SchemaAssessment,
   SchemaAssessmentContext,
   SimulatorTools,
@@ -163,6 +165,20 @@ export class ScriptedDriver implements Driver {
         detail: c.failures.join('；'),
       });
     }
+    // Verified probes, when the probe step produced any: failed probes are
+    // simulator-confirmed weaknesses of THIS design — surface them as
+    // findings in their own right (the static case list may be empty then).
+    const probes = ctx.probeResults ?? [];
+    for (const p of probes.filter((x) => !x.passed)) {
+      findings.push({
+        severity: 'medium',
+        title: `探测证实：${p.name}`,
+        detail: `评审探测预测「${p.prediction.primaryBreach}」被仿真实测证实——${p.failures.join('；')}。${p.prediction.fixHint ? `修法：${p.prediction.fixHint}` : ''}`,
+      });
+    }
+    const probeNote = probes.length
+      ? `探测环节：模型提出 ${probes.length} 个假设用例，仿真验证后 ${probes.filter((x) => x.verdict === 'hit').length} 个预言命中、${probes.filter((x) => x.verdict === 'held').length} 个被设计扛住、${probes.filter((x) => x.verdict === 'miss').length} 个未命中。`
+      : '';
     const summary =
       `本轮代码判卷 ${ctx.passed}/${ctx.total} 通过，得分 ${ctx.scorePct}。` +
       (ctx.structuralFindings.length
@@ -170,7 +186,10 @@ export class ScriptedDriver implements Driver {
         : '结构层面没有确定性缺陷，失分主要来自容量与场景。') +
       (failed.length
         ? `挂掉的用例：${failed.map((c) => c.name).join('、')}。`
-        : '全部用例通过。');
+        : probes.length
+          ? ''
+          : '全部用例通过。') +
+      probeNote;
     const scoreRationale =
       `分数由代码判卷按用例权重算出（P99 / 错误率 / 成本等硬阈值，LLM 不改判）。` +
       (failed.length
@@ -252,6 +271,135 @@ export class ScriptedDriver implements Driver {
     const def = componentDef(ctx.componentType);
     for (const q of def.questions) {
       push(q.level, q.question, q.keyPoints);
+    }
+    return out;
+  }
+
+  /**
+   * Offline probes: derive 1–2 falsifiable cases from the deterministic
+   * structural findings (the same signals an LLM prober would pick on).
+   * Each proposal names the structure it attacks and predicts the breach
+   * category the house criteria assign to it — the simulator then grades
+   * the prediction exactly like an LLM's. When no rule fired, probe the
+   * baseline and predict it holds.
+   */
+  async generateProbes(ctx: ProbeContext): Promise<ProbeCase[]> {
+    const out: ProbeCase[] = [];
+    const std = { p99Ms: 1000, maxErrorRatePct: 1 } as const;
+    const typeOfNode = (id?: string) => ctx.nodes.find((n) => n.id === id)?.type;
+    for (const f of ctx.structuralFindings) {
+      if (out.length >= 2) break;
+      const why = `结构规则「${f.title}」已报警：${f.detail}`;
+      switch (f.ruleId) {
+        case 'hot-read-no-cache':
+          out.push({
+            name: '探测：峰值读流量直打存储（无缓存）',
+            scenario: { trafficMultiplier: 3, durationSec: 40, events: [], kills: [] },
+            thresholds: { ...std, maxStorageQps: Math.round(ctx.baselineRps * 1.2) },
+            prediction: {
+              willFail: true,
+              primaryBreach: '存储过载',
+              rationale: `${why} 峰值下读流量无缓存拦截，存储层入站会先于其它层到顶。`,
+              fixHint: '在读路径前加缓存层，并给热点 key 做预热/互斥重建。',
+            },
+          });
+          break;
+        case 'spof': {
+          const type = typeOfNode(f.componentIds[0]);
+          if (!type) break;
+          out.push({
+            name: `探测：峰值期杀掉单点 ${type}`,
+            scenario: { trafficMultiplier: 2, durationSec: 40, events: [], kills: [type] },
+            thresholds: { ...std },
+            prediction: {
+              willFail: true,
+              primaryBreach: '错误率超标',
+              rationale: `${why} 该类型只有一个节点，杀掉后这一层消失、无处改道。`,
+              fixHint: '同类型至少两个独立节点，并留 failover 余量。',
+            },
+          });
+          break;
+        }
+        case 'sync-fanout':
+        case 'missing-queue':
+          out.push({
+            name: '探测：爆帖事件下的同步写扩散',
+            scenario: {
+              trafficMultiplier: 1.5,
+              durationSec: 45,
+              events: [{ type: 'viral_post', magnitude: 3 }],
+              kills: [],
+            },
+            thresholds: { ...std },
+            prediction: {
+              willFail: true,
+              primaryBreach: '错误率超标',
+              rationale: `${why} 爆帖瞬间写扩散若同步直达存储/粉丝，错误率会先爆。`,
+              fixHint: 'fan-out 改异步：队列 + Worker 扩散，大 V 走拉模式。',
+            },
+          });
+          break;
+        case 'no-rate-limit':
+          out.push({
+            name: '探测：无入口限流的 ×4 峰值',
+            scenario: { trafficMultiplier: 4, durationSec: 40, events: [], kills: [] },
+            thresholds: { ...std },
+            prediction: {
+              willFail: true,
+              primaryBreach: '错误率超标',
+              rationale: `${why} 没有限流的入口在峰值下会把过载一路传导到存储层。`,
+              fixHint: '在网关按下游真实容量反推限流阈值，超限明确拒绝而不是排队。',
+            },
+          });
+          break;
+        case 'bad-shard-key':
+          out.push({
+            name: '探测：热点 key 打爆单个分片',
+            scenario: {
+              trafficMultiplier: 2,
+              durationSec: 40,
+              events: [{ type: 'hot_key', magnitude: 3 }],
+              kills: [],
+            },
+            thresholds: { ...std, maxHottestUtilPct: 98 },
+            prediction: {
+              willFail: true,
+              primaryBreach: '热点过载',
+              rationale: `${why} 热点流量与当前分片键的分布不匹配，最热分片会先到顶。`,
+              fixHint: '换分片键或给热点 key 单独拆分/多副本读。',
+            },
+          });
+          break;
+        case 'blob-in-db':
+        case 'no-cdn':
+          out.push({
+            name: '探测：媒体/静态流量直压源站',
+            scenario: { trafficMultiplier: 2, durationSec: 40, events: [], kills: [] },
+            thresholds: { p99Ms: 1000, maxErrorRatePct: 1 },
+            prediction: {
+              willFail: true,
+              primaryBreach: 'P99 超标',
+              rationale: `${why} 大对象/静态内容不卸载，源站延迟会先被拖垮。`,
+              fixHint: '媒体走对象存储 + CDN，数据库只存元数据。',
+            },
+          });
+          break;
+        default:
+          break;
+      }
+    }
+    if (!out.length) {
+      out.push({
+        name: '探测：基线流量下设计应保持稳定',
+        scenario: { trafficMultiplier: 1, durationSec: 30, events: [], kills: [] },
+        thresholds: { p99Ms: 500, maxErrorRatePct: 0.1, maxCostPerHour: ctx.budgetCostPerHour },
+        prediction: {
+          willFail: false,
+          primaryBreach: '无',
+          rationale: '结构规则没有报警，按标准口径基线场景应当全绿——用这一例验证设计真的稳，而不是规则漏检。',
+          fixHint: '',
+        },
+      });
     }
     return out;
   }

@@ -1,4 +1,4 @@
-import type { ComponentTypeId } from '@sds/components';
+import { COMPONENT_MAP, type ComponentTypeId } from '@sds/components';
 import type { EventType, TrafficConfig } from '@sds/sim-core';
 
 /**
@@ -175,6 +175,122 @@ export interface SubmissionAssessmentContext {
   total: number;
   cases: CaseResultLike[];
   structuralFindings: StructuralFindingLike[];
+  /**
+   * Verified probe results (LLM-proposed cases, run through the simulator).
+   * When present and non-empty, the assessment grounds on THESE instead of
+   * the static per-case dump: the static cases are the fairness baseline
+   * for the score, but they are no longer briefed to the LLM.
+   */
+  probeResults?: VerifiedProbeResult[];
+}
+
+// ------------------------------------------------------------- probing ---
+//
+// The probe step inverts the old data flow. Instead of briefing the LLM
+// with the static suite's results and asking it to explain them, the LLM
+// is given the judging CRITERIA and this design, and must PROPOSE its own
+// failure cases — each with a falsifiable prediction. The simulator then
+// runs every proposed case and grades the prediction. The LLM proposes
+// hypotheses; simulation is the arbiter.
+
+/** The failure-category vocabulary of the judging standards. */
+export const BREACH_CATEGORIES = [
+  '错误率超标',
+  'P99 超标',
+  '成本超标',
+  '存储过载',
+  '热点过载',
+  '读到旧数据',
+  '队列积压',
+] as const;
+export type BreachCategory = (typeof BREACH_CATEGORIES)[number];
+/** A prediction's primary breach: a category, or '无' when predicting a pass. */
+export type PrimaryBreach = BreachCategory | '无';
+
+/**
+ * The judging standards handed to the prober (NOT the test cases). This is
+ * the house rubric: category vocabulary, what thresholds conventionally
+ * mean, and what the simulation engine can actually execute.
+ */
+export const PROBE_CRITERIA = `评判标准（本系统的口径，提用例与做预测都按这套来）：
+- 失败类别词表（primaryBreach 只能取其一，或预测通过时取「无」）：错误率超标（错误率高于阈值）/ P99 超标（P99 延迟高于阈值）/ 成本超标（每小时成本高于阈值）/ 存储过载（存储层入站 QPS 高于阈值）/ 热点过载（最热组件利用率高于阈值）/ 读到旧数据（读到旧数据比例高于阈值）/ 队列积压（队列最大积压高于阈值）。
+- 阈值口径：基线场景错误率应 <0.1%、P99 <500ms；峰值/事件场景错误率 <1%、P99 <1000ms 算合格；成本红线取题目预算；最热组件利用率红线 98%；读旧比例红线 5%。你给每个用例设的阈值就是判卷线，偏离口径要有理由。
+- 场景能力（超出范围会被系统截断）：流量倍数 trafficMultiplier 0.2–10（相对题目基线 RPS）；时长 durationSec 10–120（1 tick ≈ 1 秒）；readRatio 可选（0–1，改读写比）；events 可选，类型只能取 viral_post（网红爆帖，写扩散）/ cache_stampede（缓存雪崩）/ hot_key（热点 key）/ peak（流量峰值）/ rw_flip（读写比翻转），可带 targetType（组件类型）与 magnitude（1–10）；kills 可选，按组件类型杀节点测故障转移。
+- 预测必须可证伪：willFail 与 primaryBreach 要与 rationale 一致，rationale 必须指向这份设计里的具体结构（哪一层缺什么、为什么这个场景会先打爆它），不许泛泛而谈。`;
+
+export interface ProbeScenarioSpec {
+  /** Multiplier over the problem's baseline RPS, 0.2–10. */
+  trafficMultiplier: number;
+  /** Run length in ticks (≈ seconds), 10–120. */
+  durationSec: number;
+  readRatio?: number;
+  events: { type: EventType; targetType?: ComponentTypeId; magnitude?: number }[];
+  /** Component TYPES to kill mid-run (fault-injection by type). */
+  kills: ComponentTypeId[];
+}
+
+export interface ProbeThresholds {
+  p99Ms?: number;
+  /** Percent (1 = 1%), unlike CaseThresholds' fraction. */
+  maxErrorRatePct?: number;
+  maxCostPerHour?: number;
+  maxStorageQps?: number;
+  /** Percent (98 = 98%). */
+  maxHottestUtilPct?: number;
+  /** Percent (5 = 5%). */
+  maxStaleReadPct?: number;
+  maxQueueDepth?: number;
+}
+
+export interface ProbePrediction {
+  willFail: boolean;
+  primaryBreach: PrimaryBreach;
+  rationale: string;
+  fixHint: string;
+}
+
+/** One LLM-proposed probe case, in the friendly (relative) wire shape. */
+export interface ProbeCase {
+  name: string;
+  scenario: ProbeScenarioSpec;
+  thresholds: ProbeThresholds;
+  prediction: ProbePrediction;
+}
+
+/** Everything the prober may look at — note: NO static cases, NO results. */
+export interface ProbeContext {
+  problemName: string;
+  designSummary: string;
+  schemaSummary?: string;
+  workloadSummary: string;
+  structuralFindings: StructuralFindingLike[];
+  /** Problem scale facts the scenarios are relative to. */
+  baselineRps: number;
+  readRatio: number;
+  budgetCostPerHour: number;
+  /** The design's nodes, so kills/settings can be targeted by type. */
+  nodes: { id: string; type: ComponentTypeId; name: string }[];
+}
+
+export type ProbeVerdict = 'hit' | 'held' | 'miss';
+
+/** A proposed case after the simulator ran it: prediction vs measured truth. */
+export interface VerifiedProbeResult {
+  name: string;
+  /** Human-readable rendering of the executed scenario. */
+  scenarioSummary: string;
+  prediction: ProbePrediction;
+  passed: boolean;
+  measured: CaseMeasuredLike;
+  failures: string[];
+  /** The breach category that actually dominated, null when the case passed. */
+  actualBreach: BreachCategory | null;
+  /**
+   * hit  = predicted fail with the right category, or predicted pass and passed;
+   * held = predicted fail but the design passed anyway （设计扛住了）;
+   * miss = anything else (predicted pass but failed, or wrong category).
+   */
+  verdict: ProbeVerdict;
 }
 
 export interface SubmissionAssessment {
@@ -209,6 +325,12 @@ export interface Driver {
   generateFollowUps(ctx: FollowUpContext): Promise<FollowUpQuestion[]>;
   /** Qualitative schema conclusions on top of checker's deterministic signals. */
   assessSchema(ctx: SchemaAssessmentContext): Promise<SchemaAssessment>;
+  /**
+   * Propose probe cases for THIS design from the judging criteria alone
+   * (no static cases are shown). The host runs them through the simulator
+   * and grades the predictions.
+   */
+  generateProbes(ctx: ProbeContext): Promise<ProbeCase[]>;
 }
 
 /** OpenAI-style function schemas for the tool interface (LLM drivers). */
@@ -433,13 +555,30 @@ export function parseFollowUps(json: unknown): FollowUpQuestion[] {
 }
 
 export function buildSubmissionPrompt(ctx: SubmissionAssessmentContext): { system: string; user: string } {
+  const probes = ctx.probeResults ?? [];
+  const verdictText = (v: ProbeVerdict) =>
+    v === 'hit' ? '预言命中' : v === 'held' ? '设计扛住了（预测会失败，实测却通过）' : '预言未命中';
+  // When verified probe results exist, the review grounds on THEM: the
+  // static suite stays the score's fairness baseline but its per-case
+  // results are deliberately NOT briefed to the LLM anymore. Only when the
+  // probe step produced nothing do we fall back to the per-case dump.
+  const evidence = probes.length
+    ? `\n\n探测验证结果（评审前由模型针对这份设计提出假设用例、再由仿真引擎逐例实测，可信）：\n` +
+      probes
+        .map(
+          (p) =>
+            `- 「${p.name}」（${p.scenarioSummary}）：预测 ${p.prediction.willFail ? `会失败，主要突破口=${p.prediction.primaryBreach}` : '能通过'}——${p.prediction.rationale} → 实测 ${p.passed ? '通过' : `未通过 — ${p.failures.join('；')}`}，判定：${verdictText(p.verdict)}`,
+        )
+        .join('\n')
+    : `。逐例：\n` +
+      ctx.cases.map((c) => `- ${c.name}：${c.passed ? '通过' : `未通过 — ${c.failures.join('；')}（实测 ${JSON.stringify(c.measured)}）`}`).join('\n');
   return {
     system:
       '你是一位资深系统设计面试官，在给候选人的提交写评审。分数已由代码判卷给出（硬阈值），你的任务是解释分数、指出最关键的缺陷与修复优先级，结论必须引用给定的实测数据，不要编造数字，不要改判分数。只输出 JSON。',
     user:
       `题目：${ctx.problemName}\n候选人设计：\n${ctx.designSummary}\n\n本题读写需求：${ctx.workloadSummary}\n\n` +
-      `代码判卷结果：${ctx.passed}/${ctx.total} 通过，得分 ${ctx.scorePct}。逐例：\n` +
-      ctx.cases.map((c) => `- ${c.name}：${c.passed ? '通过' : `未通过 — ${c.failures.join('；')}（实测 ${JSON.stringify(c.measured)}）`}`).join('\n') +
+      `代码判卷结果：${ctx.passed}/${ctx.total} 通过，得分 ${ctx.scorePct}` +
+      evidence +
       `\n\n结构缺陷（确定性规则，可信）：\n${ctx.structuralFindings.map((f) => `- [${f.severity}] ${f.title}：${f.detail}`).join('\n') || '（无）'}\n\n` +
       `输出 JSON：{"summary":"2-3 句总评","scoreRationale":"为什么是这个分数：失分集中在哪、先修哪个涨分最快","findings":[{"severity":"high|medium|low","title":"…","detail":"…"}]}`,
   };
@@ -501,4 +640,143 @@ export function parseSchemaAssessment(json: unknown): SchemaAssessment {
     dimensionNotes,
     suggestions: Array.isArray(o.suggestions) ? o.suggestions.map(String).slice(0, 6) : [],
   };
+}
+
+// ------------------------------------------------------ probe prompts ---
+// The prober never sees the static suite. It gets the design, the schema,
+// the workload, the structural signals and the CRITERIA — and must commit
+// to falsifiable predictions the simulator will grade.
+
+export function buildProbePrompt(ctx: ProbeContext): { system: string; user: string } {
+  const killableTypes = [...new Set(ctx.nodes.map((n) => n.type))].join('、');
+  return {
+    system:
+      '你是一位资深系统设计面试官，正在评审前对候选人的设计做"探测"。你看不到题目的测试用例，也不知道判卷结果。你的任务：基于给定的评判标准，针对这份设计最可能翻车的地方，提出最多 4 个仿真用例，并对每个用例给出明确、可证伪的预测。随后系统会把你的用例在仿真引擎里真跑一遍，逐条核对你的预测——预测对了说明你真看懂了这份设计，错了会被如实记录。所以：挑这份设计真正的软肋，不要凑数；阈值按标准口径设；rationale 必须指向具体结构。只输出 JSON，不要输出其它文字。',
+    user:
+      `题目：${ctx.problemName}\n候选人设计：\n${ctx.designSummary}\n\n` +
+      (ctx.schemaSummary ? `数据库 schema：\n${ctx.schemaSummary}\n\n` : '') +
+      `本题读写需求：${ctx.workloadSummary}\n\n` +
+      `题目量级：基线 ${ctx.baselineRps} RPS，读占比 ${Math.round(ctx.readRatio * 100)}%，成本预算 $${ctx.budgetCostPerHour}/h。\n` +
+      `本设计里可被杀的组件类型：${killableTypes || '（无）'}\n\n` +
+      `结构缺陷（确定性规则，可信，可作为你选软肋的线索）：\n${ctx.structuralFindings.map((f) => `- [${f.severity}] ${f.title}：${f.detail}`).join('\n') || '（无）'}\n\n` +
+      `${PROBE_CRITERIA}\n\n` +
+      `输出 JSON：{"cases":[{"name":"用例名（点明场景）","scenario":{"trafficMultiplier":3,"durationSec":40,"readRatio":0.9,"events":[{"type":"viral_post","targetType":"feedservice","magnitude":3}],"kills":["appserver"]},"thresholds":{"p99Ms":1000,"maxErrorRatePct":1,"maxCostPerHour":900},"prediction":{"willFail":true,"primaryBreach":"错误率超标","rationale":"为什么这个场景会先打爆这一层","fixHint":"候选人该怎么改"}}]}\n` +
+      `scenario 的 events/kills 可省略或为空数组；thresholds 至少给一项（可选项：p99Ms / maxErrorRatePct / maxCostPerHour / maxStorageQps / maxHottestUtilPct / maxStaleReadPct / maxQueueDepth）；prediction.willFail=false 时 primaryBreach 必须为「无」。`,
+  };
+}
+
+const PROBE_EVENT_TYPES: readonly string[] = ['viral_post', 'cache_stampede', 'hot_key', 'peak', 'rw_flip'];
+const COMPONENT_TYPE_IDS: readonly string[] = Object.keys(COMPONENT_MAP);
+
+const clampNum = (v: unknown, lo: number, hi: number): number | undefined => {
+  const n = typeof v === 'number' ? v : NaN;
+  if (!Number.isFinite(n)) return undefined;
+  return Math.min(hi, Math.max(lo, n));
+};
+
+/**
+ * Validate + clamp ONE proposed probe case to what the engine can execute.
+ * Malformed cases return null (rejected individually; siblings survive).
+ * Used both for LLM output (via parseProbeCases) and for cases that round-
+ * trip back to the server for verification — the server never trusts the
+ * client's copy.
+ */
+export function normalizeProbeCase(raw: unknown): ProbeCase | null {
+  const o = raw as {
+    name?: unknown;
+    scenario?: Record<string, unknown>;
+    thresholds?: Record<string, unknown>;
+    prediction?: Record<string, unknown>;
+  } | null;
+  if (!o || typeof o.name !== 'string' || !o.name.trim() || !o.scenario || typeof o.scenario !== 'object') {
+    return null;
+  }
+  const s = o.scenario;
+  const scenario: ProbeScenarioSpec = {
+    trafficMultiplier: clampNum(s.trafficMultiplier, 0.2, 10) ?? 1,
+    durationSec: Math.round(clampNum(s.durationSec, 10, 120) ?? 40),
+    events: [],
+    kills: [],
+  };
+  const rr = clampNum(s.readRatio, 0, 1);
+  if (rr !== undefined) scenario.readRatio = rr;
+  if (Array.isArray(s.events)) {
+    for (const e of s.events.slice(0, 3)) {
+      const ev = e as { type?: unknown; targetType?: unknown; magnitude?: unknown };
+      if (!PROBE_EVENT_TYPES.includes(String(ev.type))) continue;
+      scenario.events.push({
+        type: String(ev.type) as EventType,
+        ...(COMPONENT_TYPE_IDS.includes(String(ev.targetType))
+          ? { targetType: String(ev.targetType) as ComponentTypeId }
+          : {}),
+        magnitude: clampNum(ev.magnitude, 1, 10) ?? 3,
+      });
+    }
+  }
+  if (Array.isArray(s.kills)) {
+    for (const k of s.kills) {
+      const t = String(k);
+      if (COMPONENT_TYPE_IDS.includes(t) && !scenario.kills.includes(t as ComponentTypeId)) {
+        scenario.kills.push(t as ComponentTypeId);
+      }
+      if (scenario.kills.length >= 3) break;
+    }
+  }
+
+  const t = (o.thresholds ?? {}) as Record<string, unknown>;
+  const thresholds: ProbeThresholds = {};
+  const p99 = clampNum(t.p99Ms, 50, 10_000);
+  if (p99 !== undefined) thresholds.p99Ms = p99;
+  const err = clampNum(t.maxErrorRatePct, 0.01, 50);
+  if (err !== undefined) thresholds.maxErrorRatePct = err;
+  const cost = clampNum(t.maxCostPerHour, 1, 100_000);
+  if (cost !== undefined) thresholds.maxCostPerHour = cost;
+  const sqps = clampNum(t.maxStorageQps, 10, 1_000_000);
+  if (sqps !== undefined) thresholds.maxStorageQps = sqps;
+  const hot = clampNum(t.maxHottestUtilPct, 50, 100);
+  if (hot !== undefined) thresholds.maxHottestUtilPct = hot;
+  const stale = clampNum(t.maxStaleReadPct, 0.1, 100);
+  if (stale !== undefined) thresholds.maxStaleReadPct = stale;
+  const qd = clampNum(t.maxQueueDepth, 10, 10_000_000);
+  if (qd !== undefined) thresholds.maxQueueDepth = qd;
+  if (Object.keys(thresholds).length === 0) return null; // nothing to verify against
+
+  const p = o.prediction;
+  if (!p || typeof p !== 'object') return null;
+  const willFail = p.willFail === true;
+  let primaryBreach: PrimaryBreach = '无';
+  if (willFail) {
+    if (!(BREACH_CATEGORIES as readonly string[]).includes(String(p.primaryBreach))) return null;
+    primaryBreach = String(p.primaryBreach) as BreachCategory;
+  }
+  return {
+    name: o.name.trim().slice(0, 60),
+    scenario,
+    thresholds,
+    prediction: {
+      willFail,
+      primaryBreach,
+      rationale: typeof p.rationale === 'string' ? p.rationale.slice(0, 400) : '',
+      fixHint: typeof p.fixHint === 'string' ? p.fixHint.slice(0, 300) : '',
+    },
+  };
+}
+
+/**
+ * Parse the prober's reply: {"cases":[ ... ]}. Throws only when the reply
+ * is unusable as a whole; individual malformed cases are dropped, and an
+ * all-invalid reply yields [] (the host degrades to the no-probe path).
+ */
+export function parseProbeCases(json: unknown): ProbeCase[] {
+  const arr = Array.isArray(json)
+    ? json
+    : (json as { cases?: unknown })?.cases;
+  if (!Array.isArray(arr)) throw new Error('probe: bad shape');
+  const out: ProbeCase[] = [];
+  for (const raw of arr) {
+    const pc = normalizeProbeCase(raw);
+    if (pc) out.push(pc);
+    if (out.length >= 4) break;
+  }
+  return out;
 }

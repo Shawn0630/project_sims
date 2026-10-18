@@ -3,13 +3,17 @@ import type { SchemaReviewReport } from '@sds/checker';
 import {
   ScriptedDriver,
   buildFollowUpPrompt,
+  buildProbePrompt,
   buildSchemaPrompt,
   buildSubmissionPrompt,
   parseFollowUps,
+  parseProbeCases,
   parseSchemaAssessment,
   parseSubmissionAssessment,
   type FollowUpContext,
   type FollowUpQuestion,
+  type ProbeCase,
+  type ProbeContext,
   type SchemaAssessment,
   type SchemaAssessmentContext,
   type SchemaReviewLike,
@@ -57,7 +61,7 @@ export function llmConfig(
   };
 }
 
-export type EvaluateKind = 'submission' | 'schema' | 'followups';
+export type EvaluateKind = 'submission' | 'schema' | 'followups' | 'probe';
 
 export interface EvaluateOutcome<T> {
   source: 'llm' | 'scripted';
@@ -208,6 +212,24 @@ export async function evaluateFollowUps(
     () => buildFollowUpPrompt(ctx),
     parseFollowUps,
     () => scripted.generateFollowUps(ctx),
+  );
+}
+
+/**
+ * The probe step: the model proposes failure cases for this design from
+ * the judging criteria alone (it never sees the static suite). The
+ * returned cases are normalized/clamped by the contract parser; the host
+ * then runs them through the simulator (probe.ts) and grades predictions.
+ */
+export async function evaluateProbes(
+  ctx: ProbeContext,
+): Promise<EvaluateOutcome<ProbeCase[]>> {
+  return runLogged(
+    'probe',
+    ctx,
+    () => buildProbePrompt(ctx),
+    parseProbeCases,
+    () => scripted.generateProbes(ctx),
   );
 }
 

@@ -15,10 +15,12 @@ import {
   fetchHealth,
   fetchProblems,
   judgeOnServer,
+  verifyProbesOnServer,
   type FollowUpContextDTO,
   type FollowUpQuestionDTO,
   type HealthDTO,
   type JudgeResponseDTO,
+  type ProbeCaseDTO,
   type ProblemCaseDTO,
   type ProblemPack,
   type ProblemSchemaDTO,
@@ -26,11 +28,12 @@ import {
   type StructuralFindingDTO,
   type SubmissionAssessmentDTO,
   type SuiteResultDTO,
+  type VerifiedProbeDTO,
 } from './api';
 import { Canvas } from './Canvas';
 import { DeepDive } from './DeepDive';
 import { SettingsPanel } from './SettingsPanel';
-import { CaseList, StructuralList, scoreColor } from './ReportPanel';
+import { CaseList, ProbeSection, StructuralList, scoreColor } from './ReportPanel';
 import { SchemaPanel } from './SchemaPanel';
 import { IconGlyph } from './icons';
 
@@ -169,6 +172,16 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   const [assessmentError, setAssessmentError] = useState<string | null>(null);
   const [submitStamp, setSubmitStamp] = useState(0);
 
+  // Probe step: after judging, the backend's model proposes failure cases
+  // for THIS design from the judging criteria (it never sees the static
+  // suite), the backend's simulator runs each one and grades the
+  // predictions, and the qualitative review then grounds on the VERIFIED
+  // probe results instead of the static per-case dump.
+  const [probeResults, setProbeResults] = useState<VerifiedProbeDTO[] | null>(null);
+  const [probeBusy, setProbeBusy] = useState(false);
+  const [probeNote, setProbeNote] = useState<string | null>(null);
+  const [probeLabel, setProbeLabel] = useState('');
+
   const engineRef = useRef<SimulationEngine | null>(null);
   if (!engineRef.current) {
     engineRef.current = new SimulationEngine(structuredClone(problem.sampleDesign), {
@@ -291,6 +304,9 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setJudgeError(null);
     setAssessment(null);
     setAssessmentError(null);
+    setProbeResults(null);
+    setProbeNote(null);
+    setProbeLabel('');
     setFollowUps(null);
     setHighlights(new Map());
     setSelectedId(null);
@@ -365,6 +381,9 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setSuite(null);
     setAssessment(null);
     setAssessmentError(null);
+    setProbeResults(null);
+    setProbeNote(null);
+    setProbeLabel('');
     setHighlights(new Map());
     setReplayingId(null);
     replayRef.current = null;
@@ -398,6 +417,9 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setSubmitStamp((s) => s + 1);
     setAssessment(null);
     setAssessmentError(null);
+    setProbeResults(null);
+    setProbeNote(null);
+    setProbeLabel('');
     setPhase('report');
     setSubmissions((prev) =>
       [
@@ -411,22 +433,77 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
         ...prev,
       ].slice(0, 50),
     );
-    // Submitting always triggers the qualitative assessment as part of the
-    // submission: the backend makes its single evaluate call (cloud LLM
-    // when configured, scripted fallback otherwise) and the results panel
-    // shows a loading state until it lands. The button in the panel is
-    // only a re-run, never the sole way to get the first assessment.
-    void runAssessment(result, jr.structural);
+    // Submission pipeline: code judging (done above, it owns the score) →
+    // LLM probe (the model proposes failure cases for THIS design from the
+    // criteria alone) → simulator verification of every prediction → the
+    // qualitative review, grounded on the verified probe results. The
+    // static suite remains the fairness baseline for the score and is no
+    // longer briefed to the LLM.
+    void runProbeThenAssessment(result, jr.structural);
+  };
+
+  /**
+   * Probe → verify → assess. Any probe failure degrades gracefully: the
+   * probe section shows itself unavailable and the review falls back to
+   * grounding on the judging summary, so a submission never loses its
+   * review because the probe step hiccuped.
+   */
+  const runProbeThenAssessment = async (
+    s: SuiteResultDTO,
+    structuralFindings: StructuralFindingDTO[],
+  ) => {
+    const p = problemRef.current;
+    setProbeBusy(true);
+    let verified: VerifiedProbeDTO[] = [];
+    try {
+      const pr = await evaluateOnServer<ProbeCaseDTO[]>('probe', {
+        problemName: p.name,
+        designSummary: buildDesignSummary(designRef.current),
+        schemaSummary: schemaSummaryOf(schemasRef.current[p.id]!),
+        workloadSummary: workloadSummaryOf(p),
+        structuralFindings,
+        baselineRps: p.scale.baselineRps,
+        readRatio: p.scale.readRatio,
+        budgetCostPerHour: p.scale.budgetCostPerHour,
+        nodes: designRef.current.nodes.map((n) => ({
+          id: n.id,
+          type: n.type,
+          name: componentDef(n.type).name,
+        })),
+      });
+      setProbeLabel(pr.label);
+      if (pr.data.length > 0) {
+        const vr = await verifyProbesOnServer({
+          problemId: p.id,
+          design: designRef.current,
+          cases: pr.data,
+        });
+        verified = vr.results;
+        setProbeResults(verified);
+        if (!verified.length) {
+          setProbeNote('探测用例未通过服务端的合法性校验，本轮没有可验证的探测结果。');
+        }
+      } else {
+        setProbeNote('本轮探测没有产出可用用例，评审改为依据判卷总览与结构缺陷。');
+      }
+    } catch {
+      setProbeNote('探测步骤不可用（后端未返回），评审改为依据判卷总览与结构缺陷。');
+    } finally {
+      setProbeBusy(false);
+    }
+    void runAssessment(s, structuralFindings, verified);
   };
 
   /** Qualitative review of a judged submission — ONE backend evaluate call. */
   const runAssessment = async (
     s: SuiteResultDTO,
     structuralOverride?: StructuralFindingDTO[],
+    probeOverride?: VerifiedProbeDTO[],
   ) => {
     setAssessmentBusy(true);
     setAssessmentError(null);
     try {
+      const probes = probeOverride ?? probeResults ?? [];
       const r = await evaluateOnServer<SubmissionAssessmentDTO>('submission', {
         problemName: problemRef.current.name,
         designSummary: buildDesignSummary(designRef.current),
@@ -434,8 +511,11 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
         scorePct: s.scorePct,
         passed: s.passedCount,
         total: s.totalCount,
-        cases: s.results,
+        // With verified probes, the static per-case results are NOT sent:
+        // the review grounds on the probe verification instead.
+        cases: probes.length ? [] : s.results,
         structuralFindings: structuralOverride ?? structural,
+        ...(probes.length ? { probeResults: probes } : {}),
       });
       setAssessorLabel(r.label);
       setAssessment(r.data);
@@ -1023,6 +1103,13 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                       onReplay={startReplay}
                       onStopReplay={stopReplay}
                     />
+                    {/* Probe step: LLM-proposed cases, simulator-verified. */}
+                    <ProbeSection
+                      busy={probeBusy}
+                      note={probeNote}
+                      results={probeResults}
+                      sourceLabel={probeLabel}
+                    />
                     {/* Qualitative review — backend evaluate call only. */}
                     <div style={{ marginTop: 14, border: '1px solid #1e293b', borderRadius: 8, padding: '10px 12px', background: '#0b1220' }}>
                       <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -1032,15 +1119,17 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                         )}
                         <button
                           style={{ marginLeft: 'auto' }}
-                          disabled={assessmentBusy}
+                          disabled={assessmentBusy || probeBusy}
                           onClick={() => suite && void runAssessment(suite)}
                         >
-                          {assessmentBusy ? '评审生成中…' : assessment ? '重新评审' : '让评审员点评这次提交'}
+                          {assessmentBusy || probeBusy ? '评审生成中…' : assessment ? '重新评审' : '让评审员点评这次提交'}
                         </button>
                       </div>
-                      {assessmentBusy && !assessment && (
+                      {(assessmentBusy || probeBusy) && !assessment && (
                         <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>
-                          评审生成中…（正在联系{llmConfigured ? '云端 LLM' : '本地脚本评审'}，马上就好）
+                          {probeBusy
+                            ? '评审流程进行中：先完成 LLM 探测与仿真验证，再生成点评…'
+                            : `评审生成中…（正在联系${llmConfigured ? '云端 LLM' : '本地脚本评审'}，马上就好）`}
                         </div>
                       )}
                       {assessmentBusy && assessment && (

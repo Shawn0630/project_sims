@@ -2,10 +2,12 @@ import {
   DRIVER_SYSTEM_PROMPT,
   TOOL_SCHEMAS,
   buildFollowUpPrompt,
+  buildProbePrompt,
   buildSchemaPrompt,
   buildSubmissionPrompt,
   executeToolCall,
   parseFollowUps,
+  parseProbeCases,
   parseSchemaAssessment,
   parseSubmissionAssessment,
   type Driver,
@@ -13,6 +15,8 @@ import {
   type DriverReview,
   type FollowUpContext,
   type FollowUpQuestion,
+  type ProbeCase,
+  type ProbeContext,
   type SchemaAssessment,
   type SchemaAssessmentContext,
   type SimulatorTools,
@@ -171,5 +175,10 @@ export class OllamaDriver implements Driver {
   async assessSchema(ctx: SchemaAssessmentContext): Promise<SchemaAssessment> {
     const p = buildSchemaPrompt(ctx);
     return parseSchemaAssessment(await this.chatJson(p.system, p.user));
+  }
+
+  async generateProbes(ctx: ProbeContext): Promise<ProbeCase[]> {
+    const p = buildProbePrompt(ctx);
+    return parseProbeCases(await this.chatJson(p.system, p.user));
   }
 }

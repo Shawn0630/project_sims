@@ -125,6 +125,7 @@ label { font-size: 12.5px; color: var(--muted); display: flex; flex-direction: c
 .chip-pass { background: #14532d; color: #bbf7d0; border-color: #166534; }
 .chip-fail { background: #7f1d1d; color: #fecaca; border-color: #991b1b; }
 .chip-hidden-tag { background: #4c1d95; color: #ddd6fe; border-color: #6d28d9; }
+.chip-held { background: #164e63; color: #a5f3fc; border-color: #0e7490; }
 .chip-基础 { background: #14532d; color: #bbf7d0; }
 .chip-进阶 { background: #1e3a5f; color: #bfdbfe; }
 .chip-追问 { background: #713f12; color: #fde68a; }

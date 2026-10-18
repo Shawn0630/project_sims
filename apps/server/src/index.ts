@@ -8,12 +8,14 @@ import type { Design } from '@sds/sim-core';
 import {
   buildSchemaSummary,
   evaluateFollowUps,
+  evaluateProbes,
   evaluateSchema,
   evaluateSubmission,
   llmConfig,
   toSchemaReviewLike,
   type EvaluateKind,
 } from './llm';
+import { verifyProbes } from './probe';
 import { toClientPack } from './packs';
 import { JsonProblemStorage, type ProblemStorage } from './storage';
 import { registerAdminRoutes } from './admin';
@@ -28,8 +30,11 @@ import { registerAdminRoutes } from './admin';
  *   GET  /api/problems            problem packs (hidden cases stripped)
  *   GET  /api/problems/:id        one pack (hidden cases stripped)
  *   POST /api/submissions/judge   code judging + structural + schema signals
+ *   POST /api/submissions/verify-probes
+ *                                 run LLM-proposed probe cases through the
+ *                                 simulator and grade their predictions
  *   POST /api/evaluate            ONE LLM call (or scripted fallback) →
- *                                 structured assessment / follow-ups
+ *                                 structured assessment / follow-ups / probes
  *   POST /api/problems/generate   STUB — the future problem-generation system
  *   GET  /admin + /api/admin/*     author console (see admin.ts) — pack CRUD,
  *                                 component registry + overrides, LLM call log.
@@ -116,6 +121,34 @@ app.post('/api/submissions/judge', async (c) => {
   return c.json({ problemId: problem.id, suite, structural, schemaSignals });
 });
 
+// ------------------------------------------------------- probe verification -
+// The LLM proposes probe cases from the judging criteria (POST /api/evaluate
+// kind=probe); this endpoint is the arbiter: each proposal is re-validated,
+// converted to a real test case and executed through the same checker path
+// as the static suite, and its prediction is graded (hit / held / miss).
+app.post('/api/submissions/verify-probes', async (c) => {
+  const body = (await c.req.json().catch(() => null)) as {
+    problemId?: unknown;
+    design?: unknown;
+    cases?: unknown;
+  } | null;
+  if (
+    !body ||
+    typeof body.problemId !== 'string' ||
+    !isDesign(body.design) ||
+    !Array.isArray(body.cases)
+  ) {
+    return c.json(
+      badRequest('需要 { problemId: string, design: { nodes, edges }, cases: ProbeCase[] }'),
+      400,
+    );
+  }
+  const problem = await storage.getProblem(body.problemId);
+  if (!problem) return c.json({ error: 'problem_not_found' }, 404);
+  const results = verifyProbes(problem, body.design, body.cases);
+  return c.json({ problemId: problem.id, results });
+});
+
 // ---------------------------------------------------------------- evaluate -
 app.post('/api/evaluate', async (c) => {
   const body = (await c.req.json().catch(() => null)) as {
@@ -124,13 +157,19 @@ app.post('/api/evaluate', async (c) => {
   } | null;
   const kind = body?.kind as EvaluateKind | undefined;
   const ctx = body?.context;
-  if (!kind || !['submission', 'schema', 'followups'].includes(kind) || !ctx) {
+  if (!kind || !['submission', 'schema', 'followups', 'probe'].includes(kind) || !ctx) {
     return c.json(
-      badRequest("需要 { kind: 'submission' | 'schema' | 'followups', context }"),
+      badRequest("需要 { kind: 'submission' | 'schema' | 'followups' | 'probe', context }"),
       400,
     );
   }
 
+  if (kind === 'probe') {
+    const outcome = await evaluateProbes(
+      ctx as unknown as Parameters<typeof evaluateProbes>[0],
+    );
+    return c.json({ kind, ...outcome });
+  }
   if (kind === 'submission') {
     const outcome = await evaluateSubmission(
       ctx as unknown as Parameters<typeof evaluateSubmission>[0],

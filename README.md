@@ -110,7 +110,8 @@ npm run dev:server   # 或 npm run start -w @sds/server；tsx 直接跑 TS 源�
 | `GET /api/health` | 存活 + 题目数 + LLM 是否已配置 |
 | `GET /api/problems` / `GET /api/problems/:id` | 题目包（渲染数据）；隐藏用例只保留 id/名称/权重并标 `locked`，场景、阈值、提示一律剥离 |
 | `POST /api/submissions/judge` | `{ problemId, design, schema?, schemaLoadFactor? }` → 在服务端跑既有 checker 判卷，返回逐例结果 + 结构检查 + Schema 信号 |
-| `POST /api/evaluate` | `{ kind: submission \| schema \| followups, context }` → 后端组装 prompt、做**一次** LLM 调用、防御性解析结构化 JSON 返回；无 key 或调用失败回落 ScriptedDriver 同形状结果。`kind=schema` 可直接传 `{ problemName, schema, loadFactor }`，信号由服务端计算并随响应返回 |
+| `POST /api/submissions/verify-probes` | `{ problemId, design, cases }` → 把 LLM 探测用例逐个转成真用例、经与静态套件相同的 checker 路径实跑，给每条预测定级（命中 / 设计扛住了 / 未命中）并附实测值 |
+| `POST /api/evaluate` | `{ kind: submission \| schema \| followups \| probe, context }` → 后端组装 prompt、做**一次** LLM 调用、防御性解析结构化 JSON 返回；无 key 或调用失败回落 ScriptedDriver 同形状结果。`kind=schema` 可直接传 `{ problemName, schema, loadFactor }`，信号由服务端计算并随响应返回。`kind=probe` 是探测步：模型只拿到判卷标准（类别词表 + 阈值口径）与设计本身、**看不到静态用例与结果**，须针对这份设计提出 ≤4 个带预测的失败用例，随后 `verify-probes` 用仿真逐条验真；`kind=submission` 的评审在有验证结果时以探测验证为据、不再喂静态逐例结果（探测为空时才回落旧行为） |
 | `POST /api/problems/generate` | **桩**：校验题目种子 `{ title, statement, scaleNotes? }` 后返回 501 与计划中的题目包生成契约——这是第四套系统（LLM 生成题目）的接缝 |
 | `GET /admin` | 作者控制台（见下方「作者控制台」） |
 | `PUT /api/problems/:id` / `DELETE /api/problems/:id` | 作者写接口：整包替换 / 删除题目包（经 `ProblemStorage` 落盘）。**仅限本地/内网作者使用，本轮无登录鉴权，不要暴露公网** |

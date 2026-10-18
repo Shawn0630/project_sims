@@ -3,6 +3,7 @@ import type {
   ProblemPack,
   StructuralFindingDTO,
   SuiteResultDTO,
+  VerifiedProbeDTO,
 } from './api';
 
 function thresholdSummary(tc: ProblemCaseDTO): string {
@@ -101,6 +102,81 @@ export function CaseList(props: CaseListProps) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+interface ProbeSectionProps {
+  busy: boolean;
+  /** Why the probe step produced nothing (unavailable / no valid cases). */
+  note: string | null;
+  results: VerifiedProbeDTO[] | null;
+  /** Attribution of the proposer （云端 LLM / 本地脚本）. */
+  sourceLabel: string;
+}
+
+const VERDICT_META: Record<VerifiedProbeDTO['verdict'], { text: string; cls: string }> = {
+  hit: { text: '预言命中', cls: 'chip-pass' },
+  held: { text: '设计扛住了', cls: 'chip-held' },
+  miss: { text: '未命中', cls: 'chip-fail' },
+};
+
+/**
+ * LLM-proposed probe cases AFTER simulator verification: what the model
+ * predicted for this design, what the engine actually measured, and the
+ * graded verdict. The model proposes; the simulator is the arbiter.
+ */
+export function ProbeSection(props: ProbeSectionProps) {
+  const { busy, note, results, sourceLabel } = props;
+  return (
+    <div style={{ marginTop: 14, border: '1px solid #1e293b', borderRadius: 8, padding: '10px 12px', background: '#0b1220' }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <b>🔬 LLM 探测用例（已由仿真验证）</b>
+        {sourceLabel && (
+          <span style={{ color: '#94a3b8', fontSize: 12 }}>提案：{sourceLabel}</span>
+        )}
+      </div>
+      {busy && (
+        <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>
+          探测中…（模型正在针对这份设计提出假设用例，随后由仿真逐例验证）
+        </div>
+      )}
+      {!busy && note && !results && (
+        <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>{note}</div>
+      )}
+      {results && results.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+          {results.map((r, i) => {
+            const v = VERDICT_META[r.verdict];
+            return (
+              <div key={i} className="case-row">
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <span className={`chip ${v.cls}`}>{v.text}</span>
+                  <b>{r.name}</b>
+                  <span style={{ color: '#94a3b8', fontSize: 12.5 }}>{r.scenarioSummary}</span>
+                </div>
+                <div style={{ fontSize: 13, marginTop: 4, color: '#cbd5e1' }}>
+                  预测：{r.prediction.willFail ? `会失败 · 主要突破口「${r.prediction.primaryBreach}」` : '能通过'}
+                  {r.prediction.rationale && <span> — {r.prediction.rationale}</span>}
+                </div>
+                <div style={{ fontSize: 12.5, marginTop: 3, color: '#94a3b8' }}>
+                  实测：{r.passed ? '通过' : `未通过${r.actualBreach ? ` · 实际突破口「${r.actualBreach}」` : ''}`} ·
+                  错误率 {(r.measured.errorRate * 100).toFixed(1)}% · P99 {Math.round(r.measured.p99Ms)}ms ·
+                  成本 ${r.measured.costPerHour.toFixed(0)}/h · 存储入站 {Math.round(r.measured.maxStorageQps)} QPS ·
+                  最热利用率 {Math.round(r.measured.hottestUtil * 100)}%
+                  {r.measured.queueDepthMax > 0 && ` · 最大积压 ${Math.round(r.measured.queueDepthMax).toLocaleString()}`}
+                </div>
+                {!r.passed && r.failures.length > 0 && (
+                  <div style={{ fontSize: 12.5, marginTop: 3, color: '#fca5a5' }}>{r.failures.join('；')}</div>
+                )}
+                {r.prediction.fixHint && (
+                  <div style={{ fontSize: 12.5, marginTop: 3, color: '#facc15' }}>💡 {r.prediction.fixHint}</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
