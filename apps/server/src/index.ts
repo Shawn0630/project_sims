@@ -4,10 +4,13 @@ import { cors } from 'hono/cors';
 import process from 'node:process';
 import {
   attachCaseFixes,
+  buildSchemaSimSummary,
   checkStructure,
   reviewSchema,
   runSuite,
+  simulateSchema,
   validateEditOps,
+  type SchemaSimResult,
 } from '@sds/checker';
 import type { ExecutedScenario, StructuralFindingLike } from '@sds/driver';
 import type { ProblemSchema } from '@sds/problems';
@@ -39,6 +42,11 @@ import { registerGenerationRoutes } from './generate';
  *   GET  /api/problems            problem packs (hidden cases stripped)
  *   GET  /api/problems/:id        one pack (hidden cases stripped)
  *   POST /api/submissions/judge   code judging + structural + schema signals
+ *   POST /api/schema/simulate     run the problem's requirement workload
+ *                                 against a candidate schema (the schema
+ *                                 simulator: paths, measured latencies,
+ *                                 shard load, ×10 growth) — display-grade
+ *                                 evidence, NOT part of submission scoring
  *   POST /api/submissions/verify-probes
  *                                 run LLM-proposed probe cases through the
  *                                 simulator and grade their predictions
@@ -179,6 +187,33 @@ app.post('/api/submissions/judge', async (c) => {
   return c.json({ problemId: problem.id, suite, structural, schemaSignals });
 });
 
+// --------------------------------------------------------- schema simulate -
+// The schema simulator: RUN the problem's requirement workload (its
+// access patterns at their declared rates) against the candidate schema
+// and report measured paths / latencies / rows examined / shard load at
+// current scale and at ×10 data growth. One code path (@sds/checker
+// simulateSchema) serves the design-time panel and the submit-time
+// review evidence alike. Design-time instrument only — submission
+// scoring does not consume it.
+function isSchema(v: unknown): v is ProblemSchema {
+  const s = v as ProblemSchema | null;
+  return !!s && Array.isArray(s.tables);
+}
+
+app.post('/api/schema/simulate', async (c) => {
+  const body = (await c.req.json().catch(() => null)) as {
+    problemId?: unknown;
+    schema?: unknown;
+  } | null;
+  if (!body || typeof body.problemId !== 'string' || !isSchema(body.schema)) {
+    return c.json(badRequest('需要 { problemId: string, schema: { tables: [...] } }'), 400);
+  }
+  const problem = await storage.getProblem(body.problemId);
+  if (!problem) return c.json({ error: 'problem_not_found' }, 404);
+  const sim = simulateSchema(problem, body.schema);
+  return c.json({ problemId: problem.id, sim });
+});
+
 // ------------------------------------------------------- probe verification -
 // The LLM proposes probe cases from the judging criteria (POST /api/evaluate
 // kind=probe); this endpoint is the arbiter: each proposal is re-validated,
@@ -309,6 +344,7 @@ app.post('/api/evaluate', async (c) => {
   // computes the deterministic signals itself, so the frontend never has to.
   const raw = ctx as {
     problemName?: string;
+    problemId?: string;
     schemaSummary?: string;
     signals?: unknown;
     schema?: ProblemSchema;
@@ -322,12 +358,23 @@ app.post('/api/evaluate', async (c) => {
   if (!signals) {
     return c.json(badRequest('schema 评定需要 context.signals 或 context.schema'), 400);
   }
+  // Schema simulation, recomputed HERE from the submitted schema (the
+  // frontend's displayed numbers are display-only; the review cites only
+  // server-recomputed measurements — the same trust model as judging).
+  // Needs the pack for its requirement workload: the client names it via
+  // context.problemId; an unresolvable id simply skips the sim.
+  let schemaSim: SchemaSimResult | null = null;
+  if (raw.schema && typeof raw.problemId === 'string') {
+    const problem = await storage.getProblem(raw.problemId).catch(() => null);
+    if (problem) schemaSim = simulateSchema(problem, raw.schema);
+  }
   const outcome = await evaluateSchema(
     {
       problemName: raw.problemName ?? '',
       schemaSummary:
         raw.schemaSummary ?? (raw.schema ? buildSchemaSummary(raw.schema) : ''),
       signals: signals as Parameters<typeof evaluateSchema>[0]['signals'],
+      ...(schemaSim ? { simSummary: buildSchemaSimSummary(schemaSim) } : {}),
     },
     profileId,
     // The submitted schema + the checker's full report feed the action
@@ -338,7 +385,13 @@ app.post('/api/evaluate', async (c) => {
   );
   // When the server computed the signals, return the full checker report too
   // so the client can render the per-pattern table without judging locally.
-  return c.json({ kind, ...outcome, ...(report ? { schemaSignals: report } : {}) });
+  // The recomputed schema sim rides along for the 数据库评审 tab.
+  return c.json({
+    kind,
+    ...outcome,
+    ...(report ? { schemaSignals: report } : {}),
+    ...(schemaSim ? { schemaSim } : {}),
+  });
 });
 
 app.notFound((c) => c.json({ error: 'not_found' }, 404));

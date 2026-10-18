@@ -550,6 +550,14 @@ export interface SchemaAssessmentContext {
   schemaSummary: string;
   /** Deterministic signals from @sds/checker (paths, latencies, findings). */
   signals: SchemaReviewLike;
+  /**
+   * Measured summary from the schema SIMULATOR (@sds/checker
+   * simulateSchema), recomputed server-side from the submitted schema —
+   * never trusted from the client. When present it is the review's
+   * primary numeric evidence: the workload actually ran, at current
+   * scale and at ×10 data growth.
+   */
+  simSummary?: string;
 }
 
 /** One schema improvement suggestion, with its (guaranteed) schema-ops. */
@@ -889,6 +897,9 @@ export function buildSchemaPrompt(ctx: SchemaAssessmentContext): { system: strin
       '你是一位资深系统设计面试官，在评审候选人的数据库设计。代码规则已经给出每条访问模式的路径与延迟估算（可信信号），你的任务是给出结论与改进建议：能否满足需求、延迟从哪来、怎么 scale。引用信号里的具体数字，不要编造。只输出 JSON。',
     user:
       `题目：${ctx.problemName}\n候选人的 schema：\n${ctx.schemaSummary}\n\n` +
+      (ctx.simSummary
+        ? `数据库模拟实测（服务端按题目需求把访问模式真跑了一遍，比公式估算更可信，引用数字优先用这组）：\n${ctx.simSummary}\n\n`
+        : '') +
       `代码规则信号：得分 ${ctx.signals.score}，${ctx.signals.coverage}\n逐条访问模式：\n` +
       ctx.signals.perPattern.map((p) => `- ${p.pattern}：${p.path} · 约 ${p.latencyMs}ms · ${p.verdict}${p.note ? `（${p.note}）` : ''}`).join('\n') +
       `\n规则发现：\n${ctx.signals.findings.map((f) => `- [${f.dimension}/${f.severity}] ${f.text}`).join('\n') || '（无）'}\n\n` +
