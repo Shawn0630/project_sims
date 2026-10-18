@@ -1,3 +1,4 @@
+import type { EditOp } from '@sds/driver';
 import type { ProblemDef, TestCase } from '@sds/problems';
 import { SimulationEngine, type Design, type MetricsSnapshot } from '@sds/sim-core';
 
@@ -11,6 +12,19 @@ export interface CaseMeasured {
   queueDepthMax: number;
 }
 
+/**
+ * A one-click improvement attached to a FAILED case: a structural finding
+ * that plausibly explains the failure, with its fix expressed as
+ * already-validated edit ops (see caseFixes.ts for the linking rules and
+ * edits.ts for validation). `findingId` is `<ruleId>#<index>` — the
+ * finding's position in the same judge response's structural array.
+ */
+export interface CaseFix {
+  findingId: string;
+  title: string;
+  actions: EditOp[];
+}
+
 export interface CaseResult {
   caseId: string;
   name: string;
@@ -19,6 +33,12 @@ export interface CaseResult {
   measured: CaseMeasured;
   failures: string[];
   hint?: string;
+  /**
+   * Actionable fixes linked to this failure (attachCaseFixes). Present on
+   * every FAILED case — possibly an empty array when no finding plausibly
+   * explains the failure; absent on passed cases.
+   */
+  fixes?: CaseFix[];
 }
 
 export interface SuiteResult {

@@ -168,6 +168,14 @@ export interface CaseMeasuredDTO {
   queueDepthMax: number;
 }
 
+/** A one-click fix linked to a failed case (a structural finding + its validated ops). */
+export interface CaseFixDTO {
+  /** `<ruleId>#<index>` — the finding's slot in the judge response's structural array. */
+  findingId: string;
+  title: string;
+  actions: EditOpDTO[];
+}
+
 export interface CaseResultDTO {
   caseId: string;
   name: string;
@@ -176,6 +184,8 @@ export interface CaseResultDTO {
   measured: CaseMeasuredDTO;
   failures: string[];
   hint?: string;
+  /** Fixes linked to this failure; present (maybe empty) on failed cases only. */
+  fixes?: CaseFixDTO[];
 }
 
 export interface SuiteResultDTO {

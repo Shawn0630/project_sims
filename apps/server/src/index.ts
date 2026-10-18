@@ -2,7 +2,13 @@ import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import process from 'node:process';
-import { checkStructure, reviewSchema, runSuite, validateEditOps } from '@sds/checker';
+import {
+  attachCaseFixes,
+  checkStructure,
+  reviewSchema,
+  runSuite,
+  validateEditOps,
+} from '@sds/checker';
 import type { ExecutedScenario, StructuralFindingLike } from '@sds/driver';
 import type { ProblemSchema } from '@sds/problems';
 import type { Design } from '@sds/sim-core';
@@ -132,11 +138,16 @@ app.post('/api/submissions/judge', async (c) => {
   if (!problem) return c.json({ error: 'problem_not_found' }, 404);
 
   const design: Design = body.design;
-  const suite = runSuite(problem, design);
+  const rawFindings = checkStructure(problem, design);
+  // Failed case rows carry their own one-click fixes: the structural
+  // findings that plausibly explain each failure (grounded linkage only —
+  // see attachCaseFixes in @sds/checker), so the fix loop can start from
+  // the failing row itself. Actions are re-validated at attach time.
+  const suite = attachCaseFixes(problem, design, runSuite(problem, design), rawFindings);
   // Canned fix actions are built from this very design, but re-validate
   // before responding anyway: only ops that survive validation against
   // the submitted design may ever be offered as one-click fixes.
-  const structural: StructuralFindingLike[] = checkStructure(problem, design).map((f) => {
+  const structural: StructuralFindingLike[] = rawFindings.map((f) => {
     const actions = validateEditOps(f.actions, design);
     const { actions: _canned, ...rest } = f;
     return actions.length ? { ...rest, actions } : rest;

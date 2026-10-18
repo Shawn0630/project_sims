@@ -1076,6 +1076,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                   onQuickSim={(tc) => void quickSimCase(tc)}
                   onStopSim={stopQuickSim}
                   onPinToggle={(tc) => void pinCase(tc)}
+                  onApplyFix={enterPreview}
                 />
                 <h4 style={{ margin: '18px 0 8px' }}>🧱 结构检查（确定性规则，不依赖 LLM）</h4>
                 <StructuralList
@@ -1465,6 +1466,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                       onQuickSim={(tc) => void quickSimCase(tc)}
                       onStopSim={stopQuickSim}
                       onPinToggle={(tc) => void pinCase(tc)}
+                      onApplyFix={enterPreview}
                     />
                     {/* Probe step: LLM-proposed cases, simulator-verified. */}
                     <ProbeSection

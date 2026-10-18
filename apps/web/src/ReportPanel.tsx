@@ -34,6 +34,8 @@ interface CaseListProps {
   onQuickSim: (tc: ProblemCaseDTO) => void;
   onStopSim: () => void;
   onPinToggle: (tc: ProblemCaseDTO) => void;
+  /** Enter the fix preview for a case-linked finding's validated actions. */
+  onApplyFix?: (title: string, actions: EditOpDTO[]) => void;
 }
 
 /**
@@ -41,7 +43,9 @@ interface CaseListProps {
  * cases stay locked until a submission reveals them. Once judged, each row
  * shows measured-vs-threshold, failure explanations, and the fix-loop
  * actions: ▶ 快速模拟 (local visual re-run of this case's scenario on the
- * current design — never a re-judge) and 📌 pinning to the scenario bar.
+ * current design — never a re-judge), 📌 pinning to the scenario bar, and —
+ * on failed rows — ✨ buttons for the case-linked structural fixes the
+ * server attached to this result (same preview/apply flow as finding cards).
  */
 export function CaseList(props: CaseListProps) {
   const { problem, suite } = props;
@@ -110,6 +114,19 @@ export function CaseList(props: CaseListProps) {
             )}
             {r && !r.passed && r.hint && (
               <div style={{ fontSize: 12.5, color: '#facc15', marginTop: 4 }}>💡 {r.hint}</div>
+            )}
+            {r && !r.passed && props.onApplyFix && r.fixes && r.fixes.length > 0 && (
+              <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+                {r.fixes.map((fix) => (
+                  <button
+                    key={fix.findingId}
+                    onClick={() => props.onApplyFix!(fix.title, fix.actions)}
+                    title="预览这条结构缺陷的修复改动，确认后才应用到设计"
+                  >
+                    ✨ 应用此改进（{fix.title}）
+                  </button>
+                ))}
+              </div>
             )}
           </div>
         );
