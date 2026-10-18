@@ -155,6 +155,10 @@ export type EditOpDTO =
       componentType: ComponentTypeId;
       connectFromId?: string;
       connectToId?: string;
+      /** Id the created node will carry — lets later ops in the same
+       *  list chain onto it (queue insert, then its worker). Server
+       *  validation stamps it; apply honors it verbatim. */
+      newNodeId?: string;
     }
   | { op: 'addEdge'; fromId: string; toId: string };
 

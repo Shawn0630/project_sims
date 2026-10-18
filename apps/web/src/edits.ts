@@ -12,7 +12,8 @@ import type { EditOpDTO } from './api';
  *     server-validated) actions against the CURRENT design: if the user
  *     edited the graph since the finding was generated, ops pointing at
  *     vanished nodes are dropped; if nothing survives, applying is
- *     refused gracefully.
+ *     refused gracefully. The re-check is sequential — an op may chain
+ *     onto a node an earlier op in the same list creates (newNodeId).
  *   applyActions   — PURE: returns the would-be design plus plain-language
  *     change descriptions and highlight marks. The committed design state
  *     is only replaced when the user confirms the preview.
@@ -41,24 +42,61 @@ const LEGAL_KEYS: Partial<Record<ComponentTypeId, string[]>> = {
 };
 
 export function recheckActions(actions: EditOpDTO[], design: Design): EditOpDTO[] {
+  // Sequential, mirroring the server's progressive validation: an op may
+  // reference a node an EARLIER op in the same list creates (chained
+  // inserts via newNodeId), so existence is checked against the working
+  // graph, not just the committed design. An insert whose declared
+  // newNodeId is already taken (e.g. this fix was already applied) is
+  // stale and drops — and POISONS the id, because later ops chained to
+  // it would be ambiguous about which node they mean.
   const ids = new Set(design.nodes.map((n) => n.id));
+  const typeById = new Map(design.nodes.map((n) => [n.id, n.type]));
   const edges = new Set(design.edges.map((e) => `${e.from}→${e.to}`));
-  return actions.filter((op) => {
+  const poisoned = new Set<string>();
+  const out: EditOpDTO[] = [];
+  for (const op of actions) {
     if (op.op === 'setSetting') {
-      const node = design.nodes.find((n) => n.id === op.nodeId);
-      if (!node || node.type === 'client') return false;
-      return (LEGAL_KEYS[node.type] ?? ['replicas', 'capacityScale']).includes(op.key);
+      if (poisoned.has(op.nodeId)) continue;
+      const type = typeById.get(op.nodeId);
+      if (!type || type === 'client') continue;
+      if (!(LEGAL_KEYS[type] ?? ['replicas', 'capacityScale']).includes(op.key)) continue;
+      out.push(op);
+    } else if (op.op === 'addComponent') {
+      const declared = op.newNodeId;
+      const badRef = (id?: string) => !!id && (poisoned.has(id) || !ids.has(id));
+      if (
+        !(op.componentType in COMPONENT_MAP) ||
+        (!op.connectFromId && !op.connectToId) ||
+        badRef(op.connectFromId) ||
+        badRef(op.connectToId) ||
+        (op.connectFromId && op.connectFromId === op.connectToId) ||
+        (declared !== undefined && ids.has(declared))
+      ) {
+        if (declared !== undefined) poisoned.add(declared);
+        continue;
+      }
+      // Bookkeeping id for the created node: the declared id when given
+      // (later ops reference exactly it), else a synthetic placeholder no
+      // later op can name — matching apply, which generates a fresh id.
+      const createdId = declared ?? ` pending#${out.length}`;
+      out.push(op);
+      ids.add(createdId);
+      typeById.set(createdId, op.componentType);
+      if (op.connectFromId && op.connectToId) {
+        edges.delete(`${op.connectFromId}→${op.connectToId}`);
+      }
+      if (op.connectFromId) edges.add(`${op.connectFromId}→${createdId}`);
+      if (op.connectToId) edges.add(`${createdId}→${op.connectToId}`);
+    } else {
+      if (poisoned.has(op.fromId) || poisoned.has(op.toId)) continue;
+      if (!ids.has(op.fromId) || !ids.has(op.toId) || op.fromId === op.toId) continue;
+      const key = `${op.fromId}→${op.toId}`;
+      if (edges.has(key)) continue;
+      edges.add(key);
+      out.push(op);
     }
-    if (op.op === 'addComponent') {
-      if (!(op.componentType in COMPONENT_MAP)) return false;
-      if (op.connectFromId && !ids.has(op.connectFromId)) return false;
-      if (op.connectToId && !ids.has(op.connectToId)) return false;
-      return !!(op.connectFromId || op.connectToId);
-    }
-    return (
-      ids.has(op.fromId) && ids.has(op.toId) && op.fromId !== op.toId && !edges.has(`${op.fromId}→${op.toId}`)
-    );
-  });
+  }
+  return out;
 }
 
 const KEY_LABELS: Record<string, string> = {
@@ -129,7 +167,10 @@ export function applyActions(design: Design, ops: EditOpDTO[]): PreviewPlan {
     } else if (op.op === 'addComponent') {
       const from = op.connectFromId ? nodeById.get(op.connectFromId) : undefined;
       const to = op.connectToId ? nodeById.get(op.connectToId) : undefined;
-      const id = newId(op.componentType);
+      // Honor the validation-stamped id so chained ops wire up exactly
+      // as previewed/validated; fresh id when absent or already taken.
+      const id =
+        op.newNodeId && !nodeById.has(op.newNodeId) ? op.newNodeId : newId(op.componentType);
       let x = 480;
       let y = 300;
       if (from && to) {

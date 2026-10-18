@@ -22,12 +22,21 @@ import {
  *                     type-checked and range-clamped, inserted component
  *                     type is real, endpoints exist, no duplicate edges.
  *                     Invalid ops drop individually; at most MAX_EDIT_OPS
- *                     survive.
+ *                     survive. Validation is PROGRESSIVE: each surviving
+ *                     op is applied to a working copy before the next is
+ *                     checked, so an op may reference a node an earlier
+ *                     op in the same list creates (chained inserts). An
+ *                     addComponent's created node gets a stable id here —
+ *                     a declared `newNodeId` is adopted when legal and
+ *                     collision-free, otherwise one is assigned — and the
+ *                     id is stamped into the returned op so apply wires
+ *                     the chain exactly as validated.
  *   applyEditOps    — pure application (input never mutated). addComponent
  *                     inserts BETWEEN its two endpoints: the new edges
  *                     from→new and new→to are added, and a direct from→to
  *                     edge, when present, is removed so traffic actually
- *                     flows through the inserted component.
+ *                     flows through the inserted component. The created
+ *                     node carries the op's newNodeId when present.
  *   describeEditOp  — plain-language rendering of one op against a design.
  *
  * The web app mirrors apply/describe for its local preview (it cannot
@@ -99,49 +108,78 @@ function coerceValue(
   }
 }
 
+/** Legal shape for a declared new-node id (ids are graph keys, keep them tame). */
+const NEW_NODE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
 /**
  * Validate proposed ops against a design. Returns the surviving ops
- * (values coerced/clamped), in order, capped at MAX_EDIT_OPS.
+ * (values coerced/clamped, created-node ids stamped), in order, capped
+ * at MAX_EDIT_OPS. Checks run against a progressively-updated working
+ * copy: an op may reference nodes created by earlier ops in the list.
+ * A declared newNodeId that is malformed or already taken drops its op
+ * and POISONS the id — later references to it are ambiguous (they might
+ * mean the pre-existing node), so they drop too.
  */
 export function validateEditOps(
   ops: readonly EditOp[] | undefined,
   design: Design,
 ): EditOp[] {
   if (!ops || !ops.length) return [];
-  const nodeById = new Map(design.nodes.map((n) => [n.id, n]));
-  const plannedEdges = new Set(design.edges.map((e) => `${e.from}→${e.to}`));
+  let working: Design = structuredClone(design);
+  const poisoned = new Set<string>();
   const out: EditOp[] = [];
   for (const op of ops) {
     if (out.length >= MAX_EDIT_OPS) break;
+    const nodeById = new Map(working.nodes.map((n) => [n.id, n]));
     if (op.op === 'setSetting') {
+      if (poisoned.has(op.nodeId)) continue;
       const node = nodeById.get(op.nodeId);
       if (!node) continue;
       const rule = settingRuleFor(node.type, op.key);
       if (!rule) continue;
       const value = coerceValue(rule, op.value);
       if (value === undefined) continue;
-      out.push({ op: 'setSetting', nodeId: op.nodeId, key: op.key, value });
+      const valid: EditOp = { op: 'setSetting', nodeId: op.nodeId, key: op.key, value };
+      out.push(valid);
+      working = applyEditOps(working, [valid]);
     } else if (op.op === 'addComponent') {
       if (!(op.componentType in COMPONENT_MAP)) continue;
       const from = op.connectFromId;
       const to = op.connectToId;
+      if (from && poisoned.has(from)) continue;
+      if (to && poisoned.has(to)) continue;
       if (from && !nodeById.has(from)) continue;
       if (to && !nodeById.has(to)) continue;
       if (!from && !to) continue;
       if (from && to && from === to) continue;
-      out.push({
+      let createdId: string;
+      if (op.newNodeId !== undefined) {
+        if (!NEW_NODE_ID_RE.test(op.newNodeId) || nodeById.has(op.newNodeId)) {
+          poisoned.add(op.newNodeId);
+          continue;
+        }
+        createdId = op.newNodeId;
+      } else {
+        createdId = newId(op.componentType);
+        while (nodeById.has(createdId)) createdId = newId(op.componentType);
+      }
+      const valid: EditOp = {
         op: 'addComponent',
         componentType: op.componentType,
         ...(from ? { connectFromId: from } : {}),
         ...(to ? { connectToId: to } : {}),
-      });
+        newNodeId: createdId,
+      };
+      out.push(valid);
+      working = applyEditOps(working, [valid]);
     } else if (op.op === 'addEdge') {
+      if (poisoned.has(op.fromId) || poisoned.has(op.toId)) continue;
       if (!nodeById.has(op.fromId) || !nodeById.has(op.toId)) continue;
       if (op.fromId === op.toId) continue;
-      const key = `${op.fromId}→${op.toId}`;
-      if (plannedEdges.has(key)) continue;
-      plannedEdges.add(key);
-      out.push({ op: 'addEdge', fromId: op.fromId, toId: op.toId });
+      if (working.edges.some((e) => e.from === op.fromId && e.to === op.toId)) continue;
+      const valid: EditOp = { op: 'addEdge', fromId: op.fromId, toId: op.toId };
+      out.push(valid);
+      working = applyEditOps(working, [valid]);
     }
   }
   return out;
@@ -162,7 +200,11 @@ export function applyEditOps(design: Design, ops: readonly EditOp[]): Design {
     } else if (op.op === 'addComponent') {
       const from = op.connectFromId ? nodeById.get(op.connectFromId) : undefined;
       const to = op.connectToId ? nodeById.get(op.connectToId) : undefined;
-      const id = newId(op.componentType);
+      // Honor the id validation stamped (or the author declared) so a
+      // chained list wires up exactly as validated; fall back to a fresh
+      // id when it's absent or somehow already taken in this design.
+      const id =
+        op.newNodeId && !nodeById.has(op.newNodeId) ? op.newNodeId : newId(op.componentType);
       let x = 480;
       let y = 300;
       if (from && to) {

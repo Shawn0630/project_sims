@@ -102,6 +102,16 @@ export type EditOp =
        *  endpoints are given and a direct edge between them exists, that
        *  edge is replaced by the two hops through the new node. */
       connectToId?: string;
+      /**
+       * The id the created node will carry. Declaring it lets a LATER op
+       * in the same list reference the new node — chained inserts, e.g.
+       * insert a queue (newNodeId "q1") and then the worker consuming it
+       * (connectFromId "q1"). Validation adopts a legal, collision-free
+       * declared id or assigns one itself; either way the validated op
+       * carries the id and apply honors it verbatim, so a chain is wired
+       * exactly as validated.
+       */
+      newNodeId?: string;
     }
   | { op: 'addEdge'; fromId: string; toId: string };
 
@@ -132,11 +142,13 @@ export function sanitizeEditOps(raw: unknown): EditOp[] {
       const to = isId(o.connectToId) ? String(o.connectToId) : undefined;
       if (!from && !to) continue;
       if (from && to && from === to) continue;
+      const newNodeId = isId(o.newNodeId) ? String(o.newNodeId) : undefined;
       out.push({
         op: 'addComponent',
         componentType: String(o.componentType) as ComponentTypeId,
         ...(from ? { connectFromId: from } : {}),
         ...(to ? { connectToId: to } : {}),
+        ...(newNodeId ? { newNodeId } : {}),
       });
     } else if (o.op === 'addEdge') {
       if (isId(o.fromId) && isId(o.toId) && o.fromId !== o.toId) {
@@ -700,7 +712,7 @@ export function buildSubmissionPrompt(ctx: SubmissionAssessmentContext): { syste
       `\n\n结构缺陷（确定性规则，可信）：\n${ctx.structuralFindings.map((f) => `- [${f.severity}] ${f.title}：${f.detail}`).join('\n') || '（无）'}\n\n` +
       `每条 finding 可选附带 actions：一键可应用的结构化改法（用户预览确认后由系统执行），只能用这三种操作，且 nodeId 必须引用上面设计摘要里出现的 id：\n` +
       `- {"op":"setSetting","nodeId":"节点id","key":"参数名","value":值}：参数名只能是该组件类型合法的参数——通用 replicas（整数）/ capacityScale；网关 rateLimitPerSec；缓存 mutexRebuild（布尔）/ eviction；负载均衡 lbAlgorithm；关系型 DB 与 NoSQL 的 sharded（布尔）/ shardKey（字符串）/ readReplicas（整数）/ consistency。\n` +
-      `- {"op":"addComponent","componentType":"cache","connectFromId":"上游节点id","connectToId":"下游节点id"}：在两个已有节点之间插入一个新组件（两端 id 至少给一个）。\n` +
+      `- {"op":"addComponent","componentType":"cache","connectFromId":"上游节点id","connectToId":"下游节点id"}：在两个已有节点之间插入一个新组件（两端 id 至少给一个）。要把两个新组件串成链（例如先插队列、再插消费它的 Worker），给第一个 addComponent 写 "newNodeId":"自取的id"，后续操作用这个 id 引用新节点。\n` +
       `- {"op":"addEdge","fromId":"节点id","toId":"节点id"}：新增一条连线。\n` +
       `修法无法用这三种操作准确表达时，省略 actions，不要硬凑；每条 finding 最多 3 个操作。\n\n` +
       `输出 JSON：{"summary":"2-3 句总评","scoreRationale":"为什么是这个分数：失分集中在哪、先修哪个涨分最快","findings":[{"severity":"high|medium|low","title":"…","detail":"…","actions":[{"op":"setSetting","nodeId":"…","key":"replicas","value":2}]}]}`,
@@ -787,7 +799,7 @@ export function buildProbePrompt(ctx: ProbeContext): { system: string; user: str
       `${PROBE_CRITERIA}\n\n` +
       `输出 JSON：{"cases":[{"name":"用例名（点明场景）","scenario":{"trafficMultiplier":3,"durationSec":40,"readRatio":0.9,"events":[{"type":"viral_post","targetType":"feedservice","magnitude":3}],"kills":["appserver"]},"thresholds":{"p99Ms":1000,"maxErrorRatePct":1,"maxCostPerHour":900},"prediction":{"willFail":true,"primaryBreach":"错误率超标","rationale":"为什么这个场景会先打爆这一层","fixHint":"候选人该怎么改","actions":[{"op":"addComponent","componentType":"queue","connectFromId":"发帖节点id","connectToId":"存储节点id"}]}}]}\n` +
       `scenario 的 events/kills 可省略或为空数组；thresholds 至少给一项（可选项：p99Ms / maxErrorRatePct / maxCostPerHour / maxStorageQps / maxHottestUtilPct / maxStaleReadPct / maxQueueDepth）；prediction.willFail=false 时 primaryBreach 必须为「无」。\n` +
-      `prediction.actions 是 fixHint 的结构化版本（可选，用户一键应用）：只能用 setSetting / addComponent / addEdge 三种操作，nodeId 只能引用设计摘要里出现的 id，setSetting 的 key 只能是该组件类型合法的参数（replicas / capacityScale / rateLimitPerSec / mutexRebuild / eviction / lbAlgorithm / sharded / shardKey / readReplicas / consistency）。表达不了就省略，不要硬凑；每条最多 3 个操作。`,
+      `prediction.actions 是 fixHint 的结构化版本（可选，用户一键应用）：只能用 setSetting / addComponent / addEdge 三种操作，nodeId 只能引用设计摘要里出现的 id，setSetting 的 key 只能是该组件类型合法的参数（replicas / capacityScale / rateLimitPerSec / mutexRebuild / eviction / lbAlgorithm / sharded / shardKey / readReplicas / consistency）。需要串联两个新组件时，给第一个 addComponent 写 newNodeId 并在后续操作中引用它。表达不了就省略，不要硬凑；每条最多 3 个操作。`,
   };
 }
 

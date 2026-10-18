@@ -137,16 +137,104 @@ export function checkStructure(problem: ProblemDef, design: Design): StructuralF
   }
 
   // --- Synchronous fan-out --------------------------------------------------
-  if (problem.flags.hasFanout && ofType(design, 'queue').length === 0) {
-    const feed = [...ofType(design, 'feedservice'), ...ofType(design, 'appserver')];
-    push({
-      ruleId: 'sync-fanout',
-      severity: 'high',
-      title: 'fan-out 是同步的：发帖直写存储，没有队列削峰',
-      detail: '大 V 发帖时，一次写会被放大成成千上万次时间线写入。同步做，这些写会瞬间打满存储；异步做（队列 + Worker），同样的总量可以摊到几十秒内消化。',
-      componentIds: feed.map((f) => f.id),
-      exposedBy: problem.testCases.find((c) => c.exposesRule === 'sync-fanout')?.id,
-    });
+  if (problem.flags.hasFanout) {
+    const services = [...ofType(design, 'feedservice'), ...ofType(design, 'appserver')];
+    const fanoutStorage = design.nodes.filter(
+      (n) => componentDef(n.type).behavior === 'storage' && n.type !== 'objectstorage',
+    );
+    const queues = ofType(design, 'queue');
+    const workers = ofType(design, 'worker');
+    const hasEdge = (from: string, to: string) =>
+      design.edges.some((e) => e.from === from && e.to === to);
+    // Classify each fan-out write path out of a service: a DIRECT edge
+    // into storage (the synchronous path), or a queue the service feeds
+    // that itself writes to storage. A path is 'ready' only when a
+    // worker already drains its queue into the storage; 'buffered' when
+    // a queue sits on the path but nobody consumes it toward storage.
+    interface FanoutPath {
+      svc: DesignNode;
+      store: DesignNode;
+      queue?: DesignNode;
+      state: 'sync' | 'buffered' | 'ready';
+    }
+    const paths: FanoutPath[] = [];
+    for (const svc of services) {
+      for (const store of fanoutStorage) {
+        const queue = queues.find((q) => hasEdge(svc.id, q.id));
+        const workerDrains =
+          !!queue && workers.some((w) => hasEdge(queue.id, w.id) && hasEdge(w.id, store.id));
+        if (hasEdge(svc.id, store.id)) {
+          paths.push({
+            svc,
+            store,
+            ...(queue ? { queue } : {}),
+            state: workerDrains ? 'ready' : 'sync',
+          });
+        } else if (queue && hasEdge(queue.id, store.id) && !workerDrains) {
+          paths.push({ svc, store, queue, state: 'buffered' });
+        }
+      }
+    }
+    // The finding fires while fan-out still writes synchronously: some
+    // path is not 'ready' — or (the legacy condition) the design has no
+    // queue anywhere at all.
+    if (paths.some((p) => p.state !== 'ready') || (queues.length === 0 && services.length > 0)) {
+      // Canned fix, when the remedy is mechanically expressible on one of
+      // the sync paths: build service → queue → worker → storage. The
+      // queue insert declares newNodeId so the worker insert chains onto
+      // the node it creates. When queue + worker already serve the path
+      // the remaining sync edge can't be removed with this vocabulary
+      // (no delete ops), so the finding stays text-only there.
+      let actions: EditOp[] | undefined;
+      let anchor: FanoutPath | undefined;
+      for (const p of paths) {
+        if (p.state === 'ready') continue;
+        if (p.queue) {
+          // A queue already buffers this path but nobody consumes it
+          // toward storage — the worker insert alone completes the chain.
+          actions = [
+            {
+              op: 'addComponent',
+              componentType: 'worker',
+              connectFromId: p.queue.id,
+              connectToId: p.store.id,
+            },
+          ];
+        } else {
+          actions = [
+            {
+              op: 'addComponent',
+              componentType: 'queue',
+              connectFromId: p.svc.id,
+              connectToId: p.store.id,
+              newNodeId: 'fix-fanout-queue',
+            },
+            {
+              op: 'addComponent',
+              componentType: 'worker',
+              connectFromId: 'fix-fanout-queue',
+              connectToId: p.store.id,
+            },
+          ];
+        }
+        anchor = p;
+        break;
+      }
+      const componentIds = new Set(services.map((s) => s.id));
+      if (anchor) {
+        componentIds.add(anchor.store.id);
+        if (anchor.queue) componentIds.add(anchor.queue.id);
+      }
+      push({
+        ruleId: 'sync-fanout',
+        severity: 'high',
+        title: 'fan-out 是同步的：发帖直写存储，没有队列削峰',
+        detail: '大 V 发帖时，一次写会被放大成成千上万次时间线写入。同步做，这些写会瞬间打满存储；异步做（队列 + Worker），同样的总量可以摊到几十秒内消化。',
+        componentIds: [...componentIds],
+        exposedBy: problem.testCases.find((c) => c.exposesRule === 'sync-fanout')?.id,
+        ...(actions ? { actions } : {}),
+      });
+    }
   }
 
   // --- Queue / worker pairing ----------------------------------------------
