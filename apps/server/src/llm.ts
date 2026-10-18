@@ -6,6 +6,7 @@ import {
   buildGenerationPrompt,
   buildNextStepsPrompt,
   buildProbePrompt,
+  buildSchemaProbePrompt,
   buildSchemaPrompt,
   buildSubmissionPrompt,
   buildWholeProblemPrompt,
@@ -14,6 +15,7 @@ import {
   parseNextSteps,
   parseProbeCases,
   parseSchemaAssessment,
+  parseSchemaProbes,
   parseSubmissionAssessment,
   parseWholeProblem,
   type ActionCoverage,
@@ -28,6 +30,8 @@ import {
   type ProbeContext,
   type SchemaAssessment,
   type SchemaAssessmentContext,
+  type SchemaProbeCase,
+  type SchemaProbeContext,
   type SchemaReviewLike,
   type SubmissionAssessment,
   type SubmissionAssessmentContext,
@@ -39,6 +43,7 @@ import {
   guaranteeNextStepActions,
   guaranteePredictionActions,
   guaranteeSchemaActions,
+  guaranteeSchemaPredictionActions,
   type RepairCall,
 } from './actions';
 import { appendCall } from './calllog';
@@ -85,7 +90,14 @@ export interface LlmConfig {
   model: string;
 }
 
-export type EvaluateKind = 'submission' | 'schema' | 'followups' | 'probe' | 'next-steps';
+export type EvaluateKind =
+  | 'submission'
+  | 'schema'
+  | 'followups'
+  | 'probe'
+  | 'next-steps'
+  | 'schema-probe'
+  | 'schema-next-steps';
 
 export interface EvaluateOutcome<T> {
   source: 'llm' | 'scripted';
@@ -582,6 +594,46 @@ export async function evaluateProbes(
         ...(problem ? { problem } : {}),
         problemName: ctx.problemName,
         designSummary: ctx.designSummary,
+      });
+      return { data: r.cases, coverage: r.coverage };
+    },
+  );
+}
+
+/**
+ * The schema probe step: the model proposes adversarial DATA scenarios
+ * for this schema from the judging criteria + sim measurements alone
+ * (it never sees the static schema cases). Predictions' fix actions run
+ * the schema ladder here, and AGAIN inside verify-schema-probes after
+ * the cases round-trip the client (schemaprobe.ts) — nothing untrusted
+ * ships. Verification re-runs the schema simulator per scenario and
+ * grades hit / held / miss.
+ */
+export async function evaluateSchemaProbes(
+  ctx: SchemaProbeContext,
+  profileId?: string,
+  schema?: ProblemSchema,
+  report?: SchemaReviewReport,
+): Promise<EvaluateOutcome<SchemaProbeCase[]>> {
+  const patternIds = new Set(ctx.patterns.map((p) => p.id));
+  const tableNames = new Set<string>([
+    ...ctx.patterns.map((p) => p.table),
+    ...(schema?.tables.map((t) => t.name) ?? []),
+  ]);
+  return runLogged(
+    'schema-probe',
+    ctx,
+    () => buildSchemaProbePrompt(ctx),
+    (json) => parseSchemaProbes(json, patternIds, tableNames),
+    () => scripted.generateSchemaProbes(ctx),
+    profileId,
+    async (data, repairCall, source) => {
+      const r = await guaranteeSchemaPredictionActions(data, schema, {
+        baseSource: source === 'llm' ? 'llm' : 'rule',
+        repairCall,
+        problemName: ctx.problemName,
+        ...(report ? { report } : {}),
+        schemaSummary: ctx.schemaSummary,
       });
       return { data: r.cases, coverage: r.coverage };
     },

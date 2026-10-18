@@ -1102,6 +1102,214 @@ export function parseProbeCases(json: unknown): ProbeCase[] {
   return out;
 }
 
+// ---------------------------------------------------- schema probing ----
+// The database-side mirror of the probe pipeline. The prober reads the
+// judging criteria, the schema, the sim's measured summary and the
+// schema judging results — never the static schema test cases — and
+// proposes adversarial DATA scenarios: data growth, traffic surges, a
+// hot key / skewed value, a flip in which patterns dominate. The server
+// re-runs the schema simulator under each scenario and grades the
+// prediction (hit / held / miss, same 口径 as architecture probes).
+
+export const SCHEMA_PROBE_CRITERIA = `数据库判卷标准（本系统的口径，提场景与做预测都按这套来）：
+- 每条访问模式在场景下的 P99 延迟不得超过本题延迟预算（见上下文给出的预算 ms）；
+- 任何表在场景下的最热分片利用率不得超过 1（超过 = 该表饱和，排队会把所有打到它的查询一起拖慢）；
+- 访问模式的执行路径不得退化为全表扫描或跨分片广播（在当前规模已经如此的模式不算"被场景打坏"，要挑场景真正会改变结论的软肋）；
+- 分片键选错（与主查询字段不对齐、单调递增键）在数据增长或流量倾斜下会先爆：查询逐分片探测、写入全压一个分片。`;
+
+/** One adversarial data scenario, in the schema simulator's own knobs. */
+export interface SchemaProbeScenarioSpec {
+  /** Data rows multiplier (1 = current size). */
+  growthFactor?: number;
+  /** Global traffic multiplier over every pattern's declared rate. */
+  trafficMultiplier?: number;
+  /** Per-pattern traffic multipliers by pattern id (0 = 该模式消失，
+   *  用它表达"流量结构翻转"，如读模式暴涨而写模式归零）。 */
+  patternTraffic?: Record<string, number>;
+  /** Skew: this pattern's traffic concentrates on ONE byField value. */
+  skew?: { patternId: string; concentration: number };
+}
+
+export interface SchemaProbePrediction {
+  willFail: boolean;
+  /** What breaks first: a pattern id or a table name; '无' when passing. */
+  firstBreakKind: 'pattern' | 'table' | '无';
+  firstBreakId: string;
+  /** The metric expected to breach （自由文本，如「P99 延迟」「最热分片利用率」). */
+  metric: string;
+  rationale: string;
+  fixHint: string;
+  /** Structured fix (schema-ops) for a willFail prediction. */
+  fixActions?: SchemaOp[];
+  actionSource?: ActionSource;
+}
+
+export interface SchemaProbeCase {
+  name: string;
+  scenario: SchemaProbeScenarioSpec;
+  prediction: SchemaProbePrediction;
+}
+
+export interface SchemaProbeContext {
+  problemName: string;
+  /** The submitted schema (tables, fields, indexes, shard keys). */
+  schemaSummary: string;
+  /** The schema sim's measured summary of the submitted schema. */
+  simSummary: string;
+  /** The problem's per-pattern P99 budget (ms). */
+  budgetMs: number;
+  /** The pack's access patterns — the only legal pattern ids. */
+  patterns: { id: string; name: string; table: string; kind: string; perSec: number }[];
+  /** Schema judging outcome of this submission (revealed results only). */
+  judgingSummary: string;
+  /** Server-measured hints (also what the scripted fallback builds on):
+   *  the first pattern the sim's ×growth run already fails, the pattern
+   *  closest to the budget now, and the most-loaded table. */
+  growthFailurePatternId?: string;
+  hottestPatternId?: string;
+  hottestTable?: { name: string; util: number };
+}
+
+export type SchemaProbeVerdict = 'hit' | 'held' | 'miss';
+
+export interface VerifiedSchemaProbeResult {
+  name: string;
+  /** Deterministic one-line description of the scenario as executed. */
+  scenarioSummary: string;
+  scenario: SchemaProbeScenarioSpec;
+  prediction: SchemaProbePrediction;
+  verdict: SchemaProbeVerdict;
+  /** True when the schema held under the scenario. */
+  passed: boolean;
+  /** What actually broke first (human line), null when it held. */
+  actualFirstBreak: string | null;
+  measured: {
+    worstPatternId: string | null;
+    worstPatternName: string | null;
+    worstP99Ms: number;
+    maxTableUtil: number;
+    maxSustainableQps: number;
+  };
+  failures: string[];
+}
+
+export function buildSchemaProbePrompt(ctx: SchemaProbeContext): { system: string; user: string } {
+  return {
+    system:
+      '你是一位资深系统设计面试官，正在对候选人的数据库设计做"探测"。你看不到题目的数据库测试用例。你的任务：基于给定的判卷标准、这份 schema 的结构与模拟实测，提出最多 3 个对抗性数据场景（数据倾斜、突发增长、热点行、流量结构翻转等），并对每个场景给出明确、可证伪的预测——哪个访问模式或哪张表会先爆、爆在哪个指标上。随后系统会用数据库模拟器在该场景下真跑一遍，逐条核对你的预测。挑真正的软肋，不要凑数；rationale 必须指向具体结构与数字。只输出 JSON，不要输出其它文字。',
+    user:
+      `题目：${ctx.problemName}\n候选人数据库 schema：\n${ctx.schemaSummary}\n\n` +
+      `数据库模拟实测（当前规模与 ×10 数据量）：\n${ctx.simSummary}\n\n` +
+      `本次提交的数据库判卷结果（确定性用例的已揭示部分）：\n${ctx.judgingSummary}\n\n` +
+      `本题延迟预算：每条访问模式 P99 ≤ ${ctx.budgetMs}ms。\n` +
+      `访问模式目录（scenario 与 firstBreakId 只能引用这里的 id / 表名）：\n${ctx.patterns.map((p) => `- ${p.id}：${p.name}（表 ${p.table}，${p.kind}，约 ${p.perSec}/s）`).join('\n')}\n\n` +
+      `${SCHEMA_PROBE_CRITERIA}\n\n` +
+      `输出 JSON：{"cases":[{"name":"场景名（点明对抗手法）","scenario":{"growthFactor":5,"trafficMultiplier":2,"patternTraffic":{"<模式id>":6},"skew":{"patternId":"<模式id>","concentration":0.9}},"prediction":{"willFail":true,"firstBreakKind":"pattern","firstBreakId":"<模式id 或 表名>","metric":"P99 延迟","rationale":"为什么这个场景会先打爆它（引用实测数字）","fixHint":"该怎么改","fixActions":[{"op":"setShardKey","table":"<表名>","field":"<字段名>"}]}}]}\n` +
+      `scenario 的键都可省略，但至少要给一个有效旋钮（全省略 = 原样重跑，没有意义，会被丢弃）。growthFactor 1–20（数据量倍数）；trafficMultiplier 0.2–10（全局流量倍数）；patternTraffic 是按模式 id 的倍数（可为 0），覆盖全局倍数；skew.concentration 0.5–1（该模式流量集中到单一取值上的比例）。\n` +
+      `prediction.willFail=false 时 firstBreakKind 必须为「无」、firstBreakId 为空字符串。\n` +
+      `prediction.fixActions 是 fixHint 的结构化版本：【动作保证 · 硬性要求】willFail=true 的预测必须给 fixActions（用户一键应用到 schema 草稿）：只能用 setShardKey / addIndex / setPrimaryKeyGen / setEngine 四种操作，table 与 field 必须真实存在于上面的 schema 摘要里，setShardKey 的 field 可为 null（取消分片）。没有合法 fixActions 的失败预测会被判不合格并触发修复轮；willFail=false 的预测不要给 fixActions。每条最多 3 个操作。`,
+  };
+}
+
+/**
+ * Validate + clamp ONE proposed schema probe case. Pattern ids and
+ * table names are checked against the pack's real vocabulary; a case
+ * with no effective scenario knob is rejected (it would just re-run the
+ * base sim). Used for LLM output and for cases round-tripping back to
+ * the server for verification — the server never trusts the client copy.
+ */
+export function normalizeSchemaProbeCase(
+  raw: unknown,
+  validPatternIds: ReadonlySet<string>,
+  tableNames: ReadonlySet<string>,
+): SchemaProbeCase | null {
+  const o = raw as {
+    name?: unknown;
+    scenario?: Record<string, unknown>;
+    prediction?: Record<string, unknown>;
+  } | null;
+  if (!o || typeof o.name !== 'string' || !o.name.trim() || !o.scenario || typeof o.scenario !== 'object') {
+    return null;
+  }
+  const s = o.scenario;
+  const scenario: SchemaProbeScenarioSpec = {};
+  const growth = clampNum(s.growthFactor, 1, 20);
+  if (growth !== undefined && growth !== 1) scenario.growthFactor = growth;
+  const traffic = clampNum(s.trafficMultiplier, 0.2, 10);
+  if (traffic !== undefined && traffic !== 1) scenario.trafficMultiplier = traffic;
+  if (s.patternTraffic && typeof s.patternTraffic === 'object') {
+    const pt: Record<string, number> = {};
+    for (const [k, v] of Object.entries(s.patternTraffic as Record<string, unknown>)) {
+      if (!validPatternIds.has(k)) continue;
+      const m = clampNum(v, 0, 20);
+      if (m !== undefined && m !== 1) pt[k] = m;
+    }
+    if (Object.keys(pt).length) scenario.patternTraffic = pt;
+  }
+  const skewRaw = s.skew as { patternId?: unknown; concentration?: unknown } | undefined;
+  if (skewRaw && validPatternIds.has(String(skewRaw.patternId))) {
+    const concentration = clampNum(skewRaw.concentration, 0.5, 1) ?? 0.9;
+    scenario.skew = { patternId: String(skewRaw.patternId), concentration };
+  }
+  if (Object.keys(scenario).length === 0) return null; // no effective knob
+
+  const p = o.prediction;
+  if (!p || typeof p !== 'object') return null;
+  const willFail = p.willFail === true;
+  let firstBreakKind: SchemaProbePrediction['firstBreakKind'] = '无';
+  let firstBreakId = '';
+  if (willFail) {
+    const kind = String(p.firstBreakKind);
+    const id = String(p.firstBreakId ?? '');
+    if (kind === 'pattern' && validPatternIds.has(id)) {
+      firstBreakKind = 'pattern';
+      firstBreakId = id;
+    } else if (kind === 'table' && tableNames.has(id)) {
+      firstBreakKind = 'table';
+      firstBreakId = id;
+    } else {
+      return null; // a failure prediction must name a real first break
+    }
+  }
+  const fixActions = sanitizeSchemaOps((p as { fixActions?: unknown }).fixActions);
+  const fixSource = (p as { actionSource?: unknown }).actionSource;
+  return {
+    name: o.name.trim().slice(0, 60),
+    scenario,
+    prediction: {
+      willFail,
+      firstBreakKind,
+      firstBreakId,
+      metric: typeof p.metric === 'string' ? p.metric.slice(0, 40) : '',
+      rationale: typeof p.rationale === 'string' ? p.rationale.slice(0, 400) : '',
+      fixHint: typeof p.fixHint === 'string' ? p.fixHint.slice(0, 300) : '',
+      ...(fixActions.length ? { fixActions } : {}),
+      ...(fixActions.length && (ACTION_SOURCES as readonly string[]).includes(String(fixSource))
+        ? { actionSource: String(fixSource) as ActionSource }
+        : {}),
+    },
+  };
+}
+
+/** Parse the schema prober's reply: {"cases":[ ... ]} (cap 3). */
+export function parseSchemaProbes(
+  json: unknown,
+  validPatternIds: ReadonlySet<string>,
+  tableNames: ReadonlySet<string>,
+): SchemaProbeCase[] {
+  const arr = Array.isArray(json)
+    ? json
+    : (json as { cases?: unknown })?.cases;
+  if (!Array.isArray(arr)) throw new Error('schema-probe: bad shape');
+  const out: SchemaProbeCase[] = [];
+  for (const raw of arr) {
+    const pc = normalizeSchemaProbeCase(raw, validPatternIds, tableNames);
+    if (pc) out.push(pc);
+    if (out.length >= 3) break;
+  }
+  return out;
+}
+
 // --------------------------------------------------------- next steps ---
 //
 // The per-case counterpart of the submission review. The review (AI 评审)

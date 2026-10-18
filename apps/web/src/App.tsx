@@ -18,6 +18,7 @@ import {
   judgeOnServer,
   simulateSchemaOnServer,
   verifyProbesOnServer,
+  verifySchemaProbesOnServer,
   type ActionCoverageDTO,
   type EditOpDTO,
   type FollowUpContextDTO,
@@ -32,8 +33,10 @@ import {
   type SchemaAssessmentDTO,
   type SchemaOpDTO,
   type SchemaSignalsDTO,
+  type SchemaProbeCaseDTO,
   type SchemaSimDTO,
   type SchemaSuiteDTO,
+  type VerifiedSchemaProbeDTO,
   type StructuralFindingDTO,
   type SubmissionAssessmentDTO,
   type SuiteResultDTO,
@@ -69,7 +72,7 @@ import {
   StructuralList,
   scoreColor,
 } from './ReportPanel';
-import { SchemaPanel, SchemaAssessmentView, SchemaSignalsView, SchemaSimView, SchemaSuiteView } from './SchemaPanel';
+import { SchemaPanel, SchemaAssessmentView, SchemaProbeSection, SchemaSignalsView, SchemaSimView, SchemaSuiteView } from './SchemaPanel';
 import { IconGlyph } from './icons';
 
 type Phase = 'design' | 'run' | 'report';
@@ -290,6 +293,14 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   // the database design's own score （数据库评审 tab), independent of
   // the architecture suite.
   const [schemaSuite, setSchemaSuite] = useState<SchemaSuiteDTO | null>(null);
+  // AI schema probes, verified by the schema simulator (Part B) — same
+  // section discipline as the architecture probes: busy / note / results
+  // degrade independently of judging and of the schema assessment.
+  const [schemaProbeResults, setSchemaProbeResults] = useState<VerifiedSchemaProbeDTO[] | null>(null);
+  const [schemaProbeBusy, setSchemaProbeBusy] = useState(false);
+  const [schemaProbeNote, setSchemaProbeNote] = useState<string | null>(null);
+  const [schemaProbeLabel, setSchemaProbeLabel] = useState('');
+  const [schemaProbeCoverage, setSchemaProbeCoverage] = useState<ActionCoverageDTO | null>(null);
   // Schema simulation runs, kept per problem alongside the schema draft
   // (same lifecycle): the sim that ran + the exact draft fingerprint it
   // ran on, so a later edit can mark the shown results as the last run's.
@@ -513,6 +524,10 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setProbeResults(null);
     setProbeNote(null);
     setProbeLabel('');
+    setSchemaProbeResults(null);
+    setSchemaProbeNote(null);
+    setSchemaProbeLabel('');
+    setSchemaProbeCoverage(null);
     setFollowUps(null);
     setHighlights(new Map());
     setSelectedId(null);
@@ -604,6 +619,10 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setProbeResults(null);
     setProbeNote(null);
     setProbeLabel('');
+    setSchemaProbeResults(null);
+    setSchemaProbeNote(null);
+    setSchemaProbeLabel('');
+    setSchemaProbeCoverage(null);
     setNextSteps(null);
     setNextStepsError(null);
     setNextStepsNote(null);
@@ -676,6 +695,10 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setProbeResults(null);
     setProbeNote(null);
     setProbeLabel('');
+    setSchemaProbeResults(null);
+    setSchemaProbeNote(null);
+    setSchemaProbeLabel('');
+    setSchemaProbeCoverage(null);
     setNextSteps(null);
     setNextStepsError(null);
     setNextStepsNote(null);
@@ -714,6 +737,9 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     // no separate schema-review trigger anymore. Its conclusions render
     // only in the results page's 「数据库评审」 tab.
     void runSchemaAssessment(loadFactor);
+    // The database probe chain rides the same submit too: AI data
+    // scenarios → simulator verification → (Part C) schema next steps.
+    void runSchemaProbes();
     // And the per-case next steps (their own evaluate kind), rendered at
     // the top of the 判卷结果 tab: one pinned action per failed case.
     void runNextSteps(result, jr.structural);
@@ -839,6 +865,50 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
       setSchemaError('数据库评审调用失败：后端未返回结论，请确认后端在运行后重新提交。');
     } finally {
       setSchemaBusy(false);
+    }
+  };
+
+  /**
+   * AI schema probes — the database mirror of the architecture probe
+   * pipeline: ONE evaluate call proposes adversarial data scenarios for
+   * THIS schema (criteria + server-recomputed sim measurements; never
+   * the static schema cases), then the verify endpoint re-runs the
+   * schema simulator per scenario and grades every prediction. Failure
+   * degrades to a note in this section only — judging, the schema
+   * assessment and the next steps do not depend on it.
+   */
+  const runSchemaProbes = async (): Promise<VerifiedSchemaProbeDTO[] | null> => {
+    const p = problemRef.current;
+    const schema = schemasRef.current[p.id]!;
+    setSchemaProbeBusy(true);
+    setSchemaProbeNote(null);
+    try {
+      const pr = await evaluateOnServer<SchemaProbeCaseDTO[]>('schema-probe', {
+        problemName: p.name,
+        problemId: p.id,
+        schema,
+      });
+      setSchemaProbeLabel(pr.label);
+      const cases = pr.data ?? [];
+      if (!cases.length) {
+        setSchemaProbeResults(null);
+        setSchemaProbeNote('本轮没有产出有效的探测场景（模型未给出可执行的数据场景）。');
+        return null;
+      }
+      const vr = await verifySchemaProbesOnServer({ problemId: p.id, schema, cases });
+      setSchemaProbeResults(vr.results);
+      setSchemaProbeCoverage(vr.actionCoverage ?? null);
+      if (!vr.results.length) {
+        setSchemaProbeNote('探测场景未能通过服务端校验，本轮无验证结果。');
+        return null;
+      }
+      return vr.results;
+    } catch {
+      setSchemaProbeResults(null);
+      setSchemaProbeNote('数据库探测这一步失败了（后端不可达或调用出错）——不影响判卷与评审结果。');
+      return null;
+    } finally {
+      setSchemaProbeBusy(false);
     }
   };
 
@@ -1528,6 +1598,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                 probeBusy && '探测用例生成 + 仿真验证',
                 assessmentBusy && '提交点评',
                 schemaBusy && '数据库评审',
+                schemaProbeBusy && '数据库探测 + 仿真验证',
                 nextStepsBusy && '下一步建议',
               ]
                 .filter(Boolean)
@@ -1720,6 +1791,16 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                       尚未提交——提交后，数据库用例判卷（由数据库模拟实测、独立计分）会出现在这里。
                     </p>
                   )
+                )}
+                {(schemaProbeBusy || schemaProbeResults || schemaProbeNote) && (
+                  <SchemaProbeSection
+                    busy={schemaProbeBusy}
+                    note={schemaProbeNote}
+                    results={schemaProbeResults}
+                    sourceLabel={schemaProbeLabel}
+                    coverage={schemaProbeCoverage}
+                    onApplyFix={enterSchemaPreview}
+                  />
                 )}
                 {schemaBusy && (
                   <div style={{ color: '#94a3b8', fontSize: 13, marginBottom: 8 }}>

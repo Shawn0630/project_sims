@@ -9,11 +9,16 @@ import {
   judgeSchemaCases,
   reviewSchema,
   runSuite,
+  schemaSimBudgetMs,
   simulateSchema,
   validateEditOps,
   type SchemaSimResult,
 } from '@sds/checker';
-import type { ExecutedScenario, StructuralFindingLike } from '@sds/driver';
+import type {
+  ExecutedScenario,
+  SchemaProbeContext,
+  StructuralFindingLike,
+} from '@sds/driver';
 import type { ProblemSchema } from '@sds/problems';
 import type { Design } from '@sds/sim-core';
 import {
@@ -22,12 +27,14 @@ import {
   evaluateNextSteps,
   evaluateProbes,
   evaluateSchema,
+  evaluateSchemaProbes,
   evaluateSubmission,
   toSchemaReviewLike,
   type EvaluateKind,
 } from './llm';
 import { listUserSelectableProfiles, resolveActiveProfile } from './llmconfig';
 import { verifyProbes } from './probe';
+import { verifySchemaProbes } from './schemaprobe';
 import { toClientPack } from './packs';
 import { JsonProblemStorage, type ProblemStorage } from './storage';
 import { registerAdminRoutes } from './admin';
@@ -252,6 +259,37 @@ app.post('/api/submissions/verify-probes', async (c) => {
   return c.json({ problemId: problem.id, results, actionCoverage });
 });
 
+// ------------------------------------------------- schema probe verification -
+// The schema-side arbiter: each proposed data scenario is re-normalized,
+// re-run through the schema simulator and graded (hit / held / miss);
+// fix actions are re-validated / scenario-grounded (schemaprobe.ts).
+app.post('/api/submissions/verify-schema-probes', async (c) => {
+  const body = (await c.req.json().catch(() => null)) as {
+    problemId?: unknown;
+    schema?: unknown;
+    cases?: unknown;
+  } | null;
+  if (
+    !body ||
+    typeof body.problemId !== 'string' ||
+    !isSchema(body.schema) ||
+    !Array.isArray(body.cases)
+  ) {
+    return c.json(
+      badRequest('需要 { problemId: string, schema: { tables: [...] }, cases: SchemaProbeCase[] }'),
+      400,
+    );
+  }
+  const problem = await storage.getProblem(body.problemId);
+  if (!problem) return c.json({ error: 'problem_not_found' }, 404);
+  const { results, actionCoverage } = verifySchemaProbes(
+    problem,
+    body.schema as ProblemSchema,
+    body.cases,
+  );
+  return c.json({ problemId: problem.id, results, actionCoverage });
+});
+
 // ------------------------------------------------------------ case scenario -
 // Quick re-simulation needs a case's executable scenario locally. Visible
 // cases ship in the pack already; hidden ones do not. This endpoint serves
@@ -303,9 +341,15 @@ app.post('/api/evaluate', async (c) => {
   // measure the design's genuinely hottest node for synthesis/fallback.
   const problem =
     typeof body?.problemId === 'string' ? await storage.getProblem(body.problemId) : null;
-  if (!kind || !['submission', 'schema', 'followups', 'probe', 'next-steps'].includes(kind) || !ctx) {
+  if (
+    !kind ||
+    !['submission', 'schema', 'followups', 'probe', 'next-steps', 'schema-probe'].includes(kind) ||
+    !ctx
+  ) {
     return c.json(
-      badRequest("需要 { kind: 'submission' | 'schema' | 'followups' | 'probe' | 'next-steps', context }"),
+      badRequest(
+        "需要 { kind: 'submission' | 'schema' | 'followups' | 'probe' | 'next-steps' | 'schema-probe', context }",
+      ),
       400,
     );
   }
@@ -316,6 +360,69 @@ app.post('/api/evaluate', async (c) => {
       profileId,
       design,
       problem ?? undefined,
+    );
+    return c.json({ kind, ...outcome });
+  }
+  if (kind === 'schema-probe') {
+    // Schema probes: the client sends raw material ({ problemName?,
+    // problemId, schema }); the server assembles the full context from
+    // its own recomputed sim + judging (the trust model of kind=schema),
+    // so the prober grounds on server measurements, and the static
+    // schema cases themselves are never part of its context — only
+    // their revealed results summary is.
+    const raw = ctx as {
+      problemName?: string;
+      problemId?: string;
+      schema?: ProblemSchema;
+    };
+    if (!raw.schema || typeof raw.problemId !== 'string') {
+      return c.json(badRequest('schema-probe 需要 context.problemId 与 context.schema'), 400);
+    }
+    const prob = await storage.getProblem(raw.problemId).catch(() => null);
+    if (!prob) return c.json({ error: 'problem_not_found' }, 404);
+    const sim = simulateSchema(prob, raw.schema);
+    const suite = judgeSchemaCases(prob, raw.schema);
+    const budgetMs = schemaSimBudgetMs(prob);
+    const patterns =
+      raw.schema.accessPatterns.length > 0 ? raw.schema.accessPatterns : prob.schema.accessPatterns;
+    const hottest = [...sim.perPattern].sort(
+      (a, b) => b.p99Ms / budgetMs - a.p99Ms / budgetMs,
+    )[0];
+    const hottestTable = [...sim.perTable].sort(
+      (a, b) => b.hottestShardUtil - a.hottestShardUtil,
+    )[0];
+    const fullCtx: SchemaProbeContext = {
+      problemName: raw.problemName ?? prob.name,
+      schemaSummary: buildSchemaSummary(raw.schema),
+      simSummary: buildSchemaSimSummary(sim),
+      budgetMs,
+      patterns: patterns.map((p) => ({
+        id: p.id,
+        name: p.name,
+        table: p.table,
+        kind: p.kind,
+        perSec: p.perSec,
+      })),
+      judgingSummary:
+        suite.totalCount > 0
+          ? `数据库用例得分 ${suite.scorePct}（${suite.passedCount}/${suite.totalCount}）：\n` +
+            suite.results
+              .map((r) => `- ${r.passed ? '✓' : '✗'} ${r.name}：实测 ${r.measuredText}；要求 ${r.thresholdText}`)
+              .join('\n')
+          : '（本题暂无数据库测试用例）',
+      ...(sim.perPatternGrown.find((p) => p.verdict === '不通过')
+        ? { growthFailurePatternId: sim.perPatternGrown.find((p) => p.verdict === '不通过')!.patternId }
+        : {}),
+      ...(hottest ? { hottestPatternId: hottest.patternId } : {}),
+      ...(hottestTable
+        ? { hottestTable: { name: hottestTable.table, util: hottestTable.hottestShardUtil } }
+        : {}),
+    };
+    const outcome = await evaluateSchemaProbes(
+      fullCtx,
+      profileId,
+      raw.schema,
+      reviewSchema(raw.schema, { loadFactor: 0 }),
     );
     return c.json({ kind, ...outcome });
   }

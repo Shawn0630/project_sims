@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { MetricsSnapshot } from '@sds/sim-core';
 import type {
+  ActionCoverageDTO,
   ProblemSchemaDTO,
   SchemaAssessmentDTO,
   SchemaOpDTO,
@@ -8,8 +9,9 @@ import type {
   SchemaSimDTO,
   SchemaSuiteDTO,
   SchemaTableDTO,
+  VerifiedSchemaProbeDTO,
 } from './api';
-import { ActionSourceLabel } from './ReportPanel';
+import { ActionSourceLabel, CoverageLine } from './ReportPanel';
 import { QueryPlaybackPanel, type PlaybackLane } from './QueryPlayback';
 
 export function formatBytes(n: number): string {
@@ -337,6 +339,98 @@ export function SchemaSuiteView({
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+const SCHEMA_PROBE_VERDICT_META: Record<
+  VerifiedSchemaProbeDTO['verdict'],
+  { text: string; cls: string }
+> = {
+  hit: { text: '预言命中', cls: 'chip-pass' },
+  held: { text: '设计扛住了', cls: 'chip-held' },
+  miss: { text: '未命中', cls: 'chip-fail' },
+};
+
+/**
+ * AI schema probes AFTER simulator verification — the database mirror of
+ * the architecture probe section. The model proposed adversarial data
+ * scenarios （倾斜/增长/热点/结构翻转） from the criteria and sim
+ * measurements alone; the schema simulator re-ran each scenario and
+ * graded the prediction. Fixes ride the same provenance badges.
+ */
+export function SchemaProbeSection(props: {
+  busy: boolean;
+  note: string | null;
+  results: VerifiedSchemaProbeDTO[] | null;
+  sourceLabel: string;
+  coverage?: ActionCoverageDTO | null;
+  onApplyFix: (title: string, actions: SchemaOpDTO[]) => void;
+}) {
+  const { busy, note, results, sourceLabel } = props;
+  return (
+    <div style={{ border: '1px solid #1e293b', borderRadius: 8, padding: '10px 12px', background: '#0b1220', marginBottom: 12 }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <b>🔬 AI 探测（已由仿真验证）</b>
+        {sourceLabel && (
+          <span style={{ color: '#94a3b8', fontSize: 12 }}>提案：{sourceLabel}</span>
+        )}
+      </div>
+      {props.coverage && results && results.length > 0 && <CoverageLine coverage={props.coverage} />}
+      {busy && (
+        <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>
+          探测中…（模型正在针对这份 schema 提出对抗性数据场景，随后由数据库模拟逐个重跑验证）
+        </div>
+      )}
+      {!busy && note && !results && (
+        <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>{note}</div>
+      )}
+      {results && results.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+          {results.map((r, i) => {
+            const v = SCHEMA_PROBE_VERDICT_META[r.verdict];
+            return (
+              <div key={i} className="case-row">
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <span className={`chip ${v.cls}`}>{v.text}</span>
+                  <b>{r.name}</b>
+                  <span style={{ color: '#94a3b8', fontSize: 12.5 }}>{r.scenarioSummary}</span>
+                </div>
+                <div style={{ fontSize: 13, marginTop: 4, color: '#cbd5e1' }}>
+                  预测：{r.prediction.willFail
+                    ? `会先爆 · 「${r.prediction.firstBreakId}」${r.prediction.metric ? `（${r.prediction.metric}）` : ''}`
+                    : '能扛住'}
+                  {r.prediction.rationale && <span> — {r.prediction.rationale}</span>}
+                </div>
+                <div style={{ fontSize: 12.5, marginTop: 3, color: '#94a3b8' }}>
+                  实测：{r.passed
+                    ? '扛住了'
+                    : `先爆 ${r.actualFirstBreak ?? '—'}`} ·
+                  最慢模式{r.measured.worstPatternName ? `「${r.measured.worstPatternName}」` : ''} P99 {Math.round(r.measured.worstP99Ms)}ms ·
+                  最高表利用率 {r.measured.maxTableUtil} ·
+                  可持续约 {r.measured.maxSustainableQps.toLocaleString()} 次/s
+                </div>
+                {!r.passed && r.failures.length > 0 && (
+                  <div style={{ fontSize: 12.5, marginTop: 3, color: '#fca5a5' }}>{r.failures.join('；')}</div>
+                )}
+                {r.prediction.fixHint && (
+                  <div style={{ fontSize: 12.5, marginTop: 3, color: '#facc15' }}>💡 {r.prediction.fixHint}</div>
+                )}
+                {r.prediction.fixActions && r.prediction.fixActions.length > 0 && (
+                  <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <button onClick={() => props.onApplyFix(r.name, r.prediction.fixActions!)}>
+                      ✨ 应用此改进
+                    </button>
+                    {r.prediction.actionSource && (
+                      <ActionSourceLabel source={r.prediction.actionSource} />
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

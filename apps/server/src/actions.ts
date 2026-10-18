@@ -20,6 +20,7 @@ import {
   type ParsedRepair,
   type ProbeCase,
   type SchemaOp,
+  type SchemaProbeCase,
   type SchemaSuggestion,
   type VerifiedProbeResult,
 } from '@sds/driver';
@@ -1142,4 +1143,65 @@ export async function guaranteeNextStepActions(
     ...(w.actions?.length ? { actions: w.actions, actionSource: w.actionSource } : {}),
   }));
   return { steps, coverage };
+}
+
+/**
+ * Guarantee fix actions on SCHEMA PROBE predictions — the schema-side
+ * twin of guaranteePredictionActions. A willFail prediction's fixHint
+ * gets its structured form through the exact schema ladder the schema
+ * assessment uses (validate → repair → rule synthesis → universal
+ * fallback, guaranteeSchemaActions), by mapping each failing prediction
+ * to a pseudo-suggestion and back. Predictions of a pass carry no
+ * actions and stay out of the coverage denominator, as on the arch side.
+ */
+export async function guaranteeSchemaPredictionActions(
+  cases: SchemaProbeCase[],
+  schema: ProblemSchema | undefined,
+  opts: SchemaLadderOpts,
+): Promise<{ cases: SchemaProbeCase[]; coverage: ActionCoverage }> {
+  const failingIdx = cases
+    .map((c, i) => (c.prediction.willFail ? i : -1))
+    .filter((i) => i >= 0);
+  if (!schema) {
+    const stripped = cases.map((c) => {
+      const prediction = { ...c.prediction };
+      delete prediction.fixActions;
+      delete prediction.actionSource;
+      return { ...c, prediction };
+    });
+    return { cases: stripped, coverage: zeroCoverageLocal(failingIdx.length) };
+  }
+  const suggestions: SchemaSuggestion[] = failingIdx.map((i) => {
+    const c = cases[i]!;
+    return {
+      text: `${c.name}：${c.prediction.rationale}${c.prediction.fixHint ? ` 修复方向：${c.prediction.fixHint}` : ''}`,
+      ...(c.prediction.fixActions ? { actions: c.prediction.fixActions } : {}),
+    };
+  });
+  const r = await guaranteeSchemaActions(suggestions, schema, opts);
+  const out = [...cases];
+  failingIdx.forEach((caseIdx, k) => {
+    const s = r.suggestions[k]!;
+    const c = out[caseIdx]!;
+    const prediction = { ...c.prediction };
+    // The ladder's output is the ONLY fix that may ship: if it produced
+    // nothing (empty schema), the raw proposal must not leak through.
+    delete prediction.fixActions;
+    delete prediction.actionSource;
+    if (s.actions?.length) {
+      prediction.fixActions = s.actions;
+      if (s.actionSource) prediction.actionSource = s.actionSource;
+    }
+    out[caseIdx] = { ...c, prediction };
+  });
+  return { cases: out, coverage: r.coverage };
+}
+
+function zeroCoverageLocal(count: number): ActionCoverage {
+  return {
+    findings: count,
+    withActions: 0,
+    bySource: { llm: 0, repaired: 0, rule: 0, fallback: 0 },
+    nonMechanical: 0,
+  };
 }

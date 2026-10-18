@@ -10,6 +10,8 @@ import type {
   ProbeContext,
   SchemaAssessment,
   SchemaAssessmentContext,
+  SchemaProbeCase,
+  SchemaProbeContext,
   SimulatorTools,
   SubmissionAssessment,
   SubmissionAssessmentContext,
@@ -449,5 +451,53 @@ export class ScriptedDriver implements Driver {
       });
     }
     return { conclusion, dimensionNotes, suggestions };
+  }
+
+  /**
+   * Scripted schema probes (offline fallback for the schema-probe
+   * evaluation): two deterministic adversarial scenarios built from the
+   * server's measured hints — data growth against the pattern the grown
+   * sim already fails, and a hot-value skew against the hottest pattern.
+   * Predictions commit to the measured first break; the simulator grades
+   * them like any model's. Fix actions are attached by the server ladder.
+   */
+  async generateSchemaProbes(ctx: SchemaProbeContext): Promise<SchemaProbeCase[]> {
+    const out: SchemaProbeCase[] = [];
+    if (ctx.growthFailurePatternId) {
+      const p = ctx.patterns.find((x) => x.id === ctx.growthFailurePatternId);
+      out.push({
+        name: '探测：数据量 ×10 增长',
+        scenario: { growthFactor: 10 },
+        prediction: {
+          willFail: true,
+          firstBreakKind: 'pattern',
+          firstBreakId: ctx.growthFailurePatternId,
+          metric: 'P99 延迟',
+          rationale: `数据库模拟的 ×10 数据量档位上，「${p?.name ?? ctx.growthFailurePatternId}」已经判定不通过——增长本身就是这份 schema 最先撞上的墙。`,
+          fixHint: '先消除这条模式在大数据量下的扫描/广播路径（索引或对齐分片键）。',
+        },
+      });
+    }
+    const hotId = ctx.hottestPatternId ?? ctx.patterns[0]?.id;
+    if (hotId) {
+      const p = ctx.patterns.find((x) => x.id === hotId);
+      const tableUtil = ctx.hottestTable?.util ?? 0;
+      const willFail = tableUtil >= 0.2;
+      out.push({
+        name: '探测：热点倾斜（流量集中到单一取值）',
+        scenario: { skew: { patternId: hotId, concentration: 0.9 } },
+        prediction: {
+          willFail,
+          firstBreakKind: willFail ? 'table' : '无',
+          firstBreakId: willFail ? (p?.table ?? '') : '',
+          metric: '最热分片利用率',
+          rationale: willFail
+            ? `「${p?.name ?? hotId}」是当前最热的模式，其表 ${p?.table ?? ''} 的最热分片利用率已达 ${tableUtil}；90% 流量压到单一取值后，热点分片会先饱和。`
+            : `「${p?.name ?? hotId}」所在表当前利用率只有 ${tableUtil}，倾斜后仍有余量，预计扛得住。`,
+          fixHint: '把热点表的分片键对齐到能把流量摊开的字段，或给热点值做拆分/缓存。',
+        },
+      });
+    }
+    return out.slice(0, 3);
   }
 }

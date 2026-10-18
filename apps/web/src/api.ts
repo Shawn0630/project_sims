@@ -362,6 +362,51 @@ export interface SchemaSuiteDTO {
   scorePct: number;
 }
 
+// ----------------------------------------------------- schema probe DTOs -
+
+export interface SchemaProbeScenarioDTO {
+  growthFactor?: number;
+  trafficMultiplier?: number;
+  patternTraffic?: Record<string, number>;
+  skew?: { patternId: string; concentration: number };
+}
+
+export interface SchemaProbePredictionDTO {
+  willFail: boolean;
+  firstBreakKind: 'pattern' | 'table' | '无';
+  firstBreakId: string;
+  metric: string;
+  rationale: string;
+  fixHint: string;
+  fixActions?: SchemaOpDTO[];
+  actionSource?: ActionSourceDTO;
+}
+
+export interface SchemaProbeCaseDTO {
+  name: string;
+  scenario: SchemaProbeScenarioDTO;
+  prediction: SchemaProbePredictionDTO;
+}
+
+/** One schema probe AFTER simulator verification (the arbiter's record). */
+export interface VerifiedSchemaProbeDTO {
+  name: string;
+  scenarioSummary: string;
+  scenario: SchemaProbeScenarioDTO;
+  prediction: SchemaProbePredictionDTO;
+  verdict: 'hit' | 'held' | 'miss';
+  passed: boolean;
+  actualFirstBreak: string | null;
+  measured: {
+    worstPatternId: string | null;
+    worstPatternName: string | null;
+    worstP99Ms: number;
+    maxTableUtil: number;
+    maxSustainableQps: number;
+  };
+  failures: string[];
+}
+
 // ---------------------------------------------------------- assessment DTOs -
 
 export interface FollowUpQuestionDTO {
@@ -732,7 +777,11 @@ export function evaluateOnServer<T>(
   context: { problemName: string; problemId?: string; schema: ProblemSchemaDTO; loadFactor?: number },
 ): Promise<EvaluateResponseDTO<T>>;
 export function evaluateOnServer<T>(
-  kind: 'submission' | 'schema' | 'followups' | 'probe' | 'next-steps',
+  kind: 'schema-probe',
+  context: { problemName: string; problemId: string; schema: ProblemSchemaDTO },
+): Promise<EvaluateResponseDTO<T>>;
+export function evaluateOnServer<T>(
+  kind: 'submission' | 'schema' | 'followups' | 'probe' | 'next-steps' | 'schema-probe' | 'schema-next-steps',
   context: unknown,
   design?: Design,
   problemId?: string,
@@ -766,6 +815,21 @@ export function verifyProbesOnServer(body: {
 }): Promise<{ problemId: string; results: VerifiedProbeDTO[]; actionCoverage?: ActionCoverageDTO }> {
   return request<{ problemId: string; results: VerifiedProbeDTO[]; actionCoverage?: ActionCoverageDTO }>(
     '/api/submissions/verify-probes',
+    { method: 'POST', body: JSON.stringify(body) },
+  );
+}
+
+/**
+ * The schema simulator as arbiter: re-run each proposed data scenario
+ * against the submitted schema and grade the predictions.
+ */
+export function verifySchemaProbesOnServer(body: {
+  problemId: string;
+  schema: ProblemSchemaDTO;
+  cases: SchemaProbeCaseDTO[];
+}): Promise<{ problemId: string; results: VerifiedSchemaProbeDTO[]; actionCoverage?: ActionCoverageDTO }> {
+  return request<{ problemId: string; results: VerifiedSchemaProbeDTO[]; actionCoverage?: ActionCoverageDTO }>(
+    '/api/submissions/verify-schema-probes',
     { method: 'POST', body: JSON.stringify(body) },
   );
 }

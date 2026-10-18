@@ -19,7 +19,15 @@ export interface LlmCallRecord {
   id: string;
   /** ISO timestamp. */
   ts: string;
-  kind: 'submission' | 'schema' | 'followups' | 'probe' | 'generate' | 'next-steps';
+  kind:
+    | 'submission'
+    | 'schema'
+    | 'followups'
+    | 'probe'
+    | 'generate'
+    | 'next-steps'
+    | 'schema-probe'
+    | 'schema-next-steps';
   /** llm = a real model call was made; scripted = deterministic fallback. */
   source: 'llm' | 'scripted';
   ok: boolean;
