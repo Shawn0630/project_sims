@@ -6,6 +6,7 @@ import {
   buildGenerationPrompt,
   buildNextStepsPrompt,
   buildProbePrompt,
+  buildSchemaNextStepsPrompt,
   buildSchemaProbePrompt,
   buildSchemaPrompt,
   buildSubmissionPrompt,
@@ -15,6 +16,7 @@ import {
   parseNextSteps,
   parseProbeCases,
   parseSchemaAssessment,
+  parseSchemaNextSteps,
   parseSchemaProbes,
   parseSubmissionAssessment,
   parseWholeProblem,
@@ -30,6 +32,8 @@ import {
   type ProbeContext,
   type SchemaAssessment,
   type SchemaAssessmentContext,
+  type SchemaNextStep,
+  type SchemaNextStepsContext,
   type SchemaProbeCase,
   type SchemaProbeContext,
   type SchemaReviewLike,
@@ -43,6 +47,7 @@ import {
   guaranteeNextStepActions,
   guaranteePredictionActions,
   guaranteeSchemaActions,
+  guaranteeSchemaNextStepActions,
   guaranteeSchemaPredictionActions,
   type RepairCall,
 } from './actions';
@@ -684,6 +689,41 @@ export async function evaluateNextSteps(
         ...(problem ? { problem } : {}),
         problemName: ctx.problemName,
         designSummary: ctx.designSummary,
+      });
+      return { data: r.steps, coverage: r.coverage };
+    },
+  );
+}
+
+/**
+ * The schema next steps: ONE pinned, applicable action per anchor —
+ * this submission's failed schema cases and its verified failed schema
+ * probes. Mirrors evaluateNextSteps' contract: the scripted path needs
+ * no driver method (the ladder's deterministic synthesis IS the script,
+ * honestly sourced 'rule'/'fallback'), and an LLM failure degrades the
+ * same way — the ladder still ships a step per anchor.
+ */
+export async function evaluateSchemaNextSteps(
+  ctx: SchemaNextStepsContext,
+  profileId?: string,
+  schema?: ProblemSchema,
+  report?: SchemaReviewReport,
+): Promise<EvaluateOutcome<SchemaNextStep[]>> {
+  const anchorIds = new Set(ctx.anchors.map((a) => a.anchorId));
+  return runLogged(
+    'schema-next-steps',
+    ctx,
+    () => buildSchemaNextStepsPrompt(ctx),
+    (json) => parseSchemaNextSteps(json, anchorIds),
+    async () => [],
+    profileId,
+    async (data, repairCall, source) => {
+      const r = await guaranteeSchemaNextStepActions(data, ctx.anchors, schema, {
+        baseSource: source === 'llm' ? 'llm' : 'rule',
+        repairCall,
+        problemName: ctx.problemName,
+        ...(report ? { report } : {}),
+        schemaSummary: ctx.schemaSummary,
       });
       return { data: r.steps, coverage: r.coverage };
     },

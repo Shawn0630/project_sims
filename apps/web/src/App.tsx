@@ -33,6 +33,8 @@ import {
   type SchemaAssessmentDTO,
   type SchemaOpDTO,
   type SchemaSignalsDTO,
+  type SchemaNextStepAnchorDTO,
+  type SchemaNextStepDTO,
   type SchemaProbeCaseDTO,
   type SchemaSimDTO,
   type SchemaSuiteDTO,
@@ -72,7 +74,7 @@ import {
   StructuralList,
   scoreColor,
 } from './ReportPanel';
-import { SchemaPanel, SchemaAssessmentView, SchemaProbeSection, SchemaSignalsView, SchemaSimView, SchemaSuiteView } from './SchemaPanel';
+import { SchemaPanel, SchemaAssessmentView, SchemaNextStepsSection, SchemaProbeSection, SchemaSignalsView, SchemaSimView, SchemaSuiteView } from './SchemaPanel';
 import { IconGlyph } from './icons';
 
 type Phase = 'design' | 'run' | 'report';
@@ -301,6 +303,15 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   const [schemaProbeNote, setSchemaProbeNote] = useState<string | null>(null);
   const [schemaProbeLabel, setSchemaProbeLabel] = useState('');
   const [schemaProbeCoverage, setSchemaProbeCoverage] = useState<ActionCoverageDTO | null>(null);
+  // 🎯 数据库下一步 (Part C): one pinned action per failed schema case /
+  // verified failed probe, ladder-guaranteed like the arch next steps.
+  const [schemaNextSteps, setSchemaNextSteps] = useState<SchemaNextStepDTO[] | null>(null);
+  const [schemaNextStepsBusy, setSchemaNextStepsBusy] = useState(false);
+  const [schemaNextStepsError, setSchemaNextStepsError] = useState<string | null>(null);
+  const [schemaNextStepsNote, setSchemaNextStepsNote] = useState<string | null>(null);
+  const [schemaNextStepsLabel, setSchemaNextStepsLabel] = useState('');
+  const [schemaNextStepsCoverage, setSchemaNextStepsCoverage] = useState<ActionCoverageDTO | null>(null);
+  const [schemaAnchorNames, setSchemaAnchorNames] = useState<Record<string, string>>({});
   // Schema simulation runs, kept per problem alongside the schema draft
   // (same lifecycle): the sim that ran + the exact draft fingerprint it
   // ran on, so a later edit can mark the shown results as the last run's.
@@ -528,6 +539,12 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setSchemaProbeNote(null);
     setSchemaProbeLabel('');
     setSchemaProbeCoverage(null);
+    setSchemaNextSteps(null);
+    setSchemaNextStepsError(null);
+    setSchemaNextStepsNote(null);
+    setSchemaNextStepsLabel('');
+    setSchemaNextStepsCoverage(null);
+    setSchemaAnchorNames({});
     setFollowUps(null);
     setHighlights(new Map());
     setSelectedId(null);
@@ -623,6 +640,12 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setSchemaProbeNote(null);
     setSchemaProbeLabel('');
     setSchemaProbeCoverage(null);
+    setSchemaNextSteps(null);
+    setSchemaNextStepsError(null);
+    setSchemaNextStepsNote(null);
+    setSchemaNextStepsLabel('');
+    setSchemaNextStepsCoverage(null);
+    setSchemaAnchorNames({});
     setNextSteps(null);
     setNextStepsError(null);
     setNextStepsNote(null);
@@ -699,6 +722,12 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setSchemaProbeNote(null);
     setSchemaProbeLabel('');
     setSchemaProbeCoverage(null);
+    setSchemaNextSteps(null);
+    setSchemaNextStepsError(null);
+    setSchemaNextStepsNote(null);
+    setSchemaNextStepsLabel('');
+    setSchemaNextStepsCoverage(null);
+    setSchemaAnchorNames({});
     setNextSteps(null);
     setNextStepsError(null);
     setNextStepsNote(null);
@@ -738,8 +767,12 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     // only in the results page's 「数据库评审」 tab.
     void runSchemaAssessment(loadFactor);
     // The database probe chain rides the same submit too: AI data
-    // scenarios → simulator verification → (Part C) schema next steps.
-    void runSchemaProbes();
+    // scenarios → simulator verification → schema next steps anchored
+    // on the failures both produced.
+    void (async () => {
+      const probes = await runSchemaProbes();
+      await runSchemaNextSteps(jr.schemaSuite, probes);
+    })();
     // And the per-case next steps (their own evaluate kind), rendered at
     // the top of the 判卷结果 tab: one pinned action per failed case.
     void runNextSteps(result, jr.structural);
@@ -909,6 +942,81 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
       return null;
     } finally {
       setSchemaProbeBusy(false);
+    }
+  };
+
+  /**
+   * 🎯 数据库下一步 — ONE evaluate call anchored on this submission's
+   * failed schema cases + verified failed schema probes. The server
+   * ladder guarantees a step with a validated schema-op action per
+   * anchor; when the AI part is unavailable the steps are rule-sourced
+   * and the section says so. Applying a step reuses the schema-op
+   * preview/confirm into the draft; re-submit refreshes judging.
+   */
+  const runSchemaNextSteps = async (
+    suiteRes: SchemaSuiteDTO | null,
+    probes: VerifiedSchemaProbeDTO[] | null,
+  ) => {
+    const p = problemRef.current;
+    const anchors: SchemaNextStepAnchorDTO[] = [];
+    const names: Record<string, string> = {};
+    for (const r of suiteRes?.results ?? []) {
+      if (r.passed) continue;
+      const id = `case:${r.caseId}`;
+      anchors.push({
+        anchorId: id,
+        kind: 'case',
+        title: r.name,
+        facts: [...r.failures, `实测 ${r.measuredText}`, `要求 ${r.thresholdText}`],
+      });
+      names[id] = r.name;
+    }
+    for (const r of probes ?? []) {
+      if (r.passed) continue;
+      const id = `probe:${r.name}`;
+      anchors.push({
+        anchorId: id,
+        kind: 'probe',
+        title: r.name,
+        facts: [
+          `场景：${r.scenarioSummary}`,
+          ...r.failures,
+          ...(r.actualFirstBreak ? [`先爆点：${r.actualFirstBreak}`] : []),
+        ],
+      });
+      names[id] = r.name;
+    }
+    setSchemaAnchorNames(names);
+    if (!anchors.length) {
+      setSchemaNextSteps([]);
+      return;
+    }
+    setSchemaNextStepsBusy(true);
+    setSchemaNextStepsError(null);
+    setSchemaNextStepsNote(null);
+    try {
+      const r = await evaluateOnServer<SchemaNextStepDTO[]>('schema-next-steps', {
+        problemName: p.name,
+        problemId: p.id,
+        schema: schemasRef.current[p.id]!,
+        anchors,
+      });
+      setSchemaNextStepsLabel(r.label);
+      setSchemaNextSteps(r.data);
+      setSchemaNextStepsCoverage(r.actionCoverage ?? null);
+      if (r.source === 'scripted') {
+        setSchemaNextStepsNote(
+          llmConfigured
+            ? 'AI 下一步不可用（本次调用失败），以下为规则·实测合成的下一步。'
+            : '未配置 LLM，AI 下一步不可用——以下为规则·实测合成的下一步。',
+        );
+      }
+    } catch {
+      setSchemaNextStepsError(
+        '数据库下一步生成失败：后端未返回，请确认后端在运行后重新提交。用例行里的规则修复仍然可用。',
+      );
+    } finally {
+      setSchemaNextStepsBusy(false);
     }
   };
 
@@ -1591,7 +1699,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
               </span>
             )}
           </div>
-          {(probeBusy || assessmentBusy || schemaBusy || nextStepsBusy) && (
+          {(probeBusy || assessmentBusy || schemaBusy || schemaProbeBusy || schemaNextStepsBusy || nextStepsBusy) && (
             <div className="res-progress">
               ⏳ 评审流程进行中：
               {[
@@ -1599,6 +1707,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                 assessmentBusy && '提交点评',
                 schemaBusy && '数据库评审',
                 schemaProbeBusy && '数据库探测 + 仿真验证',
+                schemaNextStepsBusy && '数据库下一步',
                 nextStepsBusy && '下一步建议',
               ]
                 .filter(Boolean)
@@ -1799,6 +1908,18 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                     results={schemaProbeResults}
                     sourceLabel={schemaProbeLabel}
                     coverage={schemaProbeCoverage}
+                    onApplyFix={enterSchemaPreview}
+                  />
+                )}
+                {(schemaNextStepsBusy || schemaNextSteps !== null || schemaNextStepsError) && (
+                  <SchemaNextStepsSection
+                    busy={schemaNextStepsBusy}
+                    error={schemaNextStepsError}
+                    note={schemaNextStepsNote}
+                    steps={schemaNextSteps}
+                    anchorNames={schemaAnchorNames}
+                    sourceLabel={schemaNextStepsLabel}
+                    coverage={schemaNextStepsCoverage}
                     onApplyFix={enterSchemaPreview}
                   />
                 )}

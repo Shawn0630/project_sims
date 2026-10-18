@@ -1,5 +1,6 @@
 import { COMPONENT_MAP, componentDef } from '@sds/components';
 import {
+  describeSchemaOp,
   settingRuleFor,
   synthesizeCapacityFixForNode,
   validateEditOps,
@@ -20,6 +21,8 @@ import {
   type ParsedRepair,
   type ProbeCase,
   type SchemaOp,
+  type SchemaNextStep,
+  type SchemaNextStepAnchor,
   type SchemaProbeCase,
   type SchemaSuggestion,
   type VerifiedProbeResult,
@@ -1204,4 +1207,88 @@ function zeroCoverageLocal(count: number): ActionCoverage {
     bySource: { llm: 0, repaired: 0, rule: 0, fallback: 0 },
     nonMechanical: 0,
   };
+}
+
+/**
+ * Guarantee actions on SCHEMA next steps — one pinned step per anchor
+ * (failed schema case / verified failed probe). The steps ride the
+ * schema ladder wholesale: each anchor becomes a pseudo-suggestion
+ * whose text is its measured facts, and guaranteeSchemaActions runs
+ * validate → repair → rule synthesis → universal fallback over the
+ * batch. Two next-steps-specific rules on top:
+ *
+ *  - the output carries EXACTLY ONE step per anchor, in anchor order
+ *    (model steps for unknown anchors were dropped by the parser;
+ *    missing ones are constructed here);
+ *  - there is NO non-mechanical escape: an anchor is a measured
+ *    failure, so a step that cannot be acted on is a contradiction —
+ *    if the ladder somehow returns a step actionless, the universal
+ *    schema fallback closes it ('fallback').
+ *
+ * When synthesis supplied the actions, title/rationale are regenerated
+ * from the shipped ops + measured facts — never left describing the
+ * model's discarded proposal. On the scripted path the model steps are
+ * empty and the ladder constructs every step, honestly 'rule'/'fallback'.
+ */
+export async function guaranteeSchemaNextStepActions(
+  modelSteps: SchemaNextStep[],
+  anchors: SchemaNextStepAnchor[],
+  schema: ProblemSchema | undefined,
+  opts: SchemaLadderOpts,
+): Promise<{ steps: SchemaNextStep[]; coverage: ActionCoverage }> {
+  if (!schema) {
+    const steps = modelSteps.map((s) => {
+      const next = { ...s };
+      delete next.actions;
+      delete next.actionSource;
+      return next;
+    });
+    return { steps, coverage: zeroCoverageLocal(anchors.length) };
+  }
+  const stepByAnchor = new Map(modelSteps.map((s) => [s.anchorId, s]));
+  const suggestions: SchemaSuggestion[] = anchors.map((a) => {
+    const model = stepByAnchor.get(a.anchorId);
+    const text =
+      `${a.kind === 'case' ? '未过用例' : '已验证探测'}「${a.title}」：${a.facts.join('；')}` +
+      (model?.rationale ? ` 面试官判断：${model.rationale}` : '');
+    return {
+      text,
+      ...(model?.actions ? { actions: model.actions } : {}),
+    };
+  });
+  const r = await guaranteeSchemaActions(suggestions, schema, opts);
+  const coverage = r.coverage;
+  const steps: SchemaNextStep[] = anchors.map((a, i) => {
+    const s = r.suggestions[i]!;
+    const model = stepByAnchor.get(a.anchorId);
+    let actions = s.actions;
+    let actionSource = s.actionSource;
+    if (!actions?.length) {
+      const fb = universalSchemaFallback(schema);
+      if (fb.length) {
+        actions = fb;
+        actionSource = 'fallback';
+        coverage.withActions += 1;
+        coverage.bySource.fallback += 1;
+      }
+    }
+    const synthesized = actionSource === 'rule' || actionSource === 'fallback';
+    const title =
+      !synthesized && model?.title
+        ? model.title
+        : actions?.length
+          ? actions.map((op) => describeSchemaOp(op, schema)).join('；')
+          : `处理「${a.title}」`;
+    const rationale =
+      !synthesized && model?.rationale
+        ? model.rationale
+        : `针对「${a.title}」的实测（${a.facts.join('；')}），先做这一步，再重新提交看判卷是否翻绿。`;
+    return {
+      anchorId: a.anchorId,
+      title,
+      rationale,
+      ...(actions?.length ? { actions, ...(actionSource ? { actionSource } : {}) } : {}),
+    };
+  });
+  return { steps, coverage };
 }

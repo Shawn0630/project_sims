@@ -1310,6 +1310,94 @@ export function parseSchemaProbes(
   return out;
 }
 
+// ------------------------------------------------ schema next steps -----
+// The database mirror of the per-case next steps: ONE pinned action per
+// anchor, where the anchors are this submission's FAILED schema cases
+// plus its VERIFIED failed schema probes. Steps carry schema-op actions
+// through the same action-guarantee ladder as every other LLM result;
+// applying one goes through the schema-op preview/confirm into the
+// schema draft, and judging refreshes only on re-submit (stale semantics
+// identical to the architecture side).
+
+export interface SchemaNextStepAnchor {
+  /** 'case:<caseId>' for a failed schema case, 'probe:<name>' for a probe. */
+  anchorId: string;
+  kind: 'case' | 'probe';
+  /** The failed case's / probe's display name. */
+  title: string;
+  /** Measured facts, verbatim: failure lines, measured vs threshold. */
+  facts: string[];
+}
+
+export interface SchemaNextStepsContext {
+  problemName: string;
+  schemaSummary: string;
+  /** The schema sim's measured summary of the submitted schema. */
+  simSummary: string;
+  anchors: SchemaNextStepAnchor[];
+}
+
+export interface SchemaNextStep {
+  anchorId: string;
+  /** The action in one line. */
+  title: string;
+  /** Why — cites the anchor's measured numbers. */
+  rationale: string;
+  actions?: SchemaOp[];
+  actionSource?: ActionSource;
+}
+
+export function buildSchemaNextStepsPrompt(
+  ctx: SchemaNextStepsContext,
+): { system: string; user: string } {
+  return {
+    system:
+      '你是一位资深系统设计面试官。候选人刚提交了数据库设计：有些数据库用例没过，有些 AI 探测场景把这份 schema 打爆了。你的任务：给每个锚点钉住"下一步只做这一件事"——杠杆最高的那一个动作。title 一句话说清动作；rationale 必须引用锚点给出的实测数字，不许泛泛而谈；actions 给出该动作的结构化形式（schema 操作，用户会一键应用）。每个锚点恰好一条，不要多给、不要漏。只输出 JSON，不要输出其它文字。',
+    user:
+      `题目：${ctx.problemName}\n候选人数据库 schema：\n${ctx.schemaSummary}\n\n` +
+      `数据库模拟实测：\n${ctx.simSummary}\n\n` +
+      `锚点（每个都要恰好一条下一步）：\n${ctx.anchors.map((a) => `- [${a.anchorId}] ${a.kind === 'case' ? '未过用例' : '已验证探测'}「${a.title}」：${a.facts.join('；')}`).join('\n')}\n\n` +
+      `输出 JSON：{"steps":[{"anchorId":"<锚点 id，原样抄>","title":"一句话动作","rationale":"为什么先做这一步（引用实测数字）","actions":[{"op":"addIndex","table":"<表名>","field":"<字段名>"}]}]}\n` +
+      `actions【动作保证 · 硬性要求】：只能用 setShardKey / addIndex / setPrimaryKeyGen / setEngine 四种操作，table 与 field 必须真实存在于上面的 schema 摘要里；每条 1–3 个操作。没有合法 actions 的一步会被判不合格并触发修复轮。`,
+  };
+}
+
+/**
+ * Parse the schema next-steps reply: keep exactly the steps whose
+ * anchorId names a real anchor of this submission (unknown/duplicate
+ * ids dropped — the server ladder constructs the missing ones).
+ */
+export function parseSchemaNextSteps(
+  json: unknown,
+  anchorIds: ReadonlySet<string>,
+): SchemaNextStep[] {
+  const arr = Array.isArray(json)
+    ? json
+    : (json as { steps?: unknown })?.steps;
+  if (!Array.isArray(arr)) throw new Error('schema-next-steps: bad shape');
+  const out: SchemaNextStep[] = [];
+  const seen = new Set<string>();
+  for (const raw of arr) {
+    const s = raw as {
+      anchorId?: unknown;
+      title?: unknown;
+      rationale?: unknown;
+      actions?: unknown;
+    } | null;
+    if (!s || typeof s.anchorId !== 'string' || !anchorIds.has(s.anchorId)) continue;
+    if (seen.has(s.anchorId)) continue;
+    seen.add(s.anchorId);
+    const actions = sanitizeSchemaOps(s.actions);
+    out.push({
+      anchorId: s.anchorId,
+      title: typeof s.title === 'string' ? s.title.slice(0, 120) : '',
+      rationale: typeof s.rationale === 'string' ? s.rationale.slice(0, 400) : '',
+      ...(actions.length ? { actions } : {}),
+    });
+  }
+  return out;
+}
+
 // --------------------------------------------------------- next steps ---
 //
 // The per-case counterpart of the submission review. The review (AI 评审)

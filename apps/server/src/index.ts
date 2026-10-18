@@ -16,6 +16,8 @@ import {
 } from '@sds/checker';
 import type {
   ExecutedScenario,
+  SchemaNextStepAnchor,
+  SchemaNextStepsContext,
   SchemaProbeContext,
   StructuralFindingLike,
 } from '@sds/driver';
@@ -27,6 +29,7 @@ import {
   evaluateNextSteps,
   evaluateProbes,
   evaluateSchema,
+  evaluateSchemaNextSteps,
   evaluateSchemaProbes,
   evaluateSubmission,
   toSchemaReviewLike,
@@ -343,12 +346,12 @@ app.post('/api/evaluate', async (c) => {
     typeof body?.problemId === 'string' ? await storage.getProblem(body.problemId) : null;
   if (
     !kind ||
-    !['submission', 'schema', 'followups', 'probe', 'next-steps', 'schema-probe'].includes(kind) ||
+    !['submission', 'schema', 'followups', 'probe', 'next-steps', 'schema-probe', 'schema-next-steps'].includes(kind) ||
     !ctx
   ) {
     return c.json(
       badRequest(
-        "需要 { kind: 'submission' | 'schema' | 'followups' | 'probe' | 'next-steps' | 'schema-probe', context }",
+        "需要 { kind: 'submission' | 'schema' | 'followups' | 'probe' | 'next-steps' | 'schema-probe' | 'schema-next-steps', context }",
       ),
       400,
     );
@@ -419,6 +422,59 @@ app.post('/api/evaluate', async (c) => {
         : {}),
     };
     const outcome = await evaluateSchemaProbes(
+      fullCtx,
+      profileId,
+      raw.schema,
+      reviewSchema(raw.schema, { loadFactor: 0 }),
+    );
+    return c.json({ kind, ...outcome });
+  }
+  if (kind === 'schema-next-steps') {
+    // Schema next steps: the client sends raw material ({ problemName?,
+    // problemId, schema, anchors }) where the anchors are this
+    // submission's failed schema cases + verified failed probes (client-
+    // held results data, like the architecture next-steps' failedCases).
+    // The server assembles the grounded context (schema summary + sim
+    // summary recomputed here) and the ladder validates every action
+    // against the real schema — anchor text is context, never authority.
+    const raw = ctx as {
+      problemName?: string;
+      problemId?: string;
+      schema?: ProblemSchema;
+      anchors?: SchemaNextStepAnchor[];
+    };
+    if (!raw.schema || typeof raw.problemId !== 'string' || !Array.isArray(raw.anchors)) {
+      return c.json(
+        badRequest('schema-next-steps 需要 context.problemId、context.schema 与 context.anchors'),
+        400,
+      );
+    }
+    const prob = await storage.getProblem(raw.problemId).catch(() => null);
+    if (!prob) return c.json({ error: 'problem_not_found' }, 404);
+    const anchors = raw.anchors
+      .filter(
+        (a) =>
+          a &&
+          typeof a.anchorId === 'string' &&
+          (a.kind === 'case' || a.kind === 'probe') &&
+          typeof a.title === 'string' &&
+          Array.isArray(a.facts),
+      )
+      .slice(0, 12)
+      .map((a) => ({
+        anchorId: a.anchorId,
+        kind: a.kind,
+        title: a.title.slice(0, 120),
+        facts: a.facts.filter((f) => typeof f === 'string').slice(0, 6),
+      }));
+    const sim = simulateSchema(prob, raw.schema);
+    const fullCtx: SchemaNextStepsContext = {
+      problemName: raw.problemName ?? prob.name,
+      schemaSummary: buildSchemaSummary(raw.schema),
+      simSummary: buildSchemaSimSummary(sim),
+      anchors,
+    };
+    const outcome = await evaluateSchemaNextSteps(
       fullCtx,
       profileId,
       raw.schema,

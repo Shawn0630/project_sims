@@ -388,6 +388,24 @@ export interface SchemaProbeCaseDTO {
   prediction: SchemaProbePredictionDTO;
 }
 
+/** One anchor for schema next steps: a failed schema case or a
+ *  verified failed schema probe of THIS submission. */
+export interface SchemaNextStepAnchorDTO {
+  anchorId: string;
+  kind: 'case' | 'probe';
+  title: string;
+  facts: string[];
+}
+
+/** One pinned next action for one schema anchor (ladder-guaranteed). */
+export interface SchemaNextStepDTO {
+  anchorId: string;
+  title: string;
+  rationale: string;
+  actions?: SchemaOpDTO[];
+  actionSource?: ActionSourceDTO;
+}
+
 /** One schema probe AFTER simulator verification (the arbiter's record). */
 export interface VerifiedSchemaProbeDTO {
   name: string;
@@ -779,6 +797,15 @@ export function evaluateOnServer<T>(
 export function evaluateOnServer<T>(
   kind: 'schema-probe',
   context: { problemName: string; problemId: string; schema: ProblemSchemaDTO },
+): Promise<EvaluateResponseDTO<T>>;
+export function evaluateOnServer<T>(
+  kind: 'schema-next-steps',
+  context: {
+    problemName: string;
+    problemId: string;
+    schema: ProblemSchemaDTO;
+    anchors: SchemaNextStepAnchorDTO[];
+  },
 ): Promise<EvaluateResponseDTO<T>>;
 export function evaluateOnServer<T>(
   kind: 'submission' | 'schema' | 'followups' | 'probe' | 'next-steps' | 'schema-probe' | 'schema-next-steps',

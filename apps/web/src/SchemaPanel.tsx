@@ -4,6 +4,7 @@ import type {
   ActionCoverageDTO,
   ProblemSchemaDTO,
   SchemaAssessmentDTO,
+  SchemaNextStepDTO,
   SchemaOpDTO,
   SchemaSignalsDTO,
   SchemaSimDTO,
@@ -429,6 +430,82 @@ export function SchemaProbeSection(props: {
               </div>
             );
           })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 🎯 数据库下一步 — ONE pinned action per anchor (failed schema case /
+ * verified failed probe), the database mirror of the architecture
+ * next-steps section. Every step's badge says where its actions came
+ * from; applying goes through the schema-op preview/confirm into the
+ * draft, and judging refreshes only on re-submit (stale semantics).
+ */
+export function SchemaNextStepsSection(props: {
+  busy: boolean;
+  error: string | null;
+  note: string | null;
+  steps: SchemaNextStepDTO[] | null;
+  /** anchorId → display name, from the judged schema suite / probes. */
+  anchorNames: Record<string, string>;
+  sourceLabel: string;
+  coverage?: ActionCoverageDTO | null;
+  onApplyFix: (title: string, actions: SchemaOpDTO[]) => void;
+}) {
+  const { busy, error, note, steps, sourceLabel } = props;
+  return (
+    <div style={{ border: '1px solid #1e293b', borderRadius: 8, padding: '10px 12px', background: '#0b1220', marginBottom: 12 }}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <b>🎯 数据库下一步</b>
+        <span style={{ color: '#94a3b8', fontSize: 12 }}>每个未过用例 / 被打爆的探测一条 · 应用后重新提交即可验证</span>
+        {sourceLabel && (
+          <span style={{ color: '#94a3b8', fontSize: 12, marginLeft: 'auto' }}>生成：{sourceLabel}</span>
+        )}
+      </div>
+      {props.coverage && steps && steps.length > 0 && <CoverageLine coverage={props.coverage} />}
+      {busy && (
+        <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>
+          生成中…（正在针对每个锚点钉一条最高杠杆的动作）
+        </div>
+      )}
+      {!busy && error && (
+        <div style={{ color: '#fca5a5', fontSize: 13, marginTop: 6 }}>{error}</div>
+      )}
+      {!busy && !error && note && (
+        <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>{note}</div>
+      )}
+      {!busy && !error && steps && steps.length === 0 && (
+        <div style={{ color: '#4ade80', fontSize: 13, marginTop: 6 }}>
+          数据库用例与探测都扛住了——这一轮没有需要钉的下一步。
+        </div>
+      )}
+      {steps && steps.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+          {steps.map((s) => (
+            <div key={s.anchorId} className="case-row">
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                <span className="chip chip-fail">{s.anchorId.startsWith('probe:') ? '探测未过' : '未通过'}</span>
+                <b>{props.anchorNames[s.anchorId] ?? s.anchorId}</b>
+              </div>
+              <div style={{ fontSize: 13, marginTop: 4, color: '#e2e8f0' }}>{s.title}</div>
+              {s.rationale && (
+                <div style={{ fontSize: 12.5, marginTop: 3, color: '#94a3b8' }}>{s.rationale}</div>
+              )}
+              {s.actions && s.actions.length > 0 && (
+                <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                  <button
+                    onClick={() => props.onApplyFix(s.title, s.actions!)}
+                    title="预览这一步的改动，确认后才应用到数据库设计草稿"
+                  >
+                    ✨ 应用此改进
+                  </button>
+                  {s.actionSource && <ActionSourceLabel source={s.actionSource} />}
+                </div>
+              )}
+            </div>
+          ))}
         </div>
       )}
     </div>
