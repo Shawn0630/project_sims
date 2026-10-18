@@ -387,6 +387,7 @@ ${d.idConflict ? '<span class="badge bad">id 与现有题包冲突</span>' : ''}
 </div>
 <div class="small" style="margin-top:4px">
 用例 ${d.caseCount} 个 · 有效 ${d.validCaseCount} · 弱区分度 ${d.weakCount} ·
+数据库用例 ${d.schemaCaseCount ?? 0} 个 · 有效 ${d.validSchemaCaseCount ?? 0} ·
 参考解通过率 ${Math.round((d.referencePassRate ?? 0) * 100)}%
 ${d.rejectReason ? `<div class="err">驳回原因：${esc(d.rejectReason)}</div>` : ''}
 </div>
@@ -546,6 +547,7 @@ ${d.status === 'rejected' ? '<span class="badge bad">已驳回</span>' : '<span 
 </div>
 <div class="small" style="margin-top:4px">
 用例 ${d.caseCount} 个 · 有效 ${d.validCaseCount} · 弱区分度 ${d.weakCount} ·
+数据库用例 ${d.schemaCaseCount ?? 0} 个 · 有效 ${d.validSchemaCaseCount ?? 0} ·
 参考解过现有套件：${d.referenceSolvesExisting ? '<span class="ok-text">全部通过</span>' : '<span class="err">未全过</span>'} ·
 结构筛查 high ${d.highSeverityCount} 条
 ${d.rejectReason ? `<div class="err">驳回原因：${esc(d.rejectReason)}</div>` : ''}

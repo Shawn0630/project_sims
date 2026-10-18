@@ -1629,7 +1629,8 @@ export const GENERATION_CRITERIA = `出题标准（本系统的口径，生成�
 - 用例形状：traffic.rps 是绝对值（相对题目基线 RPS 的 0.2–10 倍之间取值）；traffic.readRatio 0–1；durationTicks 10–120（1 tick ≈ 1 秒）；events 至多 3 个，类型只能取 viral_post（网红爆帖）/ cache_stampede（缓存雪崩）/ hot_key（热点 key）/ peak（流量峰值）/ rw_flip（读写比翻转），可带 targetType（组件类型）、magnitude（1–10）、atTick、durationTicks；kills 至多 3 个，按组件类型在 atTick 杀节点。
 - 阈值口径（checker 单位：错误率/利用率是 0–1 的小数，不是百分数）：基线场景 maxErrorRate 0.001、maxP99Ms 按题面延迟要求（一般 400–500）、maxHottestUtil 0.95；峰值/事件场景 maxErrorRate 0.01–0.02、maxP99Ms 1000 以内；成本红线 maxCostPerHour 不超过题目预算；maxStaleReadRate 红线 0.05；maxStorageQps 按存储层可承受入站设；每个用例至少给一项阈值。
 - 区分度（新用例的价值所在）：隐藏用例要能让"凑合的示例级设计"翻车、又让一份认真的参考解通过——阈值严到参考解也过不了的用例是无效用例（会被系统剔除），松到弱设计也能过的隐藏用例会被标记弱区分度。优先攻击题目已有的考点维度（热点、雪崩、单点、成本、一致性），但不要克隆现有用例的场景。
-- 参考解契约：referenceSolution 必须能通过这道题的【全部现有用例 + 你新生成的全部用例】——系统会拿它逐例真跑，挂任何一例，整份生成作废。设计只能用组件目录里的类型与合法参数；schema 要覆盖题目的访问模式（主键/索引/分片键选型要经得起推敲），行数规模与题面量级一致。`;
+- 参考解契约：referenceSolution 必须能通过这道题的【全部现有用例 + 你新生成的全部用例】——系统会拿它逐例真跑，挂任何一例，整份生成作废。设计只能用组件目录里的类型与合法参数；schema 要覆盖题目的访问模式（主键/索引/分片键选型要经得起推敲），行数规模与题面量级一致。
+- 数据库用例（schemaCases，与架构用例并行的一套判卷）：断言只能用四种形状——{"kind":"pattern","patternId":"<模式id>","metric":"p99Ms"|"rowsExamined","max":数}（某模式在某规模下的 P99/扫描行数上限）；{"kind":"pattern-path","patternId":"<模式id>","forbiddenPaths":["全表扫描"|"跨分片广播"]}（某模式不得走灾难路径）；{"kind":"table","table":"<表名>","metric":"hottestShardUtil"|"writeAmp","max":数}（某表最热分片利用率/写放大上限）；{"kind":"global","metric":"sustainableQps","min":数}（整体可持续流量下限）。每条带 scale："now"|"grown"（当前规模/数据量 ×10)。口径同架构用例：referenceSolution.schema 必须通过你出的【全部】数据库用例（挂掉的会被剔除）；起始 schema（整题模式是 schema 字段、扩充模式是题目自带草稿）至少要挂掉一个隐藏数据库用例，全都能过的隐藏用例会被标弱区分度。阈值按数据库模拟的实测量级设：全表扫描的行数是表行数级（百万起），索引查询是千级以内；利用率红线一般 0.1–1；别拍脑袋给参考 schema 也过不了的数。`;
 
 /** Everything the generator may look at for ONE existing problem. */
 export interface GenerationContext {
@@ -1745,8 +1746,94 @@ export interface GeneratedSchema {
   accessPatterns: GeneratedAccessPattern[];
 }
 
+/**
+ * One generated SCHEMA test case — the structural mirror of
+ * @sds/problems SchemaTestCase (the driver contract stays free of a
+ * problems dependency; the server converts 1:1). Assertions are phrased
+ * over the schema simulator's measured output, exactly like the native
+ * suites: the reference schema must pass every one of them, and the
+ * starter schema should fail at least one hidden one (discrimination).
+ */
+export type GeneratedSchemaAssertion =
+  | { kind: 'pattern'; patternId: string; metric: 'p99Ms' | 'rowsExamined'; max: number }
+  | { kind: 'pattern-path'; patternId: string; forbiddenPaths: Array<'全表扫描' | '跨分片广播'> }
+  | { kind: 'table'; table: string; metric: 'hottestShardUtil' | 'writeAmp'; max: number }
+  | { kind: 'global'; metric: 'sustainableQps'; min: number };
+
+export interface GeneratedSchemaCase {
+  /** As proposed (may be empty/duplicated) — the server uniquifies. */
+  id: string;
+  name: string;
+  description: string;
+  hidden: boolean;
+  weight: number;
+  scale: 'now' | 'grown';
+  assertion: GeneratedSchemaAssertion;
+}
+
+const SCHEMA_CASE_PATHS: readonly string[] = ['全表扫描', '跨分片广播'];
+
+/** Validate + clamp ONE generated schema case; malformed → null. */
+export function normalizeGeneratedSchemaCase(raw: unknown): GeneratedSchemaCase | null {
+  const o = raw as Record<string, unknown> | null;
+  if (!o || typeof o !== 'object' || typeof o.name !== 'string' || !o.name.trim()) return null;
+  const a = (o.assertion ?? {}) as Record<string, unknown>;
+  let assertion: GeneratedSchemaAssertion | null = null;
+  if (a.kind === 'pattern' && typeof a.patternId === 'string' && a.patternId) {
+    const max = clampNum(a.max, 0.001, 1e12);
+    if (max !== undefined && (a.metric === 'p99Ms' || a.metric === 'rowsExamined')) {
+      assertion = { kind: 'pattern', patternId: a.patternId, metric: a.metric, max };
+    }
+  } else if (a.kind === 'pattern-path' && typeof a.patternId === 'string' && a.patternId) {
+    const paths = Array.isArray(a.forbiddenPaths)
+      ? a.forbiddenPaths.map(String).filter((p) => SCHEMA_CASE_PATHS.includes(p))
+      : [];
+    if (paths.length) {
+      assertion = {
+        kind: 'pattern-path',
+        patternId: a.patternId,
+        forbiddenPaths: [...new Set(paths)] as Array<'全表扫描' | '跨分片广播'>,
+      };
+    }
+  } else if (a.kind === 'table' && typeof a.table === 'string' && a.table) {
+    const max = clampNum(a.max, 0.001, 1000);
+    if (max !== undefined && (a.metric === 'hottestShardUtil' || a.metric === 'writeAmp')) {
+      assertion = { kind: 'table', table: a.table, metric: a.metric, max };
+    }
+  } else if (a.kind === 'global') {
+    const min = clampNum(a.min, 0, 1e12);
+    if (min !== undefined) assertion = { kind: 'global', metric: 'sustainableQps', min };
+  }
+  if (!assertion) return null;
+  return {
+    id: typeof o.id === 'string' ? o.id.trim().slice(0, 60) : '',
+    name: o.name.trim().slice(0, 80),
+    description: typeof o.description === 'string' ? o.description.trim().slice(0, 300) : '',
+    hidden: o.hidden !== false,
+    weight: Math.round(clampNum(o.weight, 1, 5) ?? 1),
+    scale: o.scale === 'grown' ? 'grown' : 'now',
+    assertion,
+  };
+}
+
+/** The `schemaCases` field of a generation reply (cap 8, malformed dropped). */
+export function parseGeneratedSchemaCases(raw: unknown): GeneratedSchemaCase[] {
+  if (!Array.isArray(raw)) return [];
+  const out: GeneratedSchemaCase[] = [];
+  for (const item of raw) {
+    const gc = normalizeGeneratedSchemaCase(item);
+    if (gc) out.push(gc);
+    if (out.length >= 8) break;
+  }
+  return out;
+}
+
 export interface ParsedGeneration {
   cases: GeneratedCase[];
+  /** Schema test cases for the problem (possibly empty in a bad reply —
+   *  the validation pipeline reports that honestly rather than the
+   *  parser throwing away an otherwise good generation). */
+  schemaCases: GeneratedSchemaCase[];
   referenceSolution: { design: GeneratedDesign; schema: GeneratedSchema };
 }
 
@@ -1764,8 +1851,9 @@ export function buildGenerationPrompt(ctx: GenerationContext): { system: string;
       `组件目录（参考解只能使用这些组件类型与合法参数）：\n${ctx.componentCatalog}\n\n` +
       `题目自带的 schema 草稿（参考解的 schema 可以在此基础上改进，但要覆盖同样的访问模式）：\n${ctx.schemaSummary}\n\n` +
       `${ctx.criteria}\n\n` +
-      `本次生成 ${ctx.caseCount} 个新用例${ctx.focus ? `，作者指定的侧重：${ctx.focus}` : ''}。可见/隐藏搭配：多数设为隐藏（hidden=true），可留 0–1 个可见基线型。\n\n` +
-      `输出 JSON：{"cases":[{"id":"小写连字符 id","name":"用例名（点明场景）","description":"一句话说明","hidden":true,"weight":2,"traffic":{"rps":2500,"readRatio":0.97},"durationTicks":40,"events":[{"atTick":3,"type":"hot_key","targetType":"relationaldb","magnitude":3,"durationTicks":30}],"kills":[{"componentType":"appserver","atTick":5}],"thresholds":{"maxErrorRate":0.02,"maxP99Ms":1000},"hint":"挂了之后给候选人看的修复方向","exposesRule":"spof"}],"referenceSolution":{"design":{"nodes":[{"id":"节点id","type":"cache","settings":{"replicas":2,"mutexRebuild":true}}],"edges":[{"from":"上游节点id","to":"下游节点id"}]},"schema":{"tables":[{"name":"urls","engine":"relational","rows":1000000000,"primaryKey":"id","primaryKeyGen":"snowflake","shardKey":"short_code","fields":[{"name":"id","type":"bigint","indexed":true}]}],"accessPatterns":[{"id":"p1","name":"按短码跳转","table":"urls","kind":"read","byField":"short_code","perSec":5000}]}}}\n` +
+      `本次生成 ${ctx.caseCount} 个新用例${ctx.focus ? `，作者指定的侧重：${ctx.focus}` : ''}。可见/隐藏搭配：多数设为隐藏（hidden=true），可留 0–1 个可见基线型。\n` +
+      `同时生成 2–4 个数据库用例（schemaCases）：针对这道题 schema 的真实弱点出题，至少 1 个隐藏硬例要能让题目自带的 schema 草稿挂掉，参考解的 schema 必须全过。\n\n` +
+      `输出 JSON：{"cases":[{"id":"小写连字符 id","name":"用例名（点明场景）","description":"一句话说明","hidden":true,"weight":2,"traffic":{"rps":2500,"readRatio":0.97},"durationTicks":40,"events":[{"atTick":3,"type":"hot_key","targetType":"relationaldb","magnitude":3,"durationTicks":30}],"kills":[{"componentType":"appserver","atTick":5}],"thresholds":{"maxErrorRate":0.02,"maxP99Ms":1000},"hint":"挂了之后给候选人看的修复方向","exposesRule":"spof"}],"schemaCases":[{"id":"sc1","name":"数据库用例名","description":"一句话说明","hidden":true,"weight":2,"scale":"grown","assertion":{"kind":"pattern","patternId":"p1","metric":"rowsExamined","max":10000}}],"referenceSolution":{"design":{"nodes":[{"id":"节点id","type":"cache","settings":{"replicas":2,"mutexRebuild":true}}],"edges":[{"from":"上游节点id","to":"下游节点id"}]},"schema":{"tables":[{"name":"urls","engine":"relational","rows":1000000000,"primaryKey":"id","primaryKeyGen":"snowflake","shardKey":"short_code","fields":[{"name":"id","type":"bigint","indexed":true}]}],"accessPatterns":[{"id":"p1","name":"按短码跳转","table":"urls","kind":"read","byField":"short_code","perSec":5000}]}}}\n` +
       `events/kills 没有就给空数组；thresholds 至少一项；settings 只给与默认不同的参数即可（replicas/capacityScale 通用；网关 rateLimitPerSec；缓存 mutexRebuild/eviction；负载均衡 lbAlgorithm；关系型 DB 与 NoSQL 的 sharded/shardKey/readReplicas/consistency）；design 的每个节点都要有至少一条连线，流量从 client 出发要能走到存储层。`,
   };
 }
@@ -1963,7 +2051,7 @@ export function parseGeneration(
   json: unknown,
   opts: { baselineRps: number; defaultReadRatio: number },
 ): ParsedGeneration {
-  const o = json as { cases?: unknown; referenceSolution?: unknown } | null;
+  const o = json as { cases?: unknown; schemaCases?: unknown; referenceSolution?: unknown } | null;
   if (!o || typeof o !== 'object') throw new Error('generation: bad shape');
   const cases: GeneratedCase[] = [];
   if (Array.isArray(o.cases)) {
@@ -1979,7 +2067,11 @@ export function parseGeneration(
   if (!design) throw new Error('generation: reference design unusable');
   const schema = normalizeGeneratedSchema(ref.schema);
   if (!schema) throw new Error('generation: reference schema unusable');
-  return { cases, referenceSolution: { design, schema } };
+  return {
+    cases,
+    schemaCases: parseGeneratedSchemaCases(o.schemaCases),
+    referenceSolution: { design, schema },
+  };
 }
 
 // ------------------------------------------------- whole-problem generation -
@@ -2057,6 +2149,9 @@ export interface ParsedWholeProblem {
   /** The STARTER schema handed to solvers (not the reference schema). */
   schema: GeneratedSchema;
   cases: GeneratedCase[];
+  /** Schema test cases for the new problem (validated against the
+   *  reference schema + starter discrimination, like `cases`). */
+  schemaCases: GeneratedSchemaCase[];
   /** Deliberately naive starting design — the discrimination baseline. */
   sampleDesign: GeneratedDesign;
   referenceSolution: { design: GeneratedDesign; schema: GeneratedSchema };
@@ -2078,9 +2173,10 @@ export function buildWholeProblemPrompt(ctx: WholeProblemContext): { system: str
       `- workload.patterns 必须与 schema 自洽：pattern 的 table 只能是 schema 里的表；path 是组件类型数组，从 client 出发到存储层；share 合计约 1。\n` +
       `- schema 是给答题者的【起始版】，可以朴素（比如该分片没分片、该加的索引没加），留出改进空间；referenceSolution.schema 是参考答案版（分片/索引/主键生成都经得起推敲）。两者的表集合应一致（同一批表，参数不同）。\n` +
       `- testCases 4–7 个：至少 1 个可见基线型（hidden=false，无 events/kills，稳态流量），其余多数隐藏，覆盖来源暗示的考点（热点、雪崩、单点、成本、一致性…）。每个用例至少一项阈值。\n` +
+      `- schemaCases 2–4 个（数据库用例，形状见出题标准）：起始 schema 至少要挂掉其中一个隐藏用例，referenceSolution.schema 必须全过。\n` +
       `- sampleDesign 故意朴素：单链路、无缓存/无队列、副本少——能过基线、过不了峰值与隐藏用例是理想状态。\n` +
-      `- referenceSolution 必须通过你出的【全部】用例；设计里每个节点都要有连线，流量从 client 出发能走到存储层。\n\n` +
-      `输出 JSON：{"id":"like-system","name":"Design 点赞系统","nameEn":"Design a Like System","difficulty":"中等","tags":["计数","热点","缓存"],"statement":"题面…","functionalRequirements":["点赞/取消点赞","…"],"scale":{"dau":"1 亿 DAU","readRatio":0.95,"peakMultiplier":3,"baselineRps":2000,"budgetCostPerHour":300,"notes":"…"},"workload":{"readRatio":0.95,"consistency":"计数可最终一致…","patterns":[{"id":"w1","name":"查点赞数","kind":"read","description":"…","share":0.8,"path":["client","loadbalancer","appserver","cache","nosql"],"table":"likes","consistency":"eventual","terminalPerSec":5000}]},"schema":{"tables":[{"name":"likes","engine":"nosql","rows":10000000000,"primaryKey":"id","primaryKeyGen":"snowflake","shardKey":null,"fields":[{"name":"id","type":"bigint","indexed":true},{"name":"target_id","type":"bigint","indexed":true}]}],"accessPatterns":[{"id":"p1","name":"按对象查点赞数","table":"likes","kind":"count","byField":"target_id","perSec":5000}]},"cases":[{"id":"baseline","name":"基线负载","description":"…","hidden":false,"weight":1,"traffic":{"rps":2000,"readRatio":0.95},"durationTicks":30,"events":[],"kills":[],"thresholds":{"maxErrorRate":0.001,"maxP99Ms":500},"hint":"…"}],"sampleDesign":{"nodes":[{"id":"app","type":"appserver","settings":{}}],"edges":[]},"referenceSolution":{"design":{"nodes":[{"id":"c","type":"client","settings":{}}],"edges":[]},"schema":{"tables":[],"accessPatterns":[]}}}`,
+      `- referenceSolution 必须通过你出的【全部】用例（架构 + 数据库）；设计里每个节点都要有连线，流量从 client 出发能走到存储层。\n\n` +
+      `输出 JSON：{"id":"like-system","name":"Design 点赞系统","nameEn":"Design a Like System","difficulty":"中等","tags":["计数","热点","缓存"],"statement":"题面…","functionalRequirements":["点赞/取消点赞","…"],"scale":{"dau":"1 亿 DAU","readRatio":0.95,"peakMultiplier":3,"baselineRps":2000,"budgetCostPerHour":300,"notes":"…"},"workload":{"readRatio":0.95,"consistency":"计数可最终一致…","patterns":[{"id":"w1","name":"查点赞数","kind":"read","description":"…","share":0.8,"path":["client","loadbalancer","appserver","cache","nosql"],"table":"likes","consistency":"eventual","terminalPerSec":5000}]},"schema":{"tables":[{"name":"likes","engine":"nosql","rows":10000000000,"primaryKey":"id","primaryKeyGen":"snowflake","shardKey":null,"fields":[{"name":"id","type":"bigint","indexed":true},{"name":"target_id","type":"bigint","indexed":true}]}],"accessPatterns":[{"id":"p1","name":"按对象查点赞数","table":"likes","kind":"count","byField":"target_id","perSec":5000}]},"cases":[{"id":"baseline","name":"基线负载","description":"…","hidden":false,"weight":1,"traffic":{"rps":2000,"readRatio":0.95},"durationTicks":30,"events":[],"kills":[],"thresholds":{"maxErrorRate":0.001,"maxP99Ms":500},"hint":"…"}],"schemaCases":[{"id":"sc1","name":"点赞数查询不能全表扫描","description":"…","hidden":true,"weight":2,"scale":"now","assertion":{"kind":"pattern-path","patternId":"p1","forbiddenPaths":["全表扫描"]}}],"sampleDesign":{"nodes":[{"id":"app","type":"appserver","settings":{}}],"edges":[]},"referenceSolution":{"design":{"nodes":[{"id":"c","type":"client","settings":{}}],"edges":[]},"schema":{"tables":[],"accessPatterns":[]}}}`,
   };
 }
 
@@ -2222,6 +2318,7 @@ export function parseWholeProblem(json: unknown): ParsedWholeProblem {
     workload: normalizeGeneratedWorkload(o.workload, tableNames, scaleReadRatio),
     schema,
     cases,
+    schemaCases: parseGeneratedSchemaCases(o.schemaCases),
     sampleDesign,
     referenceSolution: { design: refDesign, schema: refSchema },
   };

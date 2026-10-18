@@ -5,6 +5,7 @@ import type { Hono } from 'hono';
 import {
   applyEditOps,
   checkStructure,
+  judgeSchemaCases,
   runSuite,
   runTestCase,
   validateEditOps,
@@ -17,12 +18,19 @@ import {
   type GeneratedCase,
   type GeneratedDesign,
   type GeneratedSchema,
+  type GeneratedSchemaCase,
   type GenerationContext,
   type ParsedGeneration,
   type ParsedWholeProblem,
   type WholeProblemContext,
 } from '@sds/driver';
-import type { ProblemDef, ProblemSchema, TestCase, WorkloadPattern } from '@sds/problems';
+import type {
+  ProblemDef,
+  ProblemSchema,
+  SchemaTestCase,
+  TestCase,
+  WorkloadPattern,
+} from '@sds/problems';
 import {
   SimulationEngine,
   defaultSettings,
@@ -60,13 +68,19 @@ import type { ProblemStorage } from './storage';
  *      weak sampleDesign (a hidden case the weak design passes is
  *      flagged 弱区分度 for the author to judge);
  *   6. checkStructure screens the reference design (reported, not fatal).
+ *   7. schema cases ride the same discipline on the database side: the
+ *      reference schema must pass each generated schema case (failures
+ *      are 无效用例）, the pack's starter schema is the discrimination
+ *      baseline, and accept re-verifies the reference schema against the
+ *      ENTIRE merged schema suite before writing.
  *
  * Drafts live in data/generations/<problemId>-<ts>.json (gitignored —
  * machine-local authoring state, like the LLM call log). Accepting a
- * draft merges its valid cases into the pack and stores the reference
- * solution as the pack's admin-only `referenceSolution` field, which
- * packs.ts strips from every solver-facing response. Accepted cases are
- * ordinary TestCases in the pack: judging, case-scenario serving and
+ * draft merges its valid cases (architecture + schema) into the pack and
+ * stores the reference solution as the pack's admin-only
+ * `referenceSolution` field, which packs.ts strips from every
+ * solver-facing response. Accepted cases are ordinary TestCases /
+ * SchemaTestCases in the pack: judging, case-scenario serving and
  * case-fix linking treat them exactly like built-in cases.
  */
 
@@ -90,6 +104,25 @@ export interface GenerationCaseValidation {
   verdict: '有效' | '无效用例';
 }
 
+/** One generated SCHEMA case's validation record — the schema-side
+ *  mirror of GenerationCaseValidation, judged by the schema simulator. */
+export interface SchemaCaseValidation {
+  caseId: string;
+  name: string;
+  hidden: boolean;
+  /** The reference schema passed this generated schema case. */
+  referencePassed: boolean;
+  referenceFailures: string[];
+  /** The starter schema's verdict — the discrimination baseline. */
+  starterPassed: boolean;
+  starterFailures: string[];
+  /** Hidden schema case the starter schema passes anyway. */
+  weakDiscrimination: boolean;
+  /** May be merged on accept (= the reference schema passes it). */
+  acceptable: boolean;
+  verdict: '有效' | '无效用例';
+}
+
 export interface GenerationReport {
   /** Reference vs the problem's pre-existing suite (null when the
    *  reference design was too broken to run at all). */
@@ -102,6 +135,17 @@ export interface GenerationReport {
   referenceSolvesExisting: boolean;
   livenessOk: boolean;
   cases: GenerationCaseValidation[];
+  /** Generated schema cases, judged against the reference schema
+   *  (pass = acceptable) and the starter schema (discrimination). */
+  schemaCases: SchemaCaseValidation[];
+  validSchemaCaseCount: number;
+  /** Reference schema vs the pack's PRE-EXISTING schema cases — the
+   *  accept gate re-runs exactly this against the merged pack. */
+  referenceVsExistingSchemaCases: {
+    passedCount: number;
+    totalCount: number;
+    failures: { caseId: string; name: string; failures: string[] }[];
+  } | null;
   structuralFindings: {
     ruleId: string;
     severity: 'high' | 'medium' | 'low';
@@ -111,6 +155,50 @@ export interface GenerationReport {
   }[];
   highSeverityCount: number;
   validCaseCount: number;
+}
+
+/** GeneratedSchemaCase → the pack shape (structurally identical). */
+export function toSchemaTestCase(gc: GeneratedSchemaCase): SchemaTestCase {
+  return {
+    id: gc.id,
+    name: gc.name,
+    description: gc.description,
+    hidden: gc.hidden,
+    weight: gc.weight,
+    scale: gc.scale,
+    assertion: gc.assertion as SchemaTestCase['assertion'],
+  };
+}
+
+/**
+ * Judge generated schema cases the way the whole pipeline judges
+ * everything: by running the arbiter. The reference schema must pass a
+ * case for it to be acceptable; the starter schema's result is the
+ * discrimination baseline (a hidden case it passes is 弱区分度）.
+ */
+export function validateGeneratedSchemaCases(
+  problem: ProblemDef,
+  schemaCases: SchemaTestCase[],
+  referenceSchema: ProblemSchema,
+  starterSchema: ProblemSchema,
+): SchemaCaseValidation[] {
+  return schemaCases.map((tc) => {
+    const probe = { ...problem, schemaTestCases: [tc] };
+    const ref = judgeSchemaCases(probe, referenceSchema).results[0]!;
+    const starter = judgeSchemaCases(probe, starterSchema).results[0]!;
+    return {
+      caseId: tc.id,
+      name: tc.name,
+      hidden: tc.hidden,
+      referencePassed: ref.passed,
+      referenceFailures: ref.failures,
+      starterPassed: starter.passed,
+      starterFailures: starter.failures,
+      weakDiscrimination: tc.hidden && starter.passed,
+      acceptable: ref.passed,
+      verdict: ref.passed ? ('有效' as const) : ('无效用例' as const),
+    };
+  });
 }
 
 export interface GenerationDraft {
@@ -132,6 +220,8 @@ export interface GenerationDraft {
   /** Normalization notes (dropped settings/edges/nodes…). */
   notes: string[];
   cases: TestCase[];
+  /** Generated schema test cases (accept merges the acceptable ones). */
+  schemaCases: SchemaTestCase[];
   referenceSolution: { design: Design; schema: ProblemSchema };
   report: GenerationReport;
 }
@@ -419,6 +509,19 @@ export function validateGeneration(
   );
   const cases = idCases.map(toTestCase);
 
+  // 1b. Schema case ids: unique vs the pack's schema cases and the batch.
+  const { items: idSchemaCases, renames: schemaRenames } = uniquifyIds(
+    new Set((problem.schemaTestCases ?? []).map((tc) => tc.id)),
+    parsed.schemaCases,
+  );
+  const schemaCases = idSchemaCases.map(toSchemaTestCase);
+  for (const r of schemaRenames) {
+    notes.push(`数据库用例 id「${r.from}」与已有用例冲突，已改名为「${r.to}」`);
+  }
+  if (!parsed.schemaCases.length) {
+    notes.push('本次生成没有产出数据库用例（schemaCases 为空）——采纳时不会新增数据库用例');
+  }
+
   // 2. Reference design assembly + schema (parse already shape-checked).
   const assembled = assembleReferenceDesign(parsed.referenceSolution.design);
   notes.push(...assembled.notes);
@@ -438,6 +541,7 @@ export function validateGeneration(
     renames,
     notes,
     cases,
+    schemaCases,
     referenceSolution,
   };
 
@@ -451,6 +555,9 @@ export function validateGeneration(
         referenceSolvesExisting: false,
         livenessOk: false,
         cases: [],
+        schemaCases: [],
+        validSchemaCaseCount: 0,
+        referenceVsExistingSchemaCases: null,
         structuralFindings: [],
         highSeverityCount: 0,
         validCaseCount: 0,
@@ -503,6 +610,29 @@ export function validateGeneration(
     componentIds: f.componentIds,
   }));
 
+  // 7. Schema cases: the reference schema must pass each generated one;
+  //    the pack's starter schema is the discrimination baseline. The
+  //    reference schema is ALSO run against the pack's pre-existing
+  //    schema cases (reported here; the accept gate enforces it).
+  const schemaCaseReports = validateGeneratedSchemaCases(
+    problem,
+    schemaCases,
+    schema,
+    problem.schema,
+  );
+  const existingSchemaSuite = (problem.schemaTestCases ?? []).length
+    ? judgeSchemaCases(problem, schema)
+    : null;
+  const referenceVsExistingSchemaCases = existingSchemaSuite
+    ? {
+        passedCount: existingSchemaSuite.passedCount,
+        totalCount: existingSchemaSuite.totalCount,
+        failures: existingSchemaSuite.results
+          .filter((r) => !r.passed)
+          .map((r) => ({ caseId: r.caseId, name: r.name, failures: r.failures })),
+      }
+    : null;
+
   const rejected = !livenessOk || !referenceSolvesExisting;
   return {
     ...base,
@@ -519,6 +649,9 @@ export function validateGeneration(
       referenceSolvesExisting,
       livenessOk,
       cases: caseReports,
+      schemaCases: schemaCaseReports,
+      validSchemaCaseCount: schemaCaseReports.filter((v) => v.acceptable).length,
+      referenceVsExistingSchemaCases,
       structuralFindings,
       highSeverityCount: structuralFindings.filter((f) => f.severity === 'high').length,
       validCaseCount: caseReports.filter((v) => v.acceptable).length,
@@ -602,6 +735,8 @@ export interface GenerationDraftSummary {
   weakCount: number;
   referenceSolvesExisting: boolean;
   highSeverityCount: number;
+  schemaCaseCount: number;
+  validSchemaCaseCount: number;
 }
 
 export function summarizeDraft(draft: GenerationDraft): GenerationDraftSummary {
@@ -620,6 +755,8 @@ export function summarizeDraft(draft: GenerationDraft): GenerationDraftSummary {
     weakCount: draft.report.cases.filter((v) => v.weakDiscrimination).length,
     referenceSolvesExisting: draft.report.referenceSolvesExisting,
     highSeverityCount: draft.report.highSeverityCount,
+    schemaCaseCount: draft.schemaCases.length,
+    validSchemaCaseCount: draft.report.validSchemaCaseCount,
   };
 }
 
@@ -649,6 +786,12 @@ export function summarizeDraft(draft: GenerationDraft): GenerationDraftSummary {
  *      (a starting design that cannot do anything is bad teaching);
  *   5. a proposed id colliding with the existing bank is FLAGGED on the
  *      draft; accept returns 409 until the admin renames it.
+ *   6. schema cases mirror the architecture side: the reference schema
+ *      must pass every generated schema case (failures excluded on
+ *      accept), the starter schema should fail at least one hidden one
+ *      (else 弱区分度 warnings), and accept requires at least one valid
+ *      schema case and re-verifies the reference schema against the
+ *      shipped schema suite.
  *
  * Accepting writes data/problems/<id>.json (only the valid cases ship);
  * the reference solution rides along as the pack's admin-only field and
@@ -669,6 +812,12 @@ export interface WholeProblemReport {
   sampleBaselinePassedCount: number;
   sampleBaselineTotalCount: number;
   sampleAllBaselineFailed: boolean;
+  /** Generated schema cases: reference-schema verdicts + starter
+   *  discrimination, the database mirror of `cases`. */
+  schemaCases: SchemaCaseValidation[];
+  validSchemaCaseCount: number;
+  /** The starter schema fails at least one HIDDEN schema case. */
+  schemaDiscriminationOk: boolean;
   warnings: string[];
   structuralFindings: GenerationReport['structuralFindings'];
   highSeverityCount: number;
@@ -870,6 +1019,38 @@ export function validateProblemDefShape(pack: unknown): string[] {
     }
     if (!visible) errs.push('至少需要一个可见用例');
   }
+  // schemaTestCases (optional field, but when present it must be a
+  // judgeable suite: unique ids, legal assertion shapes, references
+  // that exist in the schema).
+  if (p.schemaTestCases !== undefined) {
+    if (!Array.isArray(p.schemaTestCases)) {
+      errs.push('schemaTestCases 不是数组');
+    } else {
+      const patternIds = new Set((p.schema?.accessPatterns ?? []).map((a) => a.id));
+      const scIds = new Set<string>();
+      for (const sc of p.schemaTestCases) {
+        if (!sc.id || scIds.has(sc.id)) errs.push(`数据库用例 id 重复或为空「${sc.id}」`);
+        scIds.add(sc.id);
+        const a = sc.assertion as { kind?: string; patternId?: string; table?: string } | undefined;
+        if (!a || typeof a !== 'object') {
+          errs.push(`数据库用例「${sc.name}」缺少断言`);
+        } else if (a.kind === 'pattern' || a.kind === 'pattern-path') {
+          if (!a.patternId || !patternIds.has(a.patternId)) {
+            errs.push(`数据库用例「${sc.name}」引用了不存在的访问模式 ${String(a.patternId)}`);
+          }
+        } else if (a.kind === 'table') {
+          if (!a.table || !tableNames.has(a.table)) {
+            errs.push(`数据库用例「${sc.name}」引用了不存在的表 ${String(a.table)}`);
+          }
+        } else if (a.kind !== 'global') {
+          errs.push(`数据库用例「${sc.name}」的断言类型不合法（${String(a.kind)}）`);
+        }
+        if (sc.scale !== 'now' && sc.scale !== 'grown') {
+          errs.push(`数据库用例「${sc.name}」的 scale 不合法`);
+        }
+      }
+    }
+  }
   errs.push(...designShapeErrors(p.sampleDesign, 'sampleDesign'));
   if (p.referenceSolution) {
     errs.push(...designShapeErrors(p.referenceSolution.design, 'referenceSolution.design'));
@@ -1027,6 +1208,12 @@ export function validateWholeProblem(
   const { items: idCases } = uniquifyIds(new Set<string>(), parsed.cases);
   const cases = idCases.map(toTestCase);
 
+  const { items: idSchemaCases } = uniquifyIds(new Set<string>(), parsed.schemaCases);
+  const schemaCases = idSchemaCases.map(toSchemaTestCase);
+  if (!parsed.schemaCases.length) {
+    notes.push('本次生成没有产出数据库用例（schemaCases 为空）——新题将没有数据库判卷，采纳会被拦');
+  }
+
   const sampleAssembled = assembleReferenceDesign(parsed.sampleDesign);
   for (const n of sampleAssembled.notes) notes.push(`起始设计：${n}`);
   const refAssembled = assembleReferenceDesign(parsed.referenceSolution.design);
@@ -1052,6 +1239,7 @@ export function validateWholeProblem(
       patterns: workloadPatterns,
     },
     testCases: cases,
+    schemaTestCases: schemaCases,
     sampleDesign: sampleAssembled.design,
     referenceSolution: { design: refAssembled.design, schema: referenceSchema },
   };
@@ -1081,6 +1269,9 @@ export function validateWholeProblem(
     sampleBaselinePassedCount: 0,
     sampleBaselineTotalCount: 0,
     sampleAllBaselineFailed: false,
+    schemaCases: [],
+    validSchemaCaseCount: 0,
+    schemaDiscriminationOk: false,
     warnings: warns,
     structuralFindings: [],
     highSeverityCount: 0,
@@ -1167,6 +1358,30 @@ export function validateWholeProblem(
     componentIds: f.componentIds,
   }));
 
+  // Schema cases: the reference schema must pass each one; the starter
+  // schema is the discrimination baseline — it should fail at least one
+  // HIDDEN schema case, else every hidden schema case is weak (warning,
+  // mirroring the sample-design posture; a draft with NO valid schema
+  // case at all cannot be accepted — see acceptWholeProblemDraft).
+  const schemaCaseReports = validateGeneratedSchemaCases(
+    problem,
+    schemaCases,
+    referenceSchema,
+    schema,
+  );
+  const hiddenSchemaCases = schemaCaseReports.filter((v) => v.hidden);
+  const schemaDiscriminationOk = hiddenSchemaCases.some((v) => !v.starterPassed);
+  if (schemaCases.length > 0 && hiddenSchemaCases.length === 0) {
+    warnings.push('数据库用例全是可见用例——没有隐藏数据库用例，区分度无从谈起（标警告，不否决）');
+  } else if (schemaCases.length > 0 && !schemaDiscriminationOk) {
+    warnings.push(
+      '起始 schema 通过了全部隐藏数据库用例——这些用例没有区分度（标警告，不否决）',
+    );
+  }
+  if (schemaCaseReports.filter((v) => v.acceptable).length === 0) {
+    warnings.push('没有一个数据库用例能被参考 schema 通过——采纳会被拦（新题必须带至少一个有效数据库用例）');
+  }
+
   let rejectReason: string | undefined;
   if (!livenessOk) {
     rejectReason =
@@ -1195,6 +1410,9 @@ export function validateWholeProblem(
       sampleBaselinePassedCount: sampleBaselinePassed,
       sampleBaselineTotalCount: sampleBaselineTotal,
       sampleAllBaselineFailed,
+      schemaCases: schemaCaseReports,
+      validSchemaCaseCount: schemaCaseReports.filter((v) => v.acceptable).length,
+      schemaDiscriminationOk,
       warnings,
       structuralFindings,
       highSeverityCount: structuralFindings.filter((f) => f.severity === 'high').length,
@@ -1264,6 +1482,8 @@ export interface WholeProblemDraftSummary {
   weakCount: number;
   idConflict: boolean;
   referencePassRate: number;
+  schemaCaseCount: number;
+  validSchemaCaseCount: number;
 }
 
 export function summarizeWholeDraft(draft: WholeProblemDraft): WholeProblemDraftSummary {
@@ -1284,6 +1504,8 @@ export function summarizeWholeDraft(draft: WholeProblemDraft): WholeProblemDraft
     weakCount: draft.report.cases.filter((v) => v.weakDiscrimination).length,
     idConflict: draft.idConflict,
     referencePassRate: draft.report.referencePassRate,
+    schemaCaseCount: (draft.problem.schemaTestCases ?? []).length,
+    validSchemaCaseCount: draft.report.validSchemaCaseCount,
   };
 }
 
@@ -1351,7 +1573,32 @@ async function acceptWholeProblemDraft(
       409,
     );
   }
-  const finalPack: ProblemDef = { ...problem, testCases: validCases };
+  // Schema cases ship by the same rule: only the ones the reference
+  // schema passes; a new problem must carry at least one valid schema
+  // case (database judging is half of this product now).
+  const validSchemaIds = new Set(
+    draft.report.schemaCases.filter((v) => v.acceptable).map((v) => v.caseId),
+  );
+  const validSchemaCases = (problem.schemaTestCases ?? []).filter((tc) =>
+    validSchemaIds.has(tc.id),
+  );
+  const droppedSchemaCaseIds = (problem.schemaTestCases ?? [])
+    .filter((tc) => !validSchemaIds.has(tc.id))
+    .map((tc) => tc.id);
+  if (!validSchemaCases.length) {
+    return c.json(
+      {
+        error: 'no_valid_schema_cases',
+        message: '这份生成里没有通过参考 schema 验证的有效数据库用例，新题必须至少带一个',
+      },
+      409,
+    );
+  }
+  const finalPack: ProblemDef = {
+    ...problem,
+    testCases: validCases,
+    schemaTestCases: validSchemaCases,
+  };
   const shapeErrors = validateProblemDefShape(finalPack);
   if (shapeErrors.length) {
     return c.json(
@@ -1385,6 +1632,20 @@ async function acceptWholeProblemDraft(
       409,
     );
   }
+  // The reference schema must still pass every shipped schema case.
+  const schemaRecheck = judgeSchemaCases(finalPack, finalPack.referenceSolution!.schema);
+  if (schemaRecheck.passedCount !== schemaRecheck.totalCount) {
+    return c.json(
+      {
+        error: 'reference_schema_stale',
+        message: `采纳前复验未过：参考 schema 现在通过 ${schemaRecheck.passedCount}/${schemaRecheck.totalCount} 个将入库的数据库用例，不能采纳`,
+        failures: schemaRecheck.results
+          .filter((r) => !r.passed)
+          .map((r) => ({ caseId: r.caseId, name: r.name, failures: r.failures })),
+      },
+      409,
+    );
+  }
   await storage.saveProblem(finalPack);
   await deleteGenerationDraft(draft.id);
   return c.json({
@@ -1393,6 +1654,8 @@ async function acceptWholeProblemDraft(
     ...(rename && rename !== draft.problem.id ? { renamedFrom: draft.problem.id } : {}),
     acceptedCaseIds: validCases.map((tc) => tc.id),
     droppedCaseIds,
+    acceptedSchemaCaseIds: validSchemaCases.map((tc) => tc.id),
+    droppedSchemaCaseIds,
     referenceStored: true,
   });
 }
@@ -1654,11 +1917,44 @@ export function registerGenerationRoutes(app: Hono, storage: ProblemStorage): vo
       new Set(pack.testCases.map((tc) => tc.id)),
       validCases,
     );
+    // Schema cases ride along: the draft's acceptable ones merge into
+    // the pack's schemaTestCases (ids re-uniquified against the CURRENT
+    // pack), and the reference schema must pass the ENTIRE merged schema
+    // suite — the same accept-gate discipline as the arch recheck above.
+    const validSchemaIds = new Set(
+      draft.report.schemaCases.filter((v) => v.acceptable).map((v) => v.caseId),
+    );
+    const validSchemaCases = (draft.schemaCases ?? []).filter((tc) =>
+      validSchemaIds.has(tc.id),
+    );
+    const skippedSchemaCaseIds = (draft.schemaCases ?? [])
+      .filter((tc) => !validSchemaIds.has(tc.id))
+      .map((tc) => tc.id);
+    const { items: acceptedSchemaCases, renames: schemaMergeRenames } = uniquifyIds(
+      new Set((pack.schemaTestCases ?? []).map((tc) => tc.id)),
+      validSchemaCases,
+    );
     const merged: ProblemDef = {
       ...pack,
       testCases: [...pack.testCases, ...acceptedCases],
+      schemaTestCases: [...(pack.schemaTestCases ?? []), ...acceptedSchemaCases],
       referenceSolution: draft.referenceSolution,
     };
+    if ((merged.schemaTestCases ?? []).length > 0) {
+      const schemaRecheck = judgeSchemaCases(merged, draft.referenceSolution.schema);
+      if (schemaRecheck.passedCount !== schemaRecheck.totalCount) {
+        return c.json(
+          {
+            error: 'reference_schema_stale',
+            message: `参考 schema 现在只能通过合并后的数据库用例 ${schemaRecheck.passedCount}/${schemaRecheck.totalCount}，不能采纳`,
+            failures: schemaRecheck.results
+              .filter((r) => !r.passed)
+              .map((r) => ({ caseId: r.caseId, name: r.name, failures: r.failures })),
+          },
+          409,
+        );
+      }
+    }
     await storage.saveProblem(merged);
     await deleteGenerationDraft(draft.id);
     return c.json({
@@ -1667,6 +1963,9 @@ export function registerGenerationRoutes(app: Hono, storage: ProblemStorage): vo
       addedCaseIds: acceptedCases.map((tc) => tc.id),
       skippedCaseIds,
       renamedCases: renames,
+      addedSchemaCaseIds: acceptedSchemaCases.map((tc) => tc.id),
+      skippedSchemaCaseIds,
+      renamedSchemaCases: schemaMergeRenames,
       referenceStored: true,
     });
   });
