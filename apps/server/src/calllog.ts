@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { ActionCoverage } from '@sds/driver';
 
 /**
  * LLM call log — every evaluation that flows through /api/evaluate (and,
@@ -45,6 +46,12 @@ export interface LlmCallRecord {
   responseRaw?: string;
   /** The structured result after defensive parsing / scripted generation. */
   responseParsed?: unknown;
+  /**
+   * Action-guarantee accounting (submission / probe / schema calls): how
+   * many assessed findings shipped ≥1 validated action, by provenance.
+   * The logged responseParsed is the ENRICHED result (ladder already run).
+   */
+  actionCoverage?: ActionCoverage;
   /**
    * How many HTTP attempts this logical call took (llm calls only).
    * > 1 means transient upstream failures were retried before the outcome.

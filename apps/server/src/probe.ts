@@ -1,6 +1,7 @@
-import { runTestCase, validateEditOps, type CaseMeasured } from '@sds/checker';
+import { runTestCase, type CaseMeasured } from '@sds/checker';
 import {
   normalizeProbeCase,
+  type ActionCoverage,
   type BreachCategory,
   type ProbeCase,
   type ProbePrediction,
@@ -9,6 +10,7 @@ import {
 } from '@sds/driver';
 import type { ProblemDef, TestCase } from '@sds/problems';
 import type { Design } from '@sds/sim-core';
+import { ensureVerifiedActions } from './actions';
 
 /**
  * Probe verification — the simulator as arbiter.
@@ -120,30 +122,30 @@ export function scenarioSummaryOf(problem: ProblemDef, pc: ProbeCase): string {
 /**
  * Run a batch of raw (untrusted) proposed cases against a design and grade
  * every prediction. Malformed cases are dropped before execution.
+ *
+ * Fix actions: the cases round-tripped through the client, so nothing is
+ * trusted — each willFail prediction's actions are re-validated against
+ * THIS design, and any that do not survive are replaced by rule synthesis
+ * / the universal fallback (ensureVerifiedActions, actions.ts), keeping
+ * the action guarantee true on the verified results too. Verification
+ * itself (scenarios, verdicts, measured values) is untouched by this.
  */
 export function verifyProbes(
   problem: ProblemDef,
   design: Design,
   rawCases: unknown[],
-): VerifiedProbeResult[] {
-  const out: VerifiedProbeResult[] = [];
-  rawCases.slice(0, 4).forEach((raw, i) => {
-    const pc = normalizeProbeCase(raw);
+): { results: VerifiedProbeResult[]; actionCoverage: ActionCoverage } {
+  const raw: VerifiedProbeResult[] = [];
+  rawCases.slice(0, 4).forEach((input, i) => {
+    const pc = normalizeProbeCase(input);
     if (!pc) return;
     const tc = probeToTestCase(problem, pc, i);
     const r = runTestCase(problem, design, tc);
     const actualBreach = r.passed ? null : actualBreachOf(tc, r.measured);
-    // The prediction's structured fix is validated against THIS design
-    // before it is allowed to become a one-click action in the UI —
-    // cases round-tripped through the client, so nothing is trusted.
-    const validActions = validateEditOps(pc.prediction.actions, design);
-    const prediction: ProbePrediction = { ...pc.prediction };
-    if (validActions.length) prediction.actions = validActions;
-    else delete prediction.actions;
-    out.push({
+    raw.push({
       name: pc.name,
       scenarioSummary: scenarioSummaryOf(problem, pc),
-      prediction,
+      prediction: pc.prediction,
       passed: r.passed,
       measured: r.measured,
       failures: r.failures,
@@ -160,5 +162,6 @@ export function verifyProbes(
       },
     });
   });
-  return out;
+  const { results, coverage } = ensureVerifiedActions(raw, problem, design);
+  return { results, actionCoverage: coverage };
 }

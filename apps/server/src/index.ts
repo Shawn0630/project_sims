@@ -191,8 +191,8 @@ app.post('/api/submissions/verify-probes', async (c) => {
   }
   const problem = await storage.getProblem(body.problemId);
   if (!problem) return c.json({ error: 'problem_not_found' }, 404);
-  const results = verifyProbes(problem, body.design, body.cases);
-  return c.json({ problemId: problem.id, results });
+  const { results, actionCoverage } = verifyProbes(problem, body.design, body.cases);
+  return c.json({ problemId: problem.id, results, actionCoverage });
 });
 
 // ------------------------------------------------------------ case scenario -
@@ -230,6 +230,7 @@ app.post('/api/evaluate', async (c) => {
     context?: Record<string, unknown>;
     profileId?: unknown;
     design?: unknown;
+    problemId?: unknown;
   } | null;
   const kind = body?.kind as EvaluateKind | undefined;
   const ctx = body?.context;
@@ -237,10 +238,14 @@ app.post('/api/evaluate', async (c) => {
   // marked userSelectable (enforced in llmconfig.resolveProfileForCall);
   // anything else silently resolves to the server default.
   const profileId = typeof body?.profileId === 'string' ? body.profileId : undefined;
-  // The submitted design, when the client sends it: used ONLY to validate
-  // the fix actions a finding/probe carries (llm.ts keepValidActions) —
+  // The submitted design, when the client sends it: the action-guarantee
+  // ladder validates / repairs / synthesizes fix actions against it —
   // actions that do not validate against it never reach the response.
   const design = isDesign(body?.design) ? body.design : undefined;
+  // The problem the submission belongs to, when named: lets the ladder
+  // measure the design's genuinely hottest node for synthesis/fallback.
+  const problem =
+    typeof body?.problemId === 'string' ? await storage.getProblem(body.problemId) : null;
   if (!kind || !['submission', 'schema', 'followups', 'probe'].includes(kind) || !ctx) {
     return c.json(
       badRequest("需要 { kind: 'submission' | 'schema' | 'followups' | 'probe', context }"),
@@ -253,6 +258,7 @@ app.post('/api/evaluate', async (c) => {
       ctx as unknown as Parameters<typeof evaluateProbes>[0],
       profileId,
       design,
+      problem ?? undefined,
     );
     return c.json({ kind, ...outcome });
   }
@@ -261,6 +267,7 @@ app.post('/api/evaluate', async (c) => {
       ctx as unknown as Parameters<typeof evaluateSubmission>[0],
       profileId,
       design,
+      problem ?? undefined,
     );
     return c.json({ kind, ...outcome });
   }
@@ -299,6 +306,11 @@ app.post('/api/evaluate', async (c) => {
       signals: signals as Parameters<typeof evaluateSchema>[0]['signals'],
     },
     profileId,
+    // The submitted schema + the checker's full report feed the action
+    // ladder: schema-op validation, repair and synthesis all ground on
+    // them. Signals-only requests (no schema) get text-only suggestions.
+    raw.schema,
+    report ?? undefined,
   );
   // When the server computed the signals, return the full checker report too
   // so the client can render the per-pattern table without judging locally.

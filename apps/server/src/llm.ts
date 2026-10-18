@@ -1,4 +1,4 @@
-import { validateEditOps, type SchemaReviewReport } from '@sds/checker';
+import { type SchemaReviewReport } from '@sds/checker';
 import type { Design } from '@sds/sim-core';
 import {
   ScriptedDriver,
@@ -12,7 +12,7 @@ import {
   parseProbeCases,
   parseSchemaAssessment,
   parseSubmissionAssessment,
-  type EditOp,
+  type ActionCoverage,
   type FollowUpContext,
   type FollowUpQuestion,
   type GenerationContext,
@@ -25,7 +25,13 @@ import {
   type SubmissionAssessment,
   type SubmissionAssessmentContext,
 } from '@sds/driver';
-import type { ProblemSchema } from '@sds/problems';
+import type { ProblemDef, ProblemSchema } from '@sds/problems';
+import {
+  guaranteeFindingActions,
+  guaranteePredictionActions,
+  guaranteeSchemaActions,
+  type RepairCall,
+} from './actions';
 import { appendCall } from './calllog';
 import { resolveProfileForCall } from './llmconfig';
 
@@ -84,6 +90,13 @@ export interface EvaluateOutcome<T> {
   profileName: string;
   /** True when the end user picked this profile for this call. */
   viaUserChoice: boolean;
+  /**
+   * Action-guarantee accounting for this evaluation (submission / probe /
+   * schema kinds): how many assessed findings ship ≥1 validated action,
+   * broken down by provenance. Absent on kinds without actions
+   * (followups).
+   */
+  actionCoverage?: ActionCoverage;
 }
 
 const scripted = new ScriptedDriver();
@@ -196,6 +209,21 @@ function hostOf(baseUrl: string): string {
 }
 
 /**
+ * Post-processing hook for the action-guarantee ladder (actions.ts). It
+ * runs INSIDE runLogged — before the call-log record is appended — so the
+ * logged responseParsed is the ENRICHED data (actions attached, sources
+ * tagged) and the record itself carries the coverage accounting. On the
+ * LLM path it receives a repair caller bound to the same resolved
+ * profile; on the scripted path repairCall is null (there is no model
+ * output to repair — synthesis/fallback still run).
+ */
+type EnrichFn<T> = (
+  data: T,
+  repairCall: RepairCall | null,
+  source: 'llm' | 'scripted',
+) => Promise<{ data: T; coverage?: ActionCoverage }>;
+
+/**
  * The single logged evaluation path. With a key configured: assemble the
  * prompt, make ONE model call, log the full request + raw response + parsed
  * result (or the failure), and return the parsed outcome. Without a key —
@@ -209,6 +237,7 @@ async function runLogged<T>(
   parse: (json: unknown) => T,
   scriptedFn: () => Promise<T>,
   profileId?: string,
+  enrich?: EnrichFn<T>,
 ): Promise<EvaluateOutcome<T>> {
   // Resolve the model profile fresh for THIS call: normally the server's
   // active profile; when the end user picked one of the admin-opened
@@ -216,6 +245,87 @@ async function runLogged<T>(
   // switch or a user pick both take effect with no restart.
   const { profile: cfg, viaUserChoice } = await resolveProfileForCall(profileId);
   let fellBackFromError: string | null = null;
+
+  /**
+   * Ladder step 2's call: ONE bounded action-repair re-prompt on the SAME
+   * profile, logged like every other call (same kind; the note marks it
+   * as the repair pass). Returns the parsed JSON, or null when the call
+   * failed / did not parse — the ladder then degrades to rule synthesis.
+   */
+  const repairCall: RepairCall = async (prompt) => {
+    if (!cfg.apiKey) return null;
+    const requestBody = {
+      model: cfg.model,
+      messages: [
+        { role: 'system', content: prompt.system },
+        { role: 'user', content: prompt.user },
+      ],
+      response_format: { type: 'json_object' },
+    };
+    const t0 = Date.now();
+    const { result, attempts } = await chatWithRetry(cfg, requestBody);
+    const attemptErrors = attempts.flatMap((a) => (a.error ? [a.error] : []));
+    const note = '动作修复轮（action-repair pass）：为缺少合法动作的条目补一键修复动作，与主调用同一档案';
+    if (!result) {
+      appendCall({
+        kind,
+        source: 'llm',
+        ok: false,
+        baseUrlHost: hostOf(cfg.baseUrl),
+        model: cfg.model,
+        profileName: cfg.name,
+        viaUserChoice,
+        durationMs: Date.now() - t0,
+        request: requestBody,
+        error: attemptErrors[attemptErrors.length - 1] ?? 'LLM call failed',
+        attempts: attempts.length,
+        attemptErrors,
+        note,
+      });
+      return null;
+    }
+    const raw = result.content;
+    try {
+      const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+      const parsed = JSON.parse(cleaned) as unknown;
+      appendCall({
+        kind,
+        source: 'llm',
+        ok: true,
+        baseUrlHost: hostOf(cfg.baseUrl),
+        model: cfg.model,
+        profileName: cfg.name,
+        viaUserChoice,
+        durationMs: Date.now() - t0,
+        usage: result.usage,
+        request: requestBody,
+        responseRaw: raw,
+        responseParsed: parsed,
+        attempts: attempts.length,
+        ...(attemptErrors.length ? { attemptErrors } : {}),
+        note,
+      });
+      return parsed;
+    } catch (err) {
+      appendCall({
+        kind,
+        source: 'llm',
+        ok: false,
+        baseUrlHost: hostOf(cfg.baseUrl),
+        model: cfg.model,
+        profileName: cfg.name,
+        viaUserChoice,
+        durationMs: Date.now() - t0,
+        request: requestBody,
+        responseRaw: raw,
+        error: err instanceof Error ? err.message : String(err),
+        attempts: attempts.length,
+        ...(attemptErrors.length ? { attemptErrors } : {}),
+        note,
+      });
+      return null;
+    }
+  };
 
   if (cfg.apiKey) {
     const prompt = build();
@@ -240,7 +350,16 @@ async function runLogged<T>(
       const raw = result.content;
       try {
         const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-        const data = parse(JSON.parse(cleaned) as unknown);
+        let data = parse(JSON.parse(cleaned) as unknown);
+        // Action-guarantee ladder (validation → repair → synthesis →
+        // fallback) runs BEFORE the log record: what is logged and what
+        // is returned is the enriched result, sources tagged.
+        let actionCoverage: ActionCoverage | undefined;
+        if (enrich) {
+          const enriched = await enrich(data, repairCall, 'llm');
+          data = enriched.data;
+          actionCoverage = enriched.coverage;
+        }
         appendCall({
           kind,
           source: 'llm',
@@ -257,6 +376,7 @@ async function runLogged<T>(
           attempts: attempts.length,
           ...(attemptErrors.length ? { attemptErrors } : {}),
           ...(retrySummary ? { note: retrySummary } : {}),
+          ...(actionCoverage ? { actionCoverage } : {}),
         });
         return {
           source: 'llm',
@@ -265,6 +385,7 @@ async function runLogged<T>(
           model: cfg.model,
           profileName: cfg.name,
           viaUserChoice,
+          ...(actionCoverage ? { actionCoverage } : {}),
         };
       } catch (err) {
         // The call succeeded but its content did not parse — resending the
@@ -308,7 +429,17 @@ async function runLogged<T>(
   }
 
   const t0 = Date.now();
-  const data = await scriptedFn();
+  let data = await scriptedFn();
+  // The ladder applies to scripted output too — minus the repair call
+  // (there is no model output to repair): findings' rule-derived actions
+  // are validated/tagged and anything missing is synthesized or falls
+  // back, so scripted coverage is full as well.
+  let actionCoverage: ActionCoverage | undefined;
+  if (enrich) {
+    const enriched = await enrich(data as T, null, 'scripted');
+    data = enriched.data as Awaited<T>;
+    actionCoverage = enriched.coverage;
+  }
   appendCall({
     kind,
     source: 'scripted',
@@ -323,6 +454,7 @@ async function runLogged<T>(
     note: fellBackFromError
       ? `LLM 调用失败后的回落（错误见上一条记录）：${fellBackFromError}`
       : '未配置 LLM_API_KEY，离线脚本评审',
+    ...(actionCoverage ? { actionCoverage } : {}),
   });
   return {
     source: 'scripted',
@@ -331,49 +463,59 @@ async function runLogged<T>(
     model: cfg.model,
     profileName: cfg.name,
     viaUserChoice,
+    ...(actionCoverage ? { actionCoverage } : {}),
   };
 }
 
 /**
- * Findings and probe predictions may carry structured fix actions in the
- * edit-op vocabulary. Those ops are proposals — they become applicable
- * only after validateEditOps checks them against the design they were
- * generated for (nodes exist, keys legal for the component type, values
- * in range). A finding whose ops all drop keeps its text, loses its
- * apply button. When the caller did not send the design, actions are
- * stripped entirely — unvalidated ops never reach the frontend.
+ * The no-design degenerate path of the guarantee: without the submitted
+ * design there is nothing to validate or synthesize against, so actions
+ * are stripped entirely (unvalidated ops never reach the frontend) and
+ * the coverage honestly reports zero. The real app always sends the
+ * design; this exists so a bare API caller cannot smuggle raw ops out.
  */
-function keepValidActions<T extends { actions?: EditOp[] }>(
-  items: T[],
-  design: Design | undefined,
-): T[] {
-  return items.map((item) => {
-    const valid = design ? validateEditOps(item.actions, design) : [];
-    const next = { ...item };
-    if (valid.length) next.actions = valid;
-    else delete next.actions;
-    return next;
-  });
+function zeroCoverage(count: number): ActionCoverage {
+  return {
+    findings: count,
+    withActions: 0,
+    bySource: { llm: 0, repaired: 0, rule: 0, fallback: 0 },
+    nonMechanical: 0,
+  };
 }
 
 export async function evaluateSubmission(
   ctx: SubmissionAssessmentContext,
   profileId?: string,
   design?: Design,
+  problem?: ProblemDef,
 ): Promise<EvaluateOutcome<SubmissionAssessment>> {
-  const outcome = await runLogged(
+  return runLogged(
     'submission',
     ctx,
     () => buildSubmissionPrompt(ctx),
     parseSubmissionAssessment,
     () => scripted.assessSubmission(ctx),
     profileId,
+    async (data, repairCall, source) => {
+      if (!design) {
+        const findings = data.findings.map((f) => {
+          const next = { ...f };
+          delete next.actions;
+          delete next.actionSource;
+          return next;
+        });
+        return { data: { ...data, findings }, coverage: zeroCoverage(findings.length) };
+      }
+      const r = await guaranteeFindingActions(data.findings, design, {
+        baseSource: source === 'llm' ? 'llm' : 'rule',
+        repairCall,
+        ...(problem ? { problem } : {}),
+        problemName: ctx.problemName,
+        designSummary: ctx.designSummary,
+      });
+      return { data: { ...data, findings: r.findings }, coverage: r.coverage };
+    },
   );
-  outcome.data = {
-    ...outcome.data,
-    findings: keepValidActions(outcome.data.findings, design),
-  };
-  return outcome;
 }
 
 export async function evaluateFollowUps(
@@ -400,27 +542,48 @@ export async function evaluateProbes(
   ctx: ProbeContext,
   profileId?: string,
   design?: Design,
+  problem?: ProblemDef,
 ): Promise<EvaluateOutcome<ProbeCase[]>> {
-  const outcome = await runLogged(
+  return runLogged(
     'probe',
     ctx,
     () => buildProbePrompt(ctx),
     parseProbeCases,
     () => scripted.generateProbes(ctx),
     profileId,
+    async (data, repairCall, source) => {
+      if (!design) {
+        const cases = data.map((pc) => {
+          const prediction = { ...pc.prediction };
+          delete prediction.actions;
+          delete prediction.actionSource;
+          return { ...pc, prediction };
+        });
+        return {
+          data: cases,
+          coverage: zeroCoverage(cases.filter((pc) => pc.prediction.willFail).length),
+        };
+      }
+      // Predictions' fix actions run the ladder against this design now,
+      // and AGAIN inside verify-probes after the cases round-trip the
+      // client (ensureVerifiedActions) — nothing untrusted ships.
+      const r = await guaranteePredictionActions(data, design, {
+        baseSource: source === 'llm' ? 'llm' : 'rule',
+        repairCall,
+        ...(problem ? { problem } : {}),
+        problemName: ctx.problemName,
+        designSummary: ctx.designSummary,
+      });
+      return { data: r.cases, coverage: r.coverage };
+    },
   );
-  // Predictions' fix actions are validated against this design now, and
-  // AGAIN inside verify-probes after the cases round-trip the client.
-  outcome.data = outcome.data.map((pc) => ({
-    ...pc,
-    prediction: keepValidActions([pc.prediction], design)[0]!,
-  }));
-  return outcome;
 }
 
 export async function evaluateSchema(
   ctx: SchemaAssessmentContext,
   profileId?: string,
+  schema?: ProblemSchema,
+  report?: SchemaReviewReport,
 ): Promise<EvaluateOutcome<SchemaAssessment>> {
   return runLogged(
     'schema',
@@ -429,6 +592,16 @@ export async function evaluateSchema(
     parseSchemaAssessment,
     () => scripted.assessSchema(ctx),
     profileId,
+    async (data, repairCall, source) => {
+      const r = await guaranteeSchemaActions(data.suggestions, schema, {
+        baseSource: source === 'llm' ? 'llm' : 'rule',
+        repairCall,
+        problemName: ctx.problemName,
+        ...(report ? { report } : {}),
+        schemaSummary: ctx.schemaSummary,
+      });
+      return { data: { ...data, suggestions: r.suggestions }, coverage: r.coverage };
+    },
   );
 }
 
