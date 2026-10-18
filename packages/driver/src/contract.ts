@@ -71,6 +71,80 @@ export interface StructuralFindingLike {
   title: string;
   detail: string;
   componentIds: string[];
+  /** Canned fix, when the rule implies one unambiguously (validated ops). */
+  actions?: EditOp[];
+}
+
+// ------------------------------------------------------- edit operations ---
+//
+// The fix loop's vocabulary. A finding (LLM-written or rule-generated) may
+// carry a small list of STRUCTURED edits the user can apply to the design
+// in one click — after a highlighted preview and an explicit confirm. The
+// vocabulary is deliberately tiny and safe: tweak a setting, insert a
+// component between two existing nodes, or add one edge. No deletes.
+//
+// Two layers of defense:
+//  - sanitizeEditOps (here) checks SHAPE only — op kinds, field types.
+//  - validateEditOps (@sds/checker) checks SEMANTICS against the concrete
+//    design the finding was generated for — node existence, which setting
+//    keys are legal for that component type, value ranges — and drops
+//    invalid ops individually. Only validated ops ever reach the frontend
+//    as applicable actions.
+
+export type EditOp =
+  | { op: 'setSetting'; nodeId: string; key: string; value: string | number | boolean }
+  | {
+      op: 'addComponent';
+      componentType: ComponentTypeId;
+      /** Wire the new node after this existing node (optional). */
+      connectFromId?: string;
+      /** Wire the new node before this existing node (optional). When BOTH
+       *  endpoints are given and a direct edge between them exists, that
+       *  edge is replaced by the two hops through the new node. */
+      connectToId?: string;
+    }
+  | { op: 'addEdge'; fromId: string; toId: string };
+
+export const MAX_EDIT_OPS = 3;
+
+const isId = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
+
+/** Shape-level sanitation of a raw actions array (see the note above). */
+export function sanitizeEditOps(raw: unknown): EditOp[] {
+  if (!Array.isArray(raw)) return [];
+  const out: EditOp[] = [];
+  for (const item of raw) {
+    if (out.length >= MAX_EDIT_OPS) break;
+    const o = item as Record<string, unknown> | null;
+    if (!o || typeof o !== 'object') continue;
+    if (o.op === 'setSetting') {
+      const v = o.value;
+      if (
+        isId(o.nodeId) &&
+        isId(o.key) &&
+        (typeof v === 'string' || typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)))
+      ) {
+        out.push({ op: 'setSetting', nodeId: String(o.nodeId), key: String(o.key), value: v as string | number | boolean });
+      }
+    } else if (o.op === 'addComponent') {
+      if (!(COMPONENT_TYPE_IDS as readonly string[]).includes(String(o.componentType))) continue;
+      const from = isId(o.connectFromId) ? String(o.connectFromId) : undefined;
+      const to = isId(o.connectToId) ? String(o.connectToId) : undefined;
+      if (!from && !to) continue;
+      if (from && to && from === to) continue;
+      out.push({
+        op: 'addComponent',
+        componentType: String(o.componentType) as ComponentTypeId,
+        ...(from ? { connectFromId: from } : {}),
+        ...(to ? { connectToId: to } : {}),
+      });
+    } else if (o.op === 'addEdge') {
+      if (isId(o.fromId) && isId(o.toId) && o.fromId !== o.toId) {
+        out.push({ op: 'addEdge', fromId: String(o.fromId), toId: String(o.toId) });
+      }
+    }
+  }
+  return out;
 }
 
 export interface DriverContext {
@@ -88,6 +162,11 @@ export interface DriverFinding {
   title: string;
   detail: string;
   componentId?: string;
+  /**
+   * Optional one-click fix in the edit-op vocabulary. Present only after
+   * server-side validation against the submitted design (see EditOp).
+   */
+  actions?: EditOp[];
 }
 
 export interface DriverReview {
@@ -247,6 +326,12 @@ export interface ProbePrediction {
   primaryBreach: PrimaryBreach;
   rationale: string;
   fixHint: string;
+  /**
+   * Optional structured form of fixHint, in the edit-op vocabulary. The
+   * server validates these against the submitted design when the probe is
+   * verified; only surviving ops are offered as a one-click fix.
+   */
+  actions?: EditOp[];
 }
 
 /** One LLM-proposed probe case, in the friendly (relative) wire shape. */
@@ -274,6 +359,37 @@ export interface ProbeContext {
 
 export type ProbeVerdict = 'hit' | 'held' | 'miss';
 
+/** Thresholds in checker units (fractions), as executed by the simulator. */
+export interface ExecutedScenarioThresholds {
+  maxErrorRate?: number;
+  maxP99Ms?: number;
+  maxCostPerHour?: number;
+  maxStorageQps?: number;
+  maxStaleReadRate?: number;
+  maxHottestUtil?: number;
+  maxQueueDepth?: number;
+}
+
+/**
+ * A concrete, executable scenario in checker units — what the simulator
+ * actually ran for a probe case, or the full scenario of a judged suite
+ * case. The frontend uses it for one-click local re-simulation (visual
+ * preview only, never a re-judge).
+ */
+export interface ExecutedScenario {
+  traffic: TrafficConfig;
+  durationTicks: number;
+  events: {
+    atTick: number;
+    type: EventType;
+    targetType?: ComponentTypeId;
+    magnitude?: number;
+    durationTicks?: number;
+  }[];
+  kills: { componentType: ComponentTypeId; atTick: number }[];
+  thresholds: ExecutedScenarioThresholds;
+}
+
 /** A proposed case after the simulator ran it: prediction vs measured truth. */
 export interface VerifiedProbeResult {
   name: string;
@@ -291,6 +407,8 @@ export interface VerifiedProbeResult {
    * miss = anything else (predicted pass but failed, or wrong category).
    */
   verdict: ProbeVerdict;
+  /** The scenario exactly as executed — powers local quick re-simulation. */
+  scenario?: ExecutedScenario;
 }
 
 export interface SubmissionAssessment {
@@ -580,7 +698,12 @@ export function buildSubmissionPrompt(ctx: SubmissionAssessmentContext): { syste
       `代码判卷结果：${ctx.passed}/${ctx.total} 通过，得分 ${ctx.scorePct}` +
       evidence +
       `\n\n结构缺陷（确定性规则，可信）：\n${ctx.structuralFindings.map((f) => `- [${f.severity}] ${f.title}：${f.detail}`).join('\n') || '（无）'}\n\n` +
-      `输出 JSON：{"summary":"2-3 句总评","scoreRationale":"为什么是这个分数：失分集中在哪、先修哪个涨分最快","findings":[{"severity":"high|medium|low","title":"…","detail":"…"}]}`,
+      `每条 finding 可选附带 actions：一键可应用的结构化改法（用户预览确认后由系统执行），只能用这三种操作，且 nodeId 必须引用上面设计摘要里出现的 id：\n` +
+      `- {"op":"setSetting","nodeId":"节点id","key":"参数名","value":值}：参数名只能是该组件类型合法的参数——通用 replicas（整数）/ capacityScale；网关 rateLimitPerSec；缓存 mutexRebuild（布尔）/ eviction；负载均衡 lbAlgorithm；关系型 DB 与 NoSQL 的 sharded（布尔）/ shardKey（字符串）/ readReplicas（整数）/ consistency。\n` +
+      `- {"op":"addComponent","componentType":"cache","connectFromId":"上游节点id","connectToId":"下游节点id"}：在两个已有节点之间插入一个新组件（两端 id 至少给一个）。\n` +
+      `- {"op":"addEdge","fromId":"节点id","toId":"节点id"}：新增一条连线。\n` +
+      `修法无法用这三种操作准确表达时，省略 actions，不要硬凑；每条 finding 最多 3 个操作。\n\n` +
+      `输出 JSON：{"summary":"2-3 句总评","scoreRationale":"为什么是这个分数：失分集中在哪、先修哪个涨分最快","findings":[{"severity":"high|medium|low","title":"…","detail":"…","actions":[{"op":"setSetting","nodeId":"…","key":"replicas","value":2}]}]}`,
   };
 }
 
@@ -590,12 +713,14 @@ export function parseSubmissionAssessment(json: unknown): SubmissionAssessment {
   const findings: DriverFinding[] = [];
   if (Array.isArray(o.findings)) {
     for (const f of o.findings) {
-      const g = f as { severity?: unknown; title?: unknown; detail?: unknown };
+      const g = f as { severity?: unknown; title?: unknown; detail?: unknown; actions?: unknown };
       if (typeof g.title !== 'string') continue;
+      const actions = sanitizeEditOps(g.actions);
       findings.push({
         severity: (['high', 'medium', 'low'].includes(String(g.severity)) ? String(g.severity) : 'medium') as DriverFinding['severity'],
         title: g.title,
         detail: String(g.detail ?? ''),
+        ...(actions.length ? { actions } : {}),
       });
     }
   }
@@ -660,8 +785,9 @@ export function buildProbePrompt(ctx: ProbeContext): { system: string; user: str
       `本设计里可被杀的组件类型：${killableTypes || '（无）'}\n\n` +
       `结构缺陷（确定性规则，可信，可作为你选软肋的线索）：\n${ctx.structuralFindings.map((f) => `- [${f.severity}] ${f.title}：${f.detail}`).join('\n') || '（无）'}\n\n` +
       `${PROBE_CRITERIA}\n\n` +
-      `输出 JSON：{"cases":[{"name":"用例名（点明场景）","scenario":{"trafficMultiplier":3,"durationSec":40,"readRatio":0.9,"events":[{"type":"viral_post","targetType":"feedservice","magnitude":3}],"kills":["appserver"]},"thresholds":{"p99Ms":1000,"maxErrorRatePct":1,"maxCostPerHour":900},"prediction":{"willFail":true,"primaryBreach":"错误率超标","rationale":"为什么这个场景会先打爆这一层","fixHint":"候选人该怎么改"}}]}\n` +
-      `scenario 的 events/kills 可省略或为空数组；thresholds 至少给一项（可选项：p99Ms / maxErrorRatePct / maxCostPerHour / maxStorageQps / maxHottestUtilPct / maxStaleReadPct / maxQueueDepth）；prediction.willFail=false 时 primaryBreach 必须为「无」。`,
+      `输出 JSON：{"cases":[{"name":"用例名（点明场景）","scenario":{"trafficMultiplier":3,"durationSec":40,"readRatio":0.9,"events":[{"type":"viral_post","targetType":"feedservice","magnitude":3}],"kills":["appserver"]},"thresholds":{"p99Ms":1000,"maxErrorRatePct":1,"maxCostPerHour":900},"prediction":{"willFail":true,"primaryBreach":"错误率超标","rationale":"为什么这个场景会先打爆这一层","fixHint":"候选人该怎么改","actions":[{"op":"addComponent","componentType":"queue","connectFromId":"发帖节点id","connectToId":"存储节点id"}]}}]}\n` +
+      `scenario 的 events/kills 可省略或为空数组；thresholds 至少给一项（可选项：p99Ms / maxErrorRatePct / maxCostPerHour / maxStorageQps / maxHottestUtilPct / maxStaleReadPct / maxQueueDepth）；prediction.willFail=false 时 primaryBreach 必须为「无」。\n` +
+      `prediction.actions 是 fixHint 的结构化版本（可选，用户一键应用）：只能用 setSetting / addComponent / addEdge 三种操作，nodeId 只能引用设计摘要里出现的 id，setSetting 的 key 只能是该组件类型合法的参数（replicas / capacityScale / rateLimitPerSec / mutexRebuild / eviction / lbAlgorithm / sharded / shardKey / readReplicas / consistency）。表达不了就省略，不要硬凑；每条最多 3 个操作。`,
   };
 }
 
@@ -749,6 +875,7 @@ export function normalizeProbeCase(raw: unknown): ProbeCase | null {
     if (!(BREACH_CATEGORIES as readonly string[]).includes(String(p.primaryBreach))) return null;
     primaryBreach = String(p.primaryBreach) as BreachCategory;
   }
+  const predActions = sanitizeEditOps((p as { actions?: unknown }).actions);
   return {
     name: o.name.trim().slice(0, 60),
     scenario,
@@ -758,6 +885,7 @@ export function normalizeProbeCase(raw: unknown): ProbeCase | null {
       primaryBreach,
       rationale: typeof p.rationale === 'string' ? p.rationale.slice(0, 400) : '',
       fixHint: typeof p.fixHint === 'string' ? p.fixHint.slice(0, 300) : '',
+      ...(predActions.length ? { actions: predActions } : {}),
     },
   };
 }

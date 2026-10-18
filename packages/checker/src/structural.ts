@@ -1,4 +1,5 @@
 import { componentDef, type ComponentTypeId } from '@sds/components';
+import type { EditOp } from '@sds/driver';
 import type { ProblemDef } from '@sds/problems';
 import type { Design, DesignNode } from '@sds/sim-core';
 
@@ -10,6 +11,12 @@ export interface StructuralFinding {
   componentIds: string[];
   /** Test case id that will typically expose this defect. */
   exposedBy?: string;
+  /**
+   * Canned one-click fix in the edit-op vocabulary — attached ONLY where
+   * the rule implies one unambiguous edit (see the per-rule notes in
+   * checkStructure). Findings without a safe canned fix stay text-only.
+   */
+  actions?: EditOp[];
 }
 
 const LOAD_BEARING: ComponentTypeId[] = [
@@ -57,6 +64,9 @@ export function checkStructure(problem: ProblemDef, design: Design): StructuralF
       detail: `${componentDef(node.type).name}「${node.label ?? node.id}」replicas=1 且是唯一节点。它宕机时这一层整体消失，流量无处改道。改法：同类型至少再加一个节点（只加 replicas 不算跨节点冗余）。`,
       componentIds: [node.id],
       exposedBy: problem.testCases.find((c) => c.exposesRule === 'spof')?.id,
+      // Canned fix: bump this node's replicas to 2 (one-click capacity
+      // redundancy; full cross-node redundancy stays a manual design move).
+      actions: [{ op: 'setSetting', nodeId: node.id, key: 'replicas', value: 2 }],
     });
   }
 
@@ -65,6 +75,24 @@ export function checkStructure(problem: ProblemDef, design: Design): StructuralF
     (n) => componentDef(n.type).behavior === 'storage' && n.type !== 'objectstorage',
   );
   if (problem.flags.readHeavy && storage.length > 0 && ofType(design, 'cache').length === 0) {
+    // Canned fix: insert a cache between a service feeding the first
+    // reachable storage node and that storage node itself.
+    let cacheActions: EditOp[] | undefined;
+    for (const s of storage) {
+      const upstreams = design.edges
+        .filter((e) => e.to === s.id)
+        .map((e) => design.nodes.find((n) => n.id === e.from))
+        .filter((n): n is DesignNode => !!n);
+      const svc =
+        upstreams.find((u) => ['appserver', 'feedservice', 'searchservice'].includes(u.type)) ??
+        upstreams[0];
+      if (svc) {
+        cacheActions = [
+          { op: 'addComponent', componentType: 'cache', connectFromId: svc.id, connectToId: s.id },
+        ];
+        break;
+      }
+    }
     push({
       ruleId: 'hot-read-no-cache',
       severity: 'high',
@@ -72,6 +100,7 @@ export function checkStructure(problem: ProblemDef, design: Design): StructuralF
       detail: `本题读占比 ${Math.round(problem.scale.readRatio * 100)}%，但设计中没有任何缓存节点，所有读请求都直达存储。读流量一涨，DB 就是第一个瓶颈。在存储前加一层 Redis 缓存。`,
       componentIds: storage.map((s) => s.id),
       exposedBy: problem.testCases.find((c) => c.exposesRule === 'hot-read-no-cache')?.id,
+      ...(cacheActions ? { actions: cacheActions } : {}),
     });
   }
 
@@ -128,12 +157,27 @@ export function checkStructure(problem: ProblemDef, design: Design): StructuralF
       (e) => e.to === w.id && design.nodes.find((n) => n.id === e.from)?.type === 'queue',
     );
     if (!hasQueueUpstream) {
+      // Canned fix: insert a queue directly in front of this worker, wired
+      // from whichever producer currently feeds it (when it has one).
+      const producer = design.edges.find((e) => e.to === w.id)?.from;
       push({
         ruleId: 'missing-queue',
         severity: 'medium',
         title: 'Worker 前面没有队列缓冲',
         detail: '突发流量会直接砸到 Worker 上，慢消费者被打爆而不是排队等待。在生产者与 Worker 之间加消息队列。',
         componentIds: [w.id],
+        ...(producer
+          ? {
+              actions: [
+                {
+                  op: 'addComponent',
+                  componentType: 'queue',
+                  connectFromId: producer,
+                  connectToId: w.id,
+                } as EditOp,
+              ],
+            }
+          : {}),
       });
     }
   }
@@ -168,6 +212,9 @@ export function checkStructure(problem: ProblemDef, design: Design): StructuralF
         detail: `本题峰值写约 ${Math.round(peakWriteTps)} TPS，超过单机关系库约 ${singleCap} 的处理上限，且该 DB 既没开分片也没有读副本。改法：开分片（选好分片键）、加读副本分担读、或把热点数据迁到 NoSQL。`,
         componentIds: [db.id],
         exposedBy: problem.testCases.find((c) => c.exposesRule === 'db-scale')?.id,
+        // Canned fix: turn sharding on for this store (its shard key is
+        // already the default user_id unless the bad-shard-key rule fired).
+        actions: [{ op: 'setSetting', nodeId: db.id, key: 'sharded', value: true }],
       });
     }
     if (db.settings.sharded && ['created_at', 'timestamp', 'id'].includes(db.settings.shardKey ?? '')) {
@@ -178,6 +225,7 @@ export function checkStructure(problem: ProblemDef, design: Design): StructuralF
         detail: '单调递增的分片键会让新写入永远落在同一个分片上，形成热点分片，分了等于没分。换成高基数、分布均匀的键（如 user_id）。',
         componentIds: [db.id],
         exposedBy: problem.testCases.find((c) => c.exposesRule === 'db-scale')?.id,
+        actions: [{ op: 'setSetting', nodeId: db.id, key: 'shardKey', value: 'user_id' }],
       });
     }
   }
@@ -190,6 +238,7 @@ export function checkStructure(problem: ProblemDef, design: Design): StructuralF
         detail: '单调键让写入集中在单个分片（热点分片）。换成 user_id 这类高基数均匀分布的键。',
         componentIds: [store.id],
         exposedBy: problem.testCases.find((c) => c.exposesRule === 'db-scale')?.id,
+        actions: [{ op: 'setSetting', nodeId: store.id, key: 'shardKey', value: 'user_id' }],
       });
     }
   }
@@ -206,12 +255,21 @@ export function checkStructure(problem: ProblemDef, design: Design): StructuralF
         componentIds: [],
       });
     } else if (gateways.every((g) => (g.settings.rateLimitPerSec ?? 0) === 0)) {
+      // Canned fix: enable rate limiting on the first gateway, sized from
+      // the problem's peak demand (baseline × peak multiplier).
+      const limit = Math.max(
+        100,
+        Math.round(problem.scale.baselineRps * problem.scale.peakMultiplier),
+      );
       push({
         ruleId: 'no-rate-limit',
         severity: 'medium',
         title: '网关在，但限流没开',
         detail: '网关的限流阈值是 0（关闭）。按下游真实容量反推一个阈值并开启，否则突发与滥用流量会长驱直入。',
         componentIds: gateways.map((g) => g.id),
+        actions: [
+          { op: 'setSetting', nodeId: gateways[0]!.id, key: 'rateLimitPerSec', value: limit },
+        ],
       });
     }
   }

@@ -1,4 +1,5 @@
-import type { SchemaReviewReport } from '@sds/checker';
+import { validateEditOps, type SchemaReviewReport } from '@sds/checker';
+import type { Design } from '@sds/sim-core';
 import {
   ScriptedDriver,
   buildFollowUpPrompt,
@@ -9,6 +10,7 @@ import {
   parseProbeCases,
   parseSchemaAssessment,
   parseSubmissionAssessment,
+  type EditOp,
   type FollowUpContext,
   type FollowUpQuestion,
   type ProbeCase,
@@ -328,11 +330,34 @@ async function runLogged<T>(
   };
 }
 
+/**
+ * Findings and probe predictions may carry structured fix actions in the
+ * edit-op vocabulary. Those ops are proposals — they become applicable
+ * only after validateEditOps checks them against the design they were
+ * generated for (nodes exist, keys legal for the component type, values
+ * in range). A finding whose ops all drop keeps its text, loses its
+ * apply button. When the caller did not send the design, actions are
+ * stripped entirely — unvalidated ops never reach the frontend.
+ */
+function keepValidActions<T extends { actions?: EditOp[] }>(
+  items: T[],
+  design: Design | undefined,
+): T[] {
+  return items.map((item) => {
+    const valid = design ? validateEditOps(item.actions, design) : [];
+    const next = { ...item };
+    if (valid.length) next.actions = valid;
+    else delete next.actions;
+    return next;
+  });
+}
+
 export async function evaluateSubmission(
   ctx: SubmissionAssessmentContext,
   profileId?: string,
+  design?: Design,
 ): Promise<EvaluateOutcome<SubmissionAssessment>> {
-  return runLogged(
+  const outcome = await runLogged(
     'submission',
     ctx,
     () => buildSubmissionPrompt(ctx),
@@ -340,6 +365,11 @@ export async function evaluateSubmission(
     () => scripted.assessSubmission(ctx),
     profileId,
   );
+  outcome.data = {
+    ...outcome.data,
+    findings: keepValidActions(outcome.data.findings, design),
+  };
+  return outcome;
 }
 
 export async function evaluateFollowUps(
@@ -365,8 +395,9 @@ export async function evaluateFollowUps(
 export async function evaluateProbes(
   ctx: ProbeContext,
   profileId?: string,
+  design?: Design,
 ): Promise<EvaluateOutcome<ProbeCase[]>> {
-  return runLogged(
+  const outcome = await runLogged(
     'probe',
     ctx,
     () => buildProbePrompt(ctx),
@@ -374,6 +405,13 @@ export async function evaluateProbes(
     () => scripted.generateProbes(ctx),
     profileId,
   );
+  // Predictions' fix actions are validated against this design now, and
+  // AGAIN inside verify-probes after the cases round-trip the client.
+  outcome.data = outcome.data.map((pc) => ({
+    ...pc,
+    prediction: keepValidActions([pc.prediction], design)[0]!,
+  }));
+  return outcome;
 }
 
 export async function evaluateSchema(

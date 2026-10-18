@@ -2,7 +2,8 @@ import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import process from 'node:process';
-import { checkStructure, reviewSchema, runSuite } from '@sds/checker';
+import { checkStructure, reviewSchema, runSuite, validateEditOps } from '@sds/checker';
+import type { ExecutedScenario, StructuralFindingLike } from '@sds/driver';
 import type { ProblemSchema } from '@sds/problems';
 import type { Design } from '@sds/sim-core';
 import {
@@ -33,6 +34,10 @@ import { registerAdminRoutes } from './admin';
  *   POST /api/submissions/verify-probes
  *                                 run LLM-proposed probe cases through the
  *                                 simulator and grade their predictions
+ *   POST /api/submissions/case-scenario
+ *                                 the executable scenario of ONE judged case
+ *                                 (incl. hidden ones, on demand) — powers the
+ *                                 frontend's local quick re-simulation
  *   POST /api/evaluate            ONE LLM call (or scripted fallback) →
  *                                 structured assessment / follow-ups / probes.
  *                                 Optional body.profileId: an end user's pick
@@ -126,8 +131,16 @@ app.post('/api/submissions/judge', async (c) => {
   const problem = await storage.getProblem(body.problemId);
   if (!problem) return c.json({ error: 'problem_not_found' }, 404);
 
-  const suite = runSuite(problem, body.design);
-  const structural = checkStructure(problem, body.design);
+  const design: Design = body.design;
+  const suite = runSuite(problem, design);
+  // Canned fix actions are built from this very design, but re-validate
+  // before responding anyway: only ops that survive validation against
+  // the submitted design may ever be offered as one-click fixes.
+  const structural: StructuralFindingLike[] = checkStructure(problem, design).map((f) => {
+    const actions = validateEditOps(f.actions, design);
+    const { actions: _canned, ...rest } = f;
+    return actions.length ? { ...rest, actions } : rest;
+  });
   const schemaSignals = body.schema
     ? reviewSchema(body.schema as ProblemSchema, {
         loadFactor:
@@ -165,12 +178,41 @@ app.post('/api/submissions/verify-probes', async (c) => {
   return c.json({ problemId: problem.id, results });
 });
 
+// ------------------------------------------------------------ case scenario -
+// Quick re-simulation needs a case's executable scenario locally. Visible
+// cases ship in the pack already; hidden ones do not. This endpoint serves
+// ONE case's scenario on demand — the client only asks for cases a
+// submission has already revealed (its row in the results panel), so the
+// pack-level secrecy model is unchanged: nothing is listed or bulk-served.
+app.post('/api/submissions/case-scenario', async (c) => {
+  const body = (await c.req.json().catch(() => null)) as {
+    problemId?: unknown;
+    caseId?: unknown;
+  } | null;
+  if (!body || typeof body.problemId !== 'string' || typeof body.caseId !== 'string') {
+    return c.json(badRequest('需要 { problemId: string, caseId: string }'), 400);
+  }
+  const problem = await storage.getProblem(body.problemId);
+  if (!problem) return c.json({ error: 'problem_not_found' }, 404);
+  const tc = problem.testCases.find((x) => x.id === body.caseId);
+  if (!tc) return c.json({ error: 'case_not_found' }, 404);
+  const scenario: ExecutedScenario = {
+    traffic: tc.traffic,
+    durationTicks: tc.durationTicks,
+    events: tc.events ?? [],
+    kills: tc.kills ?? [],
+    thresholds: tc.thresholds,
+  };
+  return c.json({ problemId: problem.id, caseId: tc.id, scenario });
+});
+
 // ---------------------------------------------------------------- evaluate -
 app.post('/api/evaluate', async (c) => {
   const body = (await c.req.json().catch(() => null)) as {
     kind?: unknown;
     context?: Record<string, unknown>;
     profileId?: unknown;
+    design?: unknown;
   } | null;
   const kind = body?.kind as EvaluateKind | undefined;
   const ctx = body?.context;
@@ -178,6 +220,10 @@ app.post('/api/evaluate', async (c) => {
   // marked userSelectable (enforced in llmconfig.resolveProfileForCall);
   // anything else silently resolves to the server default.
   const profileId = typeof body?.profileId === 'string' ? body.profileId : undefined;
+  // The submitted design, when the client sends it: used ONLY to validate
+  // the fix actions a finding/probe carries (llm.ts keepValidActions) —
+  // actions that do not validate against it never reach the response.
+  const design = isDesign(body?.design) ? body.design : undefined;
   if (!kind || !['submission', 'schema', 'followups', 'probe'].includes(kind) || !ctx) {
     return c.json(
       badRequest("需要 { kind: 'submission' | 'schema' | 'followups' | 'probe', context }"),
@@ -189,6 +235,7 @@ app.post('/api/evaluate', async (c) => {
     const outcome = await evaluateProbes(
       ctx as unknown as Parameters<typeof evaluateProbes>[0],
       profileId,
+      design,
     );
     return c.json({ kind, ...outcome });
   }
@@ -196,6 +243,7 @@ app.post('/api/evaluate', async (c) => {
     const outcome = await evaluateSubmission(
       ctx as unknown as Parameters<typeof evaluateSubmission>[0],
       profileId,
+      design,
     );
     return c.json({ kind, ...outcome });
   }

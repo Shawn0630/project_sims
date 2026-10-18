@@ -1,8 +1,9 @@
-import { runTestCase, type CaseMeasured } from '@sds/checker';
+import { runTestCase, validateEditOps, type CaseMeasured } from '@sds/checker';
 import {
   normalizeProbeCase,
   type BreachCategory,
   type ProbeCase,
+  type ProbePrediction,
   type ProbeVerdict,
   type VerifiedProbeResult,
 } from '@sds/driver';
@@ -132,15 +133,31 @@ export function verifyProbes(
     const tc = probeToTestCase(problem, pc, i);
     const r = runTestCase(problem, design, tc);
     const actualBreach = r.passed ? null : actualBreachOf(tc, r.measured);
+    // The prediction's structured fix is validated against THIS design
+    // before it is allowed to become a one-click action in the UI —
+    // cases round-tripped through the client, so nothing is trusted.
+    const validActions = validateEditOps(pc.prediction.actions, design);
+    const prediction: ProbePrediction = { ...pc.prediction };
+    if (validActions.length) prediction.actions = validActions;
+    else delete prediction.actions;
     out.push({
       name: pc.name,
       scenarioSummary: scenarioSummaryOf(problem, pc),
-      prediction: pc.prediction,
+      prediction,
       passed: r.passed,
       measured: r.measured,
       failures: r.failures,
       actualBreach,
       verdict: verdictOf(pc, r.passed, actualBreach),
+      // The scenario exactly as executed, so the frontend can re-run it
+      // locally for visualization (preview only — never a re-judge).
+      scenario: {
+        traffic: tc.traffic,
+        durationTicks: tc.durationTicks,
+        events: tc.events ?? [],
+        kills: tc.kills ?? [],
+        thresholds: tc.thresholds,
+      },
     });
   });
   return out;

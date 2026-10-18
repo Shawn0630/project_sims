@@ -156,6 +156,9 @@ export class ScriptedDriver implements Driver {
         title: `结构性 bug：${f.title}`,
         detail: f.detail,
         componentId: f.componentIds[0],
+        // Canned fix ops ride along (the server re-validates them against
+        // the submitted design before they reach the UI as applicable).
+        ...(f.actions?.length ? { actions: f.actions } : {}),
       });
     }
     for (const c of failed) {
@@ -174,6 +177,7 @@ export class ScriptedDriver implements Driver {
         severity: 'medium',
         title: `探测证实：${p.name}`,
         detail: `评审探测预测「${p.prediction.primaryBreach}」被仿真实测证实——${p.failures.join('；')}。${p.prediction.fixHint ? `修法：${p.prediction.fixHint}` : ''}`,
+        ...(p.prediction.actions?.length ? { actions: p.prediction.actions } : {}),
       });
     }
     const probeNote = probes.length
@@ -290,6 +294,7 @@ export class ScriptedDriver implements Driver {
     for (const f of ctx.structuralFindings) {
       if (out.length >= 2) break;
       const why = `结构规则「${f.title}」已报警：${f.detail}`;
+      const before = out.length;
       switch (f.ruleId) {
         case 'hot-read-no-cache':
           out.push({
@@ -386,6 +391,11 @@ export class ScriptedDriver implements Driver {
           break;
         default:
           break;
+      }
+      // The rule's canned fix, when it has one, becomes this probe's
+      // structured fix — the server validates it again at verify time.
+      if (out.length > before && f.actions?.length) {
+        out[out.length - 1]!.prediction.actions = f.actions;
       }
     }
     if (!out.length) {
