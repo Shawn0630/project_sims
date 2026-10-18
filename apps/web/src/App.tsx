@@ -16,6 +16,7 @@ import {
   fetchHealth,
   fetchProblems,
   judgeOnServer,
+  simulateSchemaOnServer,
   verifyProbesOnServer,
   type ActionCoverageDTO,
   type EditOpDTO,
@@ -31,6 +32,7 @@ import {
   type SchemaAssessmentDTO,
   type SchemaOpDTO,
   type SchemaSignalsDTO,
+  type SchemaSimDTO,
   type StructuralFindingDTO,
   type SubmissionAssessmentDTO,
   type SuiteResultDTO,
@@ -66,7 +68,7 @@ import {
   StructuralList,
   scoreColor,
 } from './ReportPanel';
-import { SchemaPanel, SchemaAssessmentView, SchemaSignalsView } from './SchemaPanel';
+import { SchemaPanel, SchemaAssessmentView, SchemaSignalsView, SchemaSimView } from './SchemaPanel';
 import { IconGlyph } from './icons';
 
 type Phase = 'design' | 'run' | 'report';
@@ -283,6 +285,17 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   // The deterministic signals travel separately (they ride every judge
   // response) and also feed the schema view's design-time checker display.
   const [schemaSignals, setSchemaSignals] = useState<SchemaSignalsDTO | null>(null);
+  // Schema simulation runs, kept per problem alongside the schema draft
+  // (same lifecycle): the sim that ran + the exact draft fingerprint it
+  // ran on, so a later edit can mark the shown results as the last run's.
+  const [schemaSims, setSchemaSims] = useState<
+    Record<string, { sim: SchemaSimDTO; fingerprint: string }>
+  >({});
+  const [schemaSimBusy, setSchemaSimBusy] = useState(false);
+  const [schemaSimError, setSchemaSimError] = useState<string | null>(null);
+  // The sim the server recomputed for the SUBMITTED schema (rides the
+  // schema evaluate response) — shown in the results page's 数据库评审 tab.
+  const [submittedSchemaSim, setSubmittedSchemaSim] = useState<SchemaSimDTO | null>(null);
   const [schemaAssessment, setSchemaAssessment] = useState<SchemaAssessmentDTO | null>(null);
   const [schemaLabel, setSchemaLabel] = useState('');
   const [schemaBusy, setSchemaBusy] = useState(false);
@@ -751,6 +764,30 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   };
 
   /**
+   * Design-time schema simulation: the server runs the problem's
+   * requirement workload against the CURRENT draft. Results are kept
+   * per problem next to the draft; editing afterwards marks them stale
+   * (the panel says so) rather than silently re-running.
+   */
+  const runSchemaSim = async () => {
+    const p = problemRef.current;
+    const draft = schemasRef.current[p.id]!;
+    setSchemaSimBusy(true);
+    setSchemaSimError(null);
+    try {
+      const r = await simulateSchemaOnServer({ problemId: p.id, schema: draft });
+      setSchemaSims((prev) => ({
+        ...prev,
+        [p.id]: { sim: r.sim, fingerprint: JSON.stringify(draft) },
+      }));
+    } catch {
+      setSchemaSimError('数据库模拟调用失败：请确认后端在运行（npm run dev:server）后重试。');
+    } finally {
+      setSchemaSimBusy(false);
+    }
+  };
+
+  /**
    * The schema half of the unified submit: ONE backend evaluate call for
    * the submitted schema draft. The deterministic signals already came
    * back with the judge response; this call adds the qualitative
@@ -763,6 +800,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     try {
       const r = await evaluateOnServer<SchemaAssessmentDTO>('schema', {
         problemName: p.name,
+        problemId: p.id,
         schema: schemasRef.current[p.id]!,
         loadFactor,
       });
@@ -770,6 +808,9 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
       setSchemaAssessment(r.data);
       setSchemaCoverage(r.actionCoverage ?? null);
       if (r.schemaSignals) setSchemaSignals(r.schemaSignals);
+      // The server recomputed the schema sim for the submitted schema;
+      // its measurements join the deterministic signals in the tab.
+      setSubmittedSchemaSim(r.schemaSim ?? null);
     } catch {
       // Same honesty rule as the submission review: the evaluate request
       // itself never completed — say so instead of an empty tab.
@@ -1681,6 +1722,12 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                     <SchemaSignalsView signals={schemaSignals} />
                   </>
                 )}
+                {submittedSchemaSim && (
+                  <>
+                    <h4 style={{ margin: '16px 0 8px' }}>🧪 数据库模拟实测（服务端按需求流量重跑）</h4>
+                    <SchemaSimView sim={submittedSchemaSim} compact />
+                  </>
+                )}
               </div>
             )}
           </div>
@@ -2001,6 +2048,14 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
               schema={schemas[problem.id]!}
               snapshot={snapshot}
               signals={schemaSignals}
+              sim={schemaSims[problem.id]?.sim ?? null}
+              simBusy={schemaSimBusy}
+              simError={schemaSimError}
+              simStale={
+                !!schemaSims[problem.id] &&
+                schemaSims[problem.id]!.fingerprint !== JSON.stringify(schemas[problem.id]!)
+              }
+              onRunSim={() => void runSchemaSim()}
               onChange={(s) => setSchemas({ ...schemas, [problem.id]: s })}
             />
           </div>

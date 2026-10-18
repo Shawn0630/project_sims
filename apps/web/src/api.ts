@@ -244,6 +244,65 @@ export interface SchemaSignalsDTO {
   findings: SchemaFindingDTO[];
 }
 
+// ---------------------------------------------------------- schema sim DTOs -
+// The schema simulator's measurements (POST /api/schema/simulate, and the
+// server-recomputed copy riding on schema evaluate responses). The server
+// RAN the problem's requirement workload against the schema; these are
+// measurements from that run, not formula estimates.
+
+export interface SchemaSimPatternDTO {
+  patternId: string;
+  name: string;
+  table: string;
+  kind: 'read' | 'write' | 'count';
+  path: string;
+  qps: number;
+  rowsExaminedPerQuery: number;
+  avgMs: number;
+  p99Ms: number;
+  budgetMs: number;
+  verdict: string;
+  note: string;
+}
+
+export interface SchemaSimTableDTO {
+  table: string;
+  engine: 'relational' | 'nosql';
+  rows: number;
+  rowsGrown: number;
+  sizeBytesNow: number;
+  sizeBytesGrown: number;
+  indexCount: number;
+  writeAmpFactor: number;
+  readQps: number;
+  writeQps: number;
+  shardCount: number;
+  shardKey: string | null;
+  hottestShardUtil: number;
+  hottestShardUtilGrown: number;
+}
+
+export interface SchemaSimDTO {
+  growthFactor: number;
+  budgetMs: number;
+  assumptions: string[];
+  perPattern: SchemaSimPatternDTO[];
+  perPatternGrown: SchemaSimPatternDTO[];
+  perTable: SchemaSimTableDTO[];
+  headline: {
+    firstBreak: {
+      kind: 'pattern' | 'table';
+      id: string;
+      name: string;
+      atScale: 'now' | 'grown';
+      reason: string;
+    } | null;
+    maxSustainableQps: number;
+    bottleneckTable: string | null;
+    bottleneckPatternId: string | null;
+  };
+}
+
 export interface JudgeResponseDTO {
   problemId: string;
   suite: SuiteResultDTO;
@@ -498,6 +557,8 @@ export interface EvaluateResponseDTO<T> {
   actionCoverage?: ActionCoverageDTO;
   /** Present on schema evaluations where the server computed the signals. */
   schemaSignals?: SchemaSignalsDTO;
+  /** Present on schema evaluations where the server recomputed the sim. */
+  schemaSim?: SchemaSimDTO;
 }
 
 // ------------------------------------------------------- user model choice -
@@ -577,6 +638,22 @@ export function judgeOnServer(body: {
 }
 
 /**
+ * Run the schema simulator on the server: the problem's requirement
+ * workload against this schema draft → measured paths, latencies, shard
+ * load and the ×10-growth picture. Display + review evidence only; the
+ * numbers never feed submission scoring.
+ */
+export function simulateSchemaOnServer(body: {
+  problemId: string;
+  schema: ProblemSchemaDTO;
+}): Promise<{ problemId: string; sim: SchemaSimDTO }> {
+  return request<{ problemId: string; sim: SchemaSimDTO }>('/api/schema/simulate', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+/**
  * One qualitative-evaluation call. The server makes the single LLM call (or
  * the scripted fallback) and returns structured data; the UI only renders.
  */
@@ -600,7 +677,7 @@ export function evaluateOnServer<T>(
 ): Promise<EvaluateResponseDTO<T>>;
 export function evaluateOnServer<T>(
   kind: 'schema',
-  context: { problemName: string; schema: ProblemSchemaDTO; loadFactor?: number },
+  context: { problemName: string; problemId?: string; schema: ProblemSchemaDTO; loadFactor?: number },
 ): Promise<EvaluateResponseDTO<T>>;
 export function evaluateOnServer<T>(
   kind: 'submission' | 'schema' | 'followups' | 'probe' | 'next-steps',
