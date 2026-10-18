@@ -84,19 +84,16 @@ summary { cursor: pointer; color: var(--accent); font-size: 13px;}
 <div class="card">
 <b>➕ 新建题目（种子）</b>
 <p class="muted small" style="margin:6px 0 0">
-LLM 生成题目系统（第四套系统）的入口将来长在这里。现在
-<code>POST /api/problems/generate</code> 仍是契约桩——可以先把种子
-<b>存为草稿 pack</b>（最小合法题目包，难度默认「中等」，空用例集），再在上方列表里用 JSON 编辑器补全。
+全新题目仍走手动路径：先把种子 <b>存为草稿 pack</b>（最小合法题目包，难度默认「中等」，空用例集），再在上方列表里用 JSON 编辑器补全。
+LLM 扩充（第四套系统）针对<b>已有题目</b>：打开任一题目详情，用里面的「🤖 生成待审」让 LLM 生成新用例 + 参考解，系统逐例仿真验证后再由你采纳。
 </p>
 <label>标题 <input id="seedTitle" placeholder="例如：Design a Rate Limiter" /></label>
 <label>题面 <textarea id="seedStatement" rows="4" placeholder="题目描述、核心流程…"></textarea></label>
 <label>规模说明 <input id="seedScale" placeholder="例如：100 万 DAU，读:写 ≈ 100:1" /></label>
 <div class="row" style="margin-top:10px">
-<button class="btn" id="seedGenerate">🤖 调用生成器</button>
 <button class="btn primary" id="seedDraft">💾 存为草稿 pack</button>
 <span class="small" id="seedMsg"></span>
 </div>
-<div id="seedGenOut"></div>
 </div>
 </section>
 
@@ -206,7 +203,7 @@ ${(json.tags || []).map((t) => `<span class="badge">${esc(t)}</span>`).join('')}
 量级：${esc(json.scale?.dau)} · 基线 ${json.scale?.baselineRps} req/s · 峰值 ×${json.scale?.peakMultiplier} ·
 预算 $${json.scale?.budgetCostPerHour}/h · 读写比 ${Math.round((json.workload?.readRatio?? 0) * 100)}% 读<br/>
 用例：共 ${json.testCases.length}（可见 ${visible} / 隐藏 ${hidden}）· Schema 表 ${json.schema?.tables?.length?? 0} 张 ·
-访问模式 ${json.schema?.accessPatterns?.length?? 0} 条 · 示例设计节点 ${json.sampleDesign?.nodes?.length?? 0} 个
+访问模式 ${json.schema?.accessPatterns?.length?? 0} 条 · 示例设计节点 ${json.sampleDesign?.nodes?.length?? 0} 个${json.referenceSolution? ' · <b style="color:var(--ok)">已有参考解（admin-only，答题端不可见）</b>': ''}
 </div>
 <details><summary>功能需求</summary><pre>${esc((json.functionalRequirements || []).map((r) => '· ' + r).join('\n') || '（无）')}</pre></details>
 <details><summary>用例清单</summary><pre>${esc(json.testCases.map((t) => `${t.hidden? '🔒': '👁'} ${t.name}（权重 ${t.weight}）`).join('\n') || '（无用例）')}</pre></details>
@@ -218,7 +215,8 @@ ${(json.tags || []).map((t) => `<span class="badge">${esc(t)}</span>`).join('')}
 <button class="btn" id="pdCancel">取消编辑</button>
 <span class="small" id="pdMsg"></span>
 </div>
-</div>`;
+</div>
+<div id="pdGen" style="margin-top:16px"></div>`;
 $('#pdClose').onclick = () => { box.style.display = 'none'; currentPack = null;};
 $('#pdEdit').onclick = () => {
 $('#pdEditor').style.display = 'block';
@@ -242,6 +240,7 @@ loadProblems(id); loadStatus();
 msg.innerHTML = `<span class="err">保存失败（${r.status}）：${esc(r.json?.message || r.text)}</span>`;
 }
 };
+renderGenerations(id);
 box.scrollIntoView({ behavior: 'smooth', block: 'start'});
 }
 
@@ -256,25 +255,6 @@ scaleNotes: $('#seedScale').value.trim(),
 };
 }
 
-$('#seedGenerate').onclick = async () => {
-const msg = $('#seedMsg'); const out = $('#seedGenOut');
-msg.textContent = '调用中…'; out.innerHTML = '';
-const r = await api('/api/problems/generate', {
-method: 'POST', headers: { 'Content-Type': 'application/json'}, body: JSON.stringify(seedBody()),
-});
-msg.textContent = '';
-if (r.status === 501 && r.json) {
-out.innerHTML = `<div style="margin-top:10px" class="small">
-<span class="badge bad">生成器待接入</span> <span class="muted">${esc(r.json.message || '')}</span>
-<details><summary>计划中的生成契约</summary><pre>${esc(pretty(r.json.plannedContract))}</pre></details>
-<span class="muted">现在可以点「存为草稿 pack」先把种子落盘，再用 JSON 编辑器补全。</span></div>`;
-} else if (r.json?.message) {
-out.innerHTML = `<div class="err small" style="margin-top:8px">${esc(r.json.message)}</div>`;
-} else {
-out.innerHTML = `<pre style="margin-top:10px">${esc(pretty(r.json?? r.text))}</pre>`;
-}
-};
-
 $('#seedDraft').onclick = async () => {
 const msg = $('#seedMsg');
 msg.textContent = '保存中…';
@@ -288,6 +268,136 @@ loadProblems(r.json.id); loadStatus();
 msg.innerHTML = `<span class="err">失败（${r.status}）：${esc(r.json?.message || r.text)}</span>`;
 }
 };
+
+// ------------------------------------------------- generations（生成待审）--
+// The fourth system, author side: trigger an LLM generation for THIS
+// problem, review the simulator-validated draft （每例的参考解/弱设计实测 +
+// 区分度裁决）, then 采纳 (merge valid cases + store the reference
+// solution into the pack, admin-only) or 丢弃.
+async function renderGenerations(problemId) {
+const box = document.getElementById('pdGen');
+if (!box) return;
+const { json } = await api('/api/admin/generations?problemId=' + encodeURIComponent(problemId));
+const drafts = Array.isArray(json) ? json : [];
+box.innerHTML = `
+<div class="row"><b>🤖 生成待审（LLM 扩充用例 + 参考解）</b>
+<span class="muted small">用当前启用的 LLM 档案生成；系统会拿参考解逐例真跑现有套件与新用例、再用弱示例设计测区分度，全部留档在这里等你裁决。未配置 LLM 时生成会直接报错——脚本模式不伪造用例。</span></div>
+<div class="row" style="margin-top:8px; align-items:flex-end">
+<label style="margin:0">用例数 <input id="genCount" type="number" value="4" min="1" max="8" style="width:70px" /></label>
+<label style="margin:0; flex:1">侧重（可选） <input id="genFocus" placeholder="例如：多出一致性与故障恢复方面的用例" /></label>
+<button class="btn primary" id="genRun">🤖 生成</button>
+<span class="small" id="genMsg"></span>
+</div>
+<div id="genList" style="margin-top:10px">${drafts.length ? '' : '<p class="muted small">暂无待审生成。</p>'}</div>`;
+document.getElementById('genRun').onclick = async () => {
+const msg = document.getElementById('genMsg');
+const btn = document.getElementById('genRun');
+btn.disabled = true;
+msg.textContent = '生成 + 仿真验证中（要跑完整套件，可能要一会儿）…';
+const r = await api('/api/problems/generate', {
+method: 'POST', headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify({
+problemId,
+caseCount: Number(document.getElementById('genCount').value) || 4,
+focus: document.getElementById('genFocus').value.trim() || undefined,
+}),
+});
+btn.disabled = false;
+if (r.status === 201 && r.json?.draft) {
+msg.innerHTML = r.json.draft.status === 'rejected'
+? `<span class="err">已生成但被系统驳回：${esc(r.json.draft.rejectReason || '')}</span>`
+: '<span class="ok-text">生成完成并通过验证，见下方待审。</span>';
+renderGenerations(problemId);
+} else {
+msg.innerHTML = `<span class="err">生成失败（${r.status}）：${esc(r.json?.message || r.text || '')}</span>`;
+}
+};
+const list = document.getElementById('genList');
+for (const d of drafts) {
+const el = document.createElement('div');
+el.style.cssText = 'border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:10px';
+el.innerHTML = `
+<div class="row">
+<b>${esc(new Date(d.createdAt).toLocaleString('zh-CN', { hour12: false }))}</b>
+${d.status === 'rejected' ? '<span class="badge bad">已驳回</span>' : '<span class="badge draft">待审</span>'}
+<span class="muted small">模型 ${esc(d.model)} · 档案「${esc(d.profileName)}」${d.focus ? ` · 侧重：${esc(d.focus)}` : ''}</span>
+<span class="grow"></span>
+<button class="btn" data-genview="${esc(d.id)}">查看详情</button>
+</div>
+<div class="small" style="margin-top:4px">
+用例 ${d.caseCount} 个 · 有效 ${d.validCaseCount} · 弱区分度 ${d.weakCount} ·
+参考解过现有套件：${d.referenceSolvesExisting ? '<span class="ok-text">全部通过</span>' : '<span class="err">未全过</span>'} ·
+结构筛查 high ${d.highSeverityCount} 条
+${d.rejectReason ? `<div class="err">驳回原因：${esc(d.rejectReason)}</div>` : ''}
+</div>
+<div data-gendetail="${esc(d.id)}" style="margin-top:8px"></div>`;
+list.appendChild(el);
+el.querySelector('[data-genview]').onclick = () => renderGenerationDetail(problemId, d.id);
+}
+}
+
+async function renderGenerationDetail(problemId, draftId) {
+const slot = document.querySelector(`[data-gendetail="${draftId}"]`);
+if (!slot) return;
+const { json: d, status } = await api('/api/admin/generations/' + encodeURIComponent(draftId));
+if (status !== 200 || !d) { slot.innerHTML = '<span class="err">草稿加载失败</span>'; return; }
+const vById = new Map((d.report?.cases || []).map((v) => [v.caseId, v]));
+const canAccept = d.status !== 'rejected' && (d.report?.validCaseCount ?? 0) > 0;
+const nodeLine = (d.referenceSolution?.design?.nodes || [])
+.map((n) => `${esc(n.type)}「${esc(n.id)}」`).join('、');
+slot.innerHTML = `
+<div class="small">
+<div>参考解 vs 现有套件：${d.report?.referenceVsExistingSuite
+? `<b>${d.report.referenceVsExistingSuite.passedCount}/${d.report.referenceVsExistingSuite.totalCount}</b> 通过（得分 ${d.report.referenceVsExistingSuite.scorePct}）`
+: '（参考解不可运行）'}
+${(d.report?.referenceVsExistingSuite?.failures || []).map((f) => `<div class="err">✗ ${esc(f.name)}：${esc((f.failures || []).join('；'))}</div>`).join('')}
+</div>
+<div style="margin-top:4px">参考解设计：${(d.referenceSolution?.design?.nodes || []).length} 个节点 · ${(d.referenceSolution?.design?.edges || []).length} 条连线<br/>
+<span class="muted">${nodeLine || '（无）'}</span><br/>
+参考 schema：${(d.referenceSolution?.schema?.tables || []).map((t) => `${esc(t.name)}（${esc(t.engine)}，${Number(t.rows).toLocaleString()} 行）主键 ${esc(t.primaryKey)}/${esc(t.primaryKeyGen)}，分片键 ${esc(t.shardKey ?? '无')}`).join('；') || '（无表）'}</div>
+${(d.renames || []).length ? `<div class="muted" style="margin-top:4px">用例 id 改名（保唯一）：${d.renames.map((r) => `${esc(r.from)} → <code>${esc(r.to)}</code>`).join('；')}</div>` : ''}
+${(d.notes || []).length ? `<div class="muted" style="margin-top:4px">归一化说明：${d.notes.map(esc).join('；')}</div>` : ''}
+${(d.report?.structuralFindings || []).length ? `<details><summary>参考解结构筛查（${d.report.structuralFindings.length} 条，high ${d.report.highSeverityCount}）</summary>
+${d.report.structuralFindings.map((f) => `<div>[${esc(f.severity)}] ${esc(f.title)}<br/><span class="muted">${esc(f.detail)}</span></div>`).join('')}</details>` : '<div class="muted" style="margin-top:4px">结构筛查：无发现。</div>'}
+<table style="margin-top:8px"><thead><tr><th>用例</th><th>参考解实测</th><th>弱示例设计</th><th>裁决</th></tr></thead>
+<tbody>${(d.cases || []).map((tc) => { const v = vById.get(tc.id); return `
+<tr>
+<td>${tc.hidden ? '🔒' : '👁'} <b>${esc(tc.name)}</b><br/><code class="muted">${esc(tc.id)}</code>
+<div class="muted">${esc(tc.description || '')}</div>
+<div class="muted">${tc.traffic.rps} rps · 读 ${Math.round(tc.traffic.readRatio * 100)}% · ${tc.durationTicks} tick${(tc.events || []).length ? ` · 事件 ${(tc.events).map((e) => esc(e.type)).join('/')}` : ''}${(tc.kills || []).length ? ` · 杀 ${(tc.kills).map((k) => esc(k.componentType)).join('/')}` : ''}</div></td>
+<td>${v ? (v.referencePassed ? '<span class="badge ok">通过</span>' : `<span class="badge bad">失败</span><div class="err">${esc((v.referenceFailures || []).join('；'))}</div>`) : '—'}
+<div class="muted">错误率 ${(v.referenceMeasured.errorRate * 100).toFixed(2)}% · P99 ${Math.round(v.referenceMeasured.p99Ms)}ms · $${v.referenceMeasured.costPerHour.toFixed(0)}/h · 最热 ${(v.referenceMeasured.hottestUtil * 100).toFixed(0)}%</div></td>
+<td>${v ? (v.baselinePassed === null ? '<span class="muted">无示例设计</span>' : v.baselinePassed ? '<span class="badge warn">通过</span>' : '<span class="muted">失败</span>') : '—'}</td>
+<td>${v ? (v.acceptable
+? '<span class="badge ok">有效</span>' + (v.weakDiscrimination ? ' <span class="badge warn">弱区分度</span>' : '')
+: '<span class="badge bad">无效用例（采纳时剔除）</span>') : '—'}</td>
+</tr>`; }).join('')}</tbody></table>
+<div class="row" style="margin-top:10px">
+<button class="btn primary" data-genaccept="${esc(d.id)}" ${canAccept ? '' : 'disabled'}>✅ 采纳（合并有效用例 + 存参考解）</button>
+<button class="btn danger" data-gendiscard="${esc(d.id)}">🗑 丢弃</button>
+<span class="small" data-genopmsg></span>
+</div>
+${canAccept ? '' : '<div class="muted small" style="margin-top:4px">不可采纳：' + (d.status === 'rejected' ? '这份生成已被系统驳回。' : '没有有效用例。') + '</div>'}
+</div>`;
+slot.querySelector('[data-genaccept]').onclick = async () => {
+const msg = slot.querySelector('[data-genopmsg]');
+if (!confirm('采纳后：有效用例合并进题包（与自带用例平权），参考解存为题包的 admin-only 字段（答题端永远看不到）。继续？')) return;
+msg.textContent = '采纳中…';
+const r = await api('/api/admin/generations/' + encodeURIComponent(draftId) + '/accept', { method: 'POST' });
+if (r.status === 200 && r.json?.ok) {
+msg.innerHTML = `<span class="ok-text">已采纳：合并用例 ${esc((r.json.addedCaseIds || []).join('、'))}${(r.json.skippedCaseIds || []).length ? `；剔除无效 ${(r.json.skippedCaseIds).join('、')}` : ''}；参考解已存入题包。</span>`;
+loadProblems(problemId); loadStatus();
+} else {
+msg.innerHTML = `<span class="err">采纳失败（${r.status}）：${esc(r.json?.message || r.text || '')}</span>`;
+}
+};
+slot.querySelector('[data-gendiscard]').onclick = async () => {
+if (!confirm('丢弃这份生成草稿？不可恢复。')) return;
+const r = await api('/api/admin/generations/' + encodeURIComponent(draftId), { method: 'DELETE' });
+if (r.status === 200) renderGenerations(problemId);
+else alert('丢弃失败：' + (r.json?.message || r.text || r.status));
+};
+}
 
 // ------------------------------------------------------------- components --
 // (filled in by loadComponents below — see the 组件 section script)
