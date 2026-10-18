@@ -17,6 +17,7 @@ import {
   fetchProblems,
   judgeOnServer,
   verifyProbesOnServer,
+  type ActionCoverageDTO,
   type EditOpDTO,
   type FollowUpContextDTO,
   type FollowUpQuestionDTO,
@@ -27,13 +28,21 @@ import {
   type ProblemPack,
   type ProblemSchemaDTO,
   type SchemaAssessmentDTO,
+  type SchemaOpDTO,
   type SchemaSignalsDTO,
   type StructuralFindingDTO,
   type SubmissionAssessmentDTO,
   type SuiteResultDTO,
   type VerifiedProbeDTO,
 } from './api';
-import { applyActions, recheckActions, type PreviewPlan } from './edits';
+import {
+  applyActions,
+  applySchemaOpsPreview,
+  recheckActions,
+  recheckSchemaOps,
+  type PreviewPlan,
+  type SchemaPreviewPlan,
+} from './edits';
 import {
   MAX_PINS_PER_PROBLEM,
   builtinScenarios,
@@ -47,7 +56,14 @@ import {
 import { Canvas } from './Canvas';
 import { DeepDive } from './DeepDive';
 import { SettingsPanel } from './SettingsPanel';
-import { CaseList, ProbeSection, StructuralList, scoreColor } from './ReportPanel';
+import {
+  ActionSourceLabel,
+  CaseList,
+  CoverageLine,
+  ProbeSection,
+  StructuralList,
+  scoreColor,
+} from './ReportPanel';
 import { SchemaPanel, SchemaAssessmentView, SchemaSignalsView } from './SchemaPanel';
 import { IconGlyph } from './icons';
 
@@ -241,6 +257,11 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   const [probeBusy, setProbeBusy] = useState(false);
   const [probeNote, setProbeNote] = useState<string | null>(null);
   const [probeLabel, setProbeLabel] = useState('');
+  // Action-guarantee accounting per evaluation section (from the server
+  // ladder): how many findings ship an applicable action, by provenance.
+  const [assessmentCoverage, setAssessmentCoverage] = useState<ActionCoverageDTO | null>(null);
+  const [probeCoverage, setProbeCoverage] = useState<ActionCoverageDTO | null>(null);
+  const [schemaCoverage, setSchemaCoverage] = useState<ActionCoverageDTO | null>(null);
 
   // --------------------------------------------- schema evaluation layer -
   // There is NO standalone schema review anymore: the AI assessment is
@@ -253,6 +274,11 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   const [schemaLabel, setSchemaLabel] = useState('');
   const [schemaBusy, setSchemaBusy] = useState(false);
   const [schemaError, setSchemaError] = useState<string | null>(null);
+  // Schema fix loop: a suggestion's schema-ops previewed against the
+  // CURRENT schema draft (pure computation) → confirm commits the draft
+  // + one-step undo — the same discipline as the architecture fix loop.
+  const [schemaPreview, setSchemaPreview] = useState<{ title: string; plan: SchemaPreviewPlan } | null>(null);
+  const [undoSchemaFix, setUndoSchemaFix] = useState<{ schema: ProblemSchemaDTO; title: string } | null>(null);
   // The exact design + schema the on-screen results belong to. Editing
   // either beside the results marks them stale until the next submit.
   const [submittedSnapshot, setSubmittedSnapshot] = useState<{
@@ -332,15 +358,18 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     savePins(pins);
   }, [pins]);
 
-  // Esc abandons a fix preview without touching the design.
+  // Esc abandons a fix preview without touching the design / schema draft.
   useEffect(() => {
-    if (!preview) return;
+    if (!preview && !schemaPreview) return;
     const h = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setPreview(null);
+      if (e.key === 'Escape') {
+        setPreview(null);
+        setSchemaPreview(null);
+      }
     };
     window.addEventListener('keydown', h);
     return () => window.removeEventListener('keydown', h);
-  }, [preview]);
+  }, [preview, schemaPreview]);
 
   // Structural findings and schema signals are computed by the backend,
   // not here. While designing, refresh them (debounced) through the judge
@@ -600,6 +629,11 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setProbeResults(null);
     setProbeNote(null);
     setProbeLabel('');
+    setAssessmentCoverage(null);
+    setProbeCoverage(null);
+    setSchemaCoverage(null);
+    setSchemaPreview(null);
+    setUndoSchemaFix(null);
     setPhase('report');
     setSubmissions((prev) =>
       [
@@ -662,6 +696,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
           })),
         },
         designRef.current,
+        p.id,
       );
       setProbeLabel(pr.label);
       if (pr.data.length > 0) {
@@ -672,6 +707,9 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
         });
         verified = vr.results;
         setProbeResults(verified);
+        // Coverage of the VERIFIED fixes wins (that is what is on screen);
+        // the propose step's own accounting is the fallback.
+        setProbeCoverage(vr.actionCoverage ?? pr.actionCoverage ?? null);
         if (!verified.length) {
           setProbeNote('探测用例未通过服务端的合法性校验，本轮没有可验证的探测结果。');
         }
@@ -704,6 +742,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
       });
       setSchemaLabel(r.label);
       setSchemaAssessment(r.data);
+      setSchemaCoverage(r.actionCoverage ?? null);
       if (r.schemaSignals) setSchemaSignals(r.schemaSignals);
     } catch {
       // Same honesty rule as the submission review: the evaluate request
@@ -740,9 +779,11 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
           ...(probes.length ? { probeResults: probes } : {}),
         },
         designRef.current,
+        problemRef.current.id,
       );
       setAssessorLabel(r.label);
       setAssessment(r.data);
+      setAssessmentCoverage(r.actionCoverage ?? null);
     } catch {
       // The server already falls back to its scripted assessment when the
       // LLM call itself fails, so reaching here means the evaluate request
@@ -914,6 +955,48 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setDesign(undoFix.design);
     setUndoFix(null);
     setFixNotice('已撤销刚才应用的改进，设计已恢复。');
+  };
+
+  // ------------------------------------------------------ schema fix loop -
+  /**
+   * Enter preview mode for one schema suggestion's ops. The ops were
+   * validated server-side against the SUBMITTED schema; re-check them
+   * against the CURRENT draft first — if the user has since renamed or
+   * dropped the target table/field, refuse gracefully. The preview is
+   * pure computation; confirming swaps the draft and offers one-step
+   * undo. Applying switches the right workspace to 数据库设计 so the
+   * user sees the change list where the draft lives.
+   */
+  const enterSchemaPreview = (title: string, actions: SchemaOpDTO[]) => {
+    const draft = schemasRef.current[problemRef.current.id]!;
+    const valid = recheckSchemaOps(actions, draft);
+    if (!valid.length) {
+      setFixNotice('这条建议引用的表/字段在当前数据库草稿里已不存在或已是目标状态（草稿已被改动），无法应用。');
+      setRightView('schema');
+      return;
+    }
+    setFixNotice(null);
+    setSchemaPreview({ title, plan: applySchemaOpsPreview(draft, valid) });
+    setRightView('schema');
+  };
+
+  const confirmSchemaApply = () => {
+    if (!schemaPreview) return;
+    const pid = problemRef.current.id;
+    setUndoSchemaFix({ schema: schemasRef.current[pid]!, title: schemaPreview.title });
+    setSchemas({ ...schemasRef.current, [pid]: schemaPreview.plan.schema });
+    setSchemaPreview(null);
+    setFixNotice(
+      `已应用数据库改进「${schemaPreview.title}」。这只改了数据库设计草稿——评审结论仍是上次提交的，重新提交后才会重新评审。`,
+    );
+  };
+
+  const undoSchemaApply = () => {
+    if (!undoSchemaFix) return;
+    const pid = problemRef.current.id;
+    setSchemas({ ...schemasRef.current, [pid]: undoSchemaFix.schema });
+    setUndoSchemaFix(null);
+    setFixNotice('已撤销刚才应用的数据库改进，草稿已恢复。');
   };
 
   const injectLive = (type: 'viral_post' | 'cache_stampede' | 'hot_key' | 'rw_flip') => {
@@ -1415,17 +1498,21 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                               </b>
                               <span style={{ color: '#cbd5e1' }}> — {f.detail}</span>
                               {f.actions && f.actions.length > 0 && (
-                                <button
-                                  style={{ marginLeft: 8 }}
-                                  onClick={() => enterPreview(f.title, f.actions!)}
-                                >
-                                  ✨ 应用此改进
-                                </button>
+                                <>
+                                  <button
+                                    style={{ marginLeft: 8 }}
+                                    onClick={() => enterPreview(f.title, f.actions!)}
+                                  >
+                                    ✨ 应用此改进
+                                  </button>
+                                  {f.actionSource && <ActionSourceLabel source={f.actionSource} />}
+                                </>
                               )}
                             </li>
                           ))}
                         </ul>
                       )}
+                      {assessmentCoverage && <CoverageLine coverage={assessmentCoverage} />}
                     </div>
                   )}
                 </div>
@@ -1448,6 +1535,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                 }
                 results={probeResults}
                 sourceLabel={probeLabel}
+                coverage={probeCoverage}
                 quickSimId={activeSim?.id ?? null}
                 pinnedIds={pinnedIds}
                 onQuickSim={quickSimProbe}
@@ -1468,7 +1556,14 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                   <div style={{ color: '#fca5a5', fontSize: 13, marginBottom: 8 }}>⚠️ {schemaError}</div>
                 )}
                 {schemaAssessment ? (
-                  <SchemaAssessmentView assessment={schemaAssessment} label={schemaLabel || undefined} />
+                  <>
+                    <SchemaAssessmentView
+                      assessment={schemaAssessment}
+                      label={schemaLabel || undefined}
+                      onApplySuggestion={enterSchemaPreview}
+                    />
+                    {schemaCoverage && <CoverageLine coverage={schemaCoverage} />}
+                  </>
                 ) : (
                   !schemaBusy && (
                     <p className="hint" style={{ marginTop: 0 }}>
@@ -1768,6 +1863,38 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
             className="ws-view ws-view-schema"
             style={{ display: rightView === 'schema' ? 'flex' : 'none' }}
           >
+            {/* schema fix preview: what the suggestion will change in the
+                draft (table / field / old → new), confirm before it lands */}
+            {schemaPreview && (
+              <div className="preview-bar">
+                <div className="preview-head">
+                  <b>👀 数据库改进预览：{schemaPreview.title}</b>
+                  <span>尚未应用——下面是这条建议对数据库设计草稿的全部改动，确认后才真正生效。</span>
+                </div>
+                <ul className="preview-changes">
+                  {schemaPreview.plan.descriptions.map((d, i) => (
+                    <li key={i}>{d}</li>
+                  ))}
+                </ul>
+                <div className="preview-actions">
+                  <button className="primary" onClick={confirmSchemaApply}>
+                    ✔ 确认应用
+                  </button>
+                  <button onClick={() => setSchemaPreview(null)}>放弃（Esc）</button>
+                  <span className="preview-note">
+                    只改草稿：评审结论仍是上次提交的，重新提交后才重新评审。
+                  </span>
+                </div>
+              </div>
+            )}
+            {/* one-step undo for the last applied schema fix */}
+            {undoSchemaFix && !schemaPreview && (
+              <div className="undo-bar">
+                <span>已应用数据库改进「{undoSchemaFix.title}」</span>
+                <button onClick={undoSchemaApply}>↩ 撤销</button>
+                <button onClick={() => setUndoSchemaFix(null)}>忽略</button>
+              </div>
+            )}
             <SchemaPanel
               schema={schemas[problem.id]!}
               snapshot={snapshot}

@@ -1,4 +1,6 @@
 import type {
+  ActionCoverageDTO,
+  ActionSourceDTO,
   EditOpDTO,
   ProblemCaseDTO,
   ProblemPack,
@@ -6,6 +8,39 @@ import type {
   SuiteResultDTO,
   VerifiedProbeDTO,
 } from './api';
+
+/** Provenance of a fix's actions, shown small + muted next to its apply
+ *  button so the user sees the pedigree at a glance. */
+export const ACTION_SOURCE_LABELS: Record<ActionSourceDTO, string> = {
+  llm: 'LLM',
+  repaired: '修复',
+  rule: '规则',
+  fallback: '兜底',
+};
+
+export function ActionSourceLabel({ source }: { source: ActionSourceDTO }) {
+  return (
+    <span style={{ color: '#64748b', fontSize: 11.5 }}>来源：{ACTION_SOURCE_LABELS[source]}</span>
+  );
+}
+
+/** The evaluation's action-coverage accounting, one muted line. */
+export function CoverageLine({ coverage }: { coverage: ActionCoverageDTO }) {
+  const b = coverage.bySource;
+  const parts = [
+    b.llm ? `LLM ${b.llm}` : '',
+    b.repaired ? `修复 ${b.repaired}` : '',
+    b.rule ? `规则 ${b.rule}` : '',
+    b.fallback ? `兜底 ${b.fallback}` : '',
+  ].filter(Boolean);
+  return (
+    <div style={{ color: '#64748b', fontSize: 12, marginTop: 6 }}>
+      动作覆盖：{coverage.withActions}/{coverage.findings} 条带可应用改进
+      {parts.length ? `（${parts.join(' · ')}）` : ''}
+      {coverage.nonMechanical > 0 ? ` · 另有 ${coverage.nonMechanical} 条为纯权衡说明（无机械改法）` : ''}
+    </div>
+  );
+}
 
 function thresholdSummary(tc: ProblemCaseDTO): string {
   const t = tc.thresholds;
@@ -116,15 +151,18 @@ export function CaseList(props: CaseListProps) {
               <div style={{ fontSize: 12.5, color: '#facc15', marginTop: 4 }}>💡 {r.hint}</div>
             )}
             {r && !r.passed && props.onApplyFix && r.fixes && r.fixes.length > 0 && (
-              <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap', alignItems: 'center' }}>
                 {r.fixes.map((fix) => (
-                  <button
-                    key={fix.findingId}
-                    onClick={() => props.onApplyFix!(fix.title, fix.actions)}
-                    title="预览这条结构缺陷的修复改动，确认后才应用到设计"
-                  >
-                    ✨ 应用此改进（{fix.title}）
-                  </button>
+                  <span key={fix.findingId} style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+                    <button
+                      onClick={() => props.onApplyFix!(fix.title, fix.actions)}
+                      title="预览这条结构缺陷的修复改动，确认后才应用到设计"
+                    >
+                      ✨ 应用此改进（{fix.title}）
+                    </button>
+                    {/* Case-linked fixes ARE the checker's canned rule fixes. */}
+                    <ActionSourceLabel source="rule" />
+                  </span>
                 ))}
               </div>
             )}
@@ -142,6 +180,8 @@ interface ProbeSectionProps {
   results: VerifiedProbeDTO[] | null;
   /** Attribution of the proposer （云端 LLM / 本地脚本）. */
   sourceLabel: string;
+  /** Action coverage of the verified fixes (from verify-probes). */
+  coverage?: ActionCoverageDTO | null;
   /** Id of the scenario currently quick-simulating ('probe:<name>'). */
   quickSimId: string | null;
   pinnedIds: Set<string>;
@@ -173,6 +213,7 @@ export function ProbeSection(props: ProbeSectionProps) {
           <span style={{ color: '#94a3b8', fontSize: 12 }}>提案：{sourceLabel}</span>
         )}
       </div>
+      {props.coverage && results && results.length > 0 && <CoverageLine coverage={props.coverage} />}
       {busy && (
         <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>
           探测中…（模型正在针对这份设计提出假设用例，随后由仿真逐例验证）
@@ -234,9 +275,14 @@ export function ProbeSection(props: ProbeSectionProps) {
                     </>
                   )}
                   {r.prediction.actions && r.prediction.actions.length > 0 && (
-                    <button onClick={() => props.onApplyFix(r.name, r.prediction.actions!)}>
-                      ✨ 应用此改进
-                    </button>
+                    <>
+                      <button onClick={() => props.onApplyFix(r.name, r.prediction.actions!)}>
+                        ✨ 应用此改进
+                      </button>
+                      {r.prediction.actionSource && (
+                        <ActionSourceLabel source={r.prediction.actionSource} />
+                      )}
+                    </>
                   )}
                 </div>
               </div>
@@ -271,16 +317,20 @@ export function StructuralList(props: StructuralListProps) {
         <div key={i} className="finding-row">
           <span className={`chip chip-${f.severity}`}>{f.severity}</span> <b>{f.title}</b>
           <div style={{ color: '#cbd5e1', fontSize: 13, marginTop: 3 }}>{f.detail}</div>
-          <div style={{ display: 'flex', gap: 6, marginTop: 5, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: 6, marginTop: 5, flexWrap: 'wrap', alignItems: 'center' }}>
             {f.componentIds.length > 0 && (
               <button onClick={() => props.onSelectNode(f.componentIds[0]!)}>
                 在画布上看这个组件 →
               </button>
             )}
             {props.onApplyFix && f.actions && f.actions.length > 0 && (
-              <button onClick={() => props.onApplyFix!(f.title, f.actions!)}>
-                ✨ 应用此改进
-              </button>
+              <>
+                <button onClick={() => props.onApplyFix!(f.title, f.actions!)}>
+                  ✨ 应用此改进
+                </button>
+                {/* Structural findings' canned fixes are deterministic rules. */}
+                <ActionSourceLabel source="rule" />
+              </>
             )}
           </div>
         </div>

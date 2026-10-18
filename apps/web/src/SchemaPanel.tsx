@@ -2,9 +2,11 @@ import type { MetricsSnapshot } from '@sds/sim-core';
 import type {
   ProblemSchemaDTO,
   SchemaAssessmentDTO,
+  SchemaOpDTO,
   SchemaSignalsDTO,
   SchemaTableDTO,
 } from './api';
+import { ActionSourceLabel } from './ReportPanel';
 
 const ROW_PRESETS = [100_000, 10_000_000, 1_000_000_000, 50_000_000_000];
 
@@ -66,14 +68,21 @@ export function SchemaSignalsView({ signals }: { signals: SchemaSignalsDTO }) {
  * The qualitative schema conclusions — produced by the backend's unified
  * submit (one evaluate call), rendered ONLY in the results page's
  * 「数据库评审」 tab. This panel holds no review logic of its own.
+ * Suggestions carry server-validated schema-ops (the action guarantee):
+ * when `onApplySuggestion` is given, each suggestion with actions gets a
+ * ✨ button that enters the schema fix preview (confirm/undo discipline
+ * lives in App, exactly like the architecture fix loop).
  */
 export function SchemaAssessmentView({
   assessment,
   label,
+  onApplySuggestion,
 }: {
   assessment: SchemaAssessmentDTO;
   /** Source attribution （评审：云端 LLM · <model>), when available. */
   label?: string;
+  /** Enter the fix preview for one suggestion's validated schema-ops. */
+  onApplySuggestion?: (title: string, actions: SchemaOpDTO[]) => void;
 }) {
   return (
     <div style={{ border: '1px solid #1e293b', borderRadius: 8, padding: '10px 12px', background: '#0b1220' }}>
@@ -94,7 +103,21 @@ export function SchemaAssessmentView({
             <b style={{ display: 'block', marginTop: 8 }}>改进建议（按优先级）</b>
             <ul style={{ margin: '4px 0', paddingLeft: 18, color: '#cbd5e1' }}>
               {assessment.suggestions.map((s, i) => (
-                <li key={i}>{s}</li>
+                <li key={i}>
+                  {s.text}
+                  {onApplySuggestion && s.actions && s.actions.length > 0 && (
+                    <>
+                      <button
+                        style={{ marginLeft: 8 }}
+                        onClick={() => onApplySuggestion(s.text, s.actions!)}
+                        title="预览这条建议对右侧数据库设计草稿的改动，确认后才生效"
+                      >
+                        ✨ 应用到数据库设计
+                      </button>
+                      {s.actionSource && <ActionSourceLabel source={s.actionSource} />}
+                    </>
+                  )}
+                </li>
               ))}
             </ul>
           </>

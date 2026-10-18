@@ -258,6 +258,47 @@ export interface AssessmentFindingDTO {
   componentId?: string;
   /** One-click fix actions (server-validated against the submitted design). */
   actions?: EditOpDTO[];
+  /** Provenance of the actions: llm / repaired / rule / fallback. */
+  actionSource?: ActionSourceDTO;
+}
+
+// ------------------------------------------------------- action guarantee -
+// Every evaluation finding ships with ≥1 server-validated action (the
+// server ladder: first-pass validation → ONE repair re-prompt → rule
+// synthesis → universal fallback). The response carries the accounting;
+// each item carries its actions' provenance, rendered next to its apply
+// button so the user can see the fix's pedigree at a glance.
+
+/** Where an item's actions came from. */
+export type ActionSourceDTO = 'llm' | 'repaired' | 'rule' | 'fallback';
+
+export interface ActionCoverageDTO {
+  /** Assessed items (probe predictions count only when they predict failure). */
+  findings: number;
+  /** Of those, how many ship ≥1 validated action. */
+  withActions: number;
+  bySource: { llm: number; repaired: number; rule: number; fallback: number };
+  /** Declared non-mechanical items the ladder let ship actionless. */
+  nonMechanical: number;
+}
+
+/**
+ * One schema mutation, in the schema-op vocabulary the backend validates
+ * against the submitted schema (table/field must exist, enums legal,
+ * no-ops dropped). Applied to the schema DRAFT behind a preview +
+ * confirm, mirroring the architecture fix loop.
+ */
+export type SchemaOpDTO =
+  | { op: 'setShardKey'; table: string; field: string | null }
+  | { op: 'addIndex'; table: string; field: string }
+  | { op: 'setPrimaryKeyGen'; table: string; gen: 'auto' | 'snowflake' | 'uuid' | 'business' }
+  | { op: 'setEngine'; table: string; engine: 'relational' | 'nosql' };
+
+export interface SchemaSuggestionDTO {
+  text: string;
+  /** Executable form of the suggestion (server-validated schema-ops). */
+  actions?: SchemaOpDTO[];
+  actionSource?: ActionSourceDTO;
 }
 
 export interface SubmissionAssessmentDTO {
@@ -269,7 +310,7 @@ export interface SubmissionAssessmentDTO {
 export interface SchemaAssessmentDTO {
   conclusion: string;
   dimensionNotes: { dimension: '需求覆盖' | '延迟风险' | '扩展性'; note: string }[];
-  suggestions: string[];
+  suggestions: SchemaSuggestionDTO[];
 }
 
 /** Context for follow-up generation — assembled from runtime data only. */
@@ -348,6 +389,8 @@ export interface ProbeCaseDTO {
     rationale: string;
     fixHint: string;
     actions?: EditOpDTO[];
+    /** Provenance of the fix actions: llm / repaired / rule / fallback. */
+    actionSource?: ActionSourceDTO;
   };
 }
 
@@ -407,6 +450,8 @@ export interface EvaluateResponseDTO<T> {
   profileName?: string;
   /** True when the call ran on the profile the user picked below. */
   viaUserChoice?: boolean;
+  /** Action-guarantee accounting for this evaluation, when applicable. */
+  actionCoverage?: ActionCoverageDTO;
   /** Present on schema evaluations where the server computed the signals. */
   schemaSignals?: SchemaSignalsDTO;
 }
@@ -495,11 +540,13 @@ export function evaluateOnServer<T>(
   kind: 'submission' | 'followups',
   context: SubmissionAssessmentContextDTO | FollowUpContextDTO,
   design?: Design,
+  problemId?: string,
 ): Promise<EvaluateResponseDTO<T>>;
 export function evaluateOnServer<T>(
   kind: 'probe',
   context: ProbeContextDTO,
   design?: Design,
+  problemId?: string,
 ): Promise<EvaluateResponseDTO<T>>;
 export function evaluateOnServer<T>(
   kind: 'schema',
@@ -509,6 +556,7 @@ export function evaluateOnServer<T>(
   kind: 'submission' | 'schema' | 'followups' | 'probe',
   context: unknown,
   design?: Design,
+  problemId?: string,
 ): Promise<EvaluateResponseDTO<T>> {
   // The user's model pick rides along as a bare profile id; the server
   // honors it only if the admin opened that profile to end users.
@@ -519,9 +567,11 @@ export function evaluateOnServer<T>(
       kind,
       context,
       ...(profileId ? { profileId } : {}),
-      // The design snapshot the assessment is about: the server uses it
-      // ONLY to validate fix actions before returning them as applicable.
+      // The design snapshot the assessment is about: the server's action
+      // ladder validates / repairs / synthesizes fix actions against it.
       ...(design ? { design } : {}),
+      // Lets the ladder measure the design's genuinely hottest node.
+      ...(problemId ? { problemId } : {}),
     }),
   });
 }
@@ -534,8 +584,8 @@ export function verifyProbesOnServer(body: {
   problemId: string;
   design: Design;
   cases: ProbeCaseDTO[];
-}): Promise<{ problemId: string; results: VerifiedProbeDTO[] }> {
-  return request<{ problemId: string; results: VerifiedProbeDTO[] }>(
+}): Promise<{ problemId: string; results: VerifiedProbeDTO[]; actionCoverage?: ActionCoverageDTO }> {
+  return request<{ problemId: string; results: VerifiedProbeDTO[]; actionCoverage?: ActionCoverageDTO }>(
     '/api/submissions/verify-probes',
     { method: 'POST', body: JSON.stringify(body) },
   );

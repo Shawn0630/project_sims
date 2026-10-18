@@ -1,6 +1,6 @@
 import { COMPONENT_MAP, componentDef, type ComponentTypeId } from '@sds/components';
 import { defaultSettings, newId, type Design } from '@sds/sim-core';
-import type { EditOpDTO } from './api';
+import type { EditOpDTO, ProblemSchemaDTO, SchemaOpDTO } from './api';
 
 /**
  * Local mirror of the fix-action semantics (@sds/checker edits.ts is the
@@ -215,4 +215,100 @@ export function applyActions(design: Design, ops: EditOpDTO[]): PreviewPlan {
     }
   }
   return { design: next, descriptions, marks };
+}
+
+// ------------------------------------------------------- schema fix loop ---
+// Local mirror of the schema-op semantics (@sds/checker schemaOps.ts is
+// the reference). Same discipline as the architecture fix loop: the
+// suggestion's ops arrive server-validated against the SUBMITTED schema;
+// before a preview is offered they are re-checked against the CURRENT
+// schema draft (the user may have edited tables since the review), and
+// the preview is a pure computation — the draft changes only on confirm.
+
+export interface SchemaPreviewPlan {
+  schema: ProblemSchemaDTO;
+  descriptions: string[];
+}
+
+/**
+ * Re-check schema ops against the current draft, mirroring the server's
+ * validateSchemaOps: table/field must exist, enums legal, and NO-OP ops
+ * (index already present, shard key already set, gen/engine already
+ * current) drop — sequentially, so later ops see earlier ones' effects.
+ */
+export function recheckSchemaOps(ops: SchemaOpDTO[], schema: ProblemSchemaDTO): SchemaOpDTO[] {
+  const working = structuredClone(schema);
+  const out: SchemaOpDTO[] = [];
+  for (const op of ops) {
+    if (out.length >= 3) break;
+    const table = working.tables.find((t) => t.name === op.table);
+    if (!table) continue;
+    if (op.op === 'setShardKey') {
+      if (op.field !== null && !table.fields.some((f) => f.name === op.field)) continue;
+      if (table.shardKey === op.field) continue;
+      table.shardKey = op.field;
+      out.push(op);
+    } else if (op.op === 'addIndex') {
+      const field = table.fields.find((f) => f.name === op.field);
+      if (!field || field.indexed) continue;
+      field.indexed = true;
+      out.push(op);
+    } else if (op.op === 'setPrimaryKeyGen') {
+      if (table.primaryKeyGen === op.gen) continue;
+      table.primaryKeyGen = op.gen;
+      out.push(op);
+    } else {
+      if (table.engine === op.engine) continue;
+      table.engine = op.engine;
+      out.push(op);
+    }
+  }
+  return out;
+}
+
+const SCHEMA_GEN_LABELS: Record<string, string> = {
+  auto: '自增',
+  snowflake: '雪花',
+  uuid: 'UUID',
+  business: '业务键',
+};
+const SCHEMA_ENGINE_LABELS: Record<string, string> = { relational: '关系型', nosql: 'NoSQL' };
+
+/** Plain-language rendering of one schema op (table / field / old → new). */
+export function describeSchemaOp(op: SchemaOpDTO, schema: ProblemSchemaDTO): string {
+  const table = schema.tables.find((t) => t.name === op.table);
+  if (op.op === 'setShardKey') {
+    return `表 ${op.table}：分片键 ${table?.shardKey ?? '无'} → ${op.field ?? '无（不分片）'}`;
+  }
+  if (op.op === 'addIndex') {
+    return `表 ${op.table}：给字段 ${op.field} 加索引（当前未索引 → 已索引）`;
+  }
+  if (op.op === 'setPrimaryKeyGen') {
+    return `表 ${op.table}：主键生成 ${SCHEMA_GEN_LABELS[table?.primaryKeyGen ?? ''] ?? table?.primaryKeyGen ?? '？'} → ${SCHEMA_GEN_LABELS[op.gen] ?? op.gen}`;
+  }
+  return `表 ${op.table}：存储引擎 ${SCHEMA_ENGINE_LABELS[table?.engine ?? ''] ?? table?.engine ?? '？'} → ${SCHEMA_ENGINE_LABELS[op.engine] ?? op.engine}`;
+}
+
+/**
+ * Compute the schema preview: a NEW schema with the ops applied (same
+ * semantics as the server's applySchemaOps) plus the change list. Pure:
+ * the draft in App state is only replaced when the user confirms.
+ */
+export function applySchemaOpsPreview(
+  schema: ProblemSchemaDTO,
+  ops: SchemaOpDTO[],
+): SchemaPreviewPlan {
+  const descriptions = ops.map((op) => describeSchemaOp(op, schema));
+  const next: ProblemSchemaDTO = structuredClone(schema);
+  for (const op of ops) {
+    const table = next.tables.find((t) => t.name === op.table);
+    if (!table) continue;
+    if (op.op === 'setShardKey') table.shardKey = op.field;
+    else if (op.op === 'addIndex') {
+      const field = table.fields.find((f) => f.name === op.field);
+      if (field) field.indexed = true;
+    } else if (op.op === 'setPrimaryKeyGen') table.primaryKeyGen = op.gen;
+    else table.engine = op.engine;
+  }
+  return { schema: next, descriptions };
 }
