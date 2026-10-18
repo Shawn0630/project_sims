@@ -9,3 +9,5 @@ dist/
 apps/server/data/llm-calls.jsonl
 # LLM model profiles: contains API keys — local only, never committed.
 apps/server/data/llm-config.json
+# LLM generation drafts (pending author review): machine-local authoring state.
+apps/server/data/generations/

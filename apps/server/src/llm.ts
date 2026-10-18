@@ -3,16 +3,20 @@ import type { Design } from '@sds/sim-core';
 import {
   ScriptedDriver,
   buildFollowUpPrompt,
+  buildGenerationPrompt,
   buildProbePrompt,
   buildSchemaPrompt,
   buildSubmissionPrompt,
   parseFollowUps,
+  parseGeneration,
   parseProbeCases,
   parseSchemaAssessment,
   parseSubmissionAssessment,
   type EditOp,
   type FollowUpContext,
   type FollowUpQuestion,
+  type GenerationContext,
+  type ParsedGeneration,
   type ProbeCase,
   type ProbeContext,
   type SchemaAssessment,
@@ -426,6 +430,130 @@ export async function evaluateSchema(
     () => scripted.assessSchema(ctx),
     profileId,
   );
+}
+
+// ------------------------------------------------------- problem generation -
+
+/**
+ * Generation failures are HONEST errors, never a scripted fallback: there
+ * is no deterministic way to invent good test cases + a reference
+ * solution, and fabricating them would poison the problem bank. The code
+ * distinguishes "no LLM configured" (the author must set up a profile)
+ * from an upstream failure and from unparsable model output.
+ */
+export class GenerationLlmError extends Error {
+  constructor(
+    readonly code: 'llm_required' | 'llm_call_failed' | 'llm_bad_output',
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+export interface GenerationOutcome {
+  data: ParsedGeneration;
+  model: string;
+  profileName: string;
+  viaUserChoice: boolean;
+}
+
+/**
+ * The generator's ONE model call, through the same logged, profile-
+ * resolved, retrying path as every evaluation (kind 'generate' in the
+ * call log). Unlike evaluations it never falls back to the scripted
+ * driver — failures throw GenerationLlmError with the cause.
+ */
+export async function generateProblemContent(
+  ctx: GenerationContext,
+  profileId?: string,
+): Promise<GenerationOutcome> {
+  const { profile: cfg, viaUserChoice } = await resolveProfileForCall(profileId);
+  if (!cfg.apiKey) {
+    throw new GenerationLlmError(
+      'llm_required',
+      `生成题目需要可用的 LLM 档案：当前档案「${cfg.name}」没有配置 API key。脚本模式不会伪造题目——请在 admin「模型配置」里给档案填上 key，或切换到已配置的档案后重试。`,
+    );
+  }
+  const prompt = buildGenerationPrompt(ctx);
+  const requestBody = {
+    model: cfg.model,
+    messages: [
+      { role: 'system', content: prompt.system },
+      { role: 'user', content: prompt.user },
+    ],
+    response_format: { type: 'json_object' },
+  };
+  const t0 = Date.now();
+  const { result, attempts } = await chatWithRetry(cfg, requestBody);
+  const attemptErrors = attempts.flatMap((a) => (a.error ? [a.error] : []));
+  const retrySummary =
+    attempts.length > 1
+      ? `共尝试 ${attempts.length} 次${result ? '，重试后成功' : '，全部失败'}；失败尝试：${attemptErrors.join('；')}`
+      : undefined;
+  if (!result) {
+    const error = attemptErrors[attemptErrors.length - 1] ?? 'LLM call failed';
+    appendCall({
+      kind: 'generate',
+      source: 'llm',
+      ok: false,
+      baseUrlHost: hostOf(cfg.baseUrl),
+      model: cfg.model,
+      profileName: cfg.name,
+      viaUserChoice,
+      durationMs: Date.now() - t0,
+      request: requestBody,
+      error,
+      attempts: attempts.length,
+      attemptErrors,
+      ...(retrySummary ? { note: retrySummary } : {}),
+    });
+    throw new GenerationLlmError('llm_call_failed', `生成调用失败：${error}`);
+  }
+  const raw = result.content;
+  try {
+    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+    const data = parseGeneration(JSON.parse(cleaned) as unknown, {
+      baselineRps: ctx.baselineRps,
+      defaultReadRatio: ctx.defaultReadRatio,
+    });
+    appendCall({
+      kind: 'generate',
+      source: 'llm',
+      ok: true,
+      baseUrlHost: hostOf(cfg.baseUrl),
+      model: cfg.model,
+      profileName: cfg.name,
+      viaUserChoice,
+      durationMs: Date.now() - t0,
+      usage: result.usage,
+      request: requestBody,
+      responseRaw: raw,
+      responseParsed: data,
+      attempts: attempts.length,
+      ...(attemptErrors.length ? { attemptErrors } : {}),
+      ...(retrySummary ? { note: retrySummary } : {}),
+    });
+    return { data, model: cfg.model, profileName: cfg.name, viaUserChoice };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    appendCall({
+      kind: 'generate',
+      source: 'llm',
+      ok: false,
+      baseUrlHost: hostOf(cfg.baseUrl),
+      model: cfg.model,
+      profileName: cfg.name,
+      viaUserChoice,
+      durationMs: Date.now() - t0,
+      request: requestBody,
+      responseRaw: raw,
+      error: message,
+      attempts: attempts.length,
+      ...(attemptErrors.length ? { attemptErrors } : {}),
+      ...(retrySummary ? { note: retrySummary } : {}),
+    });
+    throw new GenerationLlmError('llm_bad_output', `生成结果不可用：${message}`);
+  }
 }
 
 // ------------------------------------------------- schema context assembly -

@@ -286,9 +286,10 @@ export function registerAdminRoutes(app: Hono, storage: ProblemStorage): void {
     return c.json({ ok: true, id });
   });
 
-  // Seed → draft pack. The LLM generator (POST /api/problems/generate) is
-  // still a 501 stub; this is the manual path that keeps the author flow
-  // working end to end today.
+  // Seed → draft pack. For LLM-assisted authoring, the generator
+  // (POST /api/problems/generate, see generate.ts) extends an EXISTING
+  // pack with validated cases + a reference solution; this endpoint is
+  // the manual path for brand-new problems.
   app.post('/api/problems/draft', async (c) => {
     const seed = (await c.req.json().catch(() => null)) as {
       title?: unknown;
