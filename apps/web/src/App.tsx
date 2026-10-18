@@ -289,7 +289,15 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   // (same lifecycle): the sim that ran + the exact draft fingerprint it
   // ran on, so a later edit can mark the shown results as the last run's.
   const [schemaSims, setSchemaSims] = useState<
-    Record<string, { sim: SchemaSimDTO; fingerprint: string }>
+    Record<
+      string,
+      {
+        sim: SchemaSimDTO;
+        fingerprint: string;
+        /** The previous run for a DIFFERENT draft — kept for 对比竞速. */
+        prevSim?: SchemaSimDTO | null;
+      }
+    >
   >({});
   const [schemaSimBusy, setSchemaSimBusy] = useState(false);
   const [schemaSimError, setSchemaSimError] = useState<string | null>(null);
@@ -776,10 +784,16 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setSchemaSimError(null);
     try {
       const r = await simulateSchemaOnServer({ problemId: p.id, schema: draft });
-      setSchemaSims((prev) => ({
-        ...prev,
-        [p.id]: { sim: r.sim, fingerprint: JSON.stringify(draft) },
-      }));
+      const fingerprint = JSON.stringify(draft);
+      setSchemaSims((prev) => {
+        const old = prev[p.id];
+        // Keep the last DIFFERENT-schema run alongside, so a pattern can
+        // race its previous incarnation （加索引前 vs 后） under one
+        // shared compression. Same-schema re-runs don't displace it.
+        const prevSim =
+          old && old.fingerprint !== fingerprint ? old.sim : (old?.prevSim ?? null);
+        return { ...prev, [p.id]: { sim: r.sim, fingerprint, prevSim } };
+      });
     } catch {
       setSchemaSimError('数据库模拟调用失败：请确认后端在运行（npm run dev:server）后重试。');
     } finally {
@@ -2049,6 +2063,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
               snapshot={snapshot}
               signals={schemaSignals}
               sim={schemaSims[problem.id]?.sim ?? null}
+              prevSim={schemaSims[problem.id]?.prevSim ?? null}
               simBusy={schemaSimBusy}
               simError={schemaSimError}
               simStale={

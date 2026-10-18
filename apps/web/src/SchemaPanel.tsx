@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import type { MetricsSnapshot } from '@sds/sim-core';
 import type {
   ProblemSchemaDTO,
@@ -8,6 +9,7 @@ import type {
   SchemaTableDTO,
 } from './api';
 import { ActionSourceLabel } from './ReportPanel';
+import { QueryPlaybackPanel, type PlaybackLane } from './QueryPlayback';
 
 export function formatBytes(n: number): string {
   if (n >= 1e15) return `${(n / 1e15).toFixed(1)} PB`;
@@ -38,9 +40,46 @@ function fmtUtil(u: number): string {
  * `compact` keeps only the headline + per-table load lines, for the
  * results page's 「数据库评审」 tab next to the deterministic signals.
  */
-export function SchemaSimView({ sim, compact }: { sim: SchemaSimDTO; compact?: boolean }) {
+export function SchemaSimView({
+  sim,
+  compact,
+  prevSim,
+}: {
+  sim: SchemaSimDTO;
+  compact?: boolean;
+  /** Previous run for a DIFFERENT schema of the same problem — enables
+   *  the per-pattern 对比竞速 (old vs new under ONE shared compression). */
+  prevSim?: SchemaSimDTO | null;
+}) {
   const grownById = new Map(sim.perPatternGrown.map((p) => [p.patternId, p]));
   const fb = sim.headline.firstBreak;
+  const [playback, setPlayback] = useState<{ patternId: string; race: boolean } | null>(null);
+  const prevById = new Map((prevSim?.perPattern ?? []).map((p) => [p.patternId, p]));
+  const raceable = (p: SchemaSimDTO['perPattern'][number]): boolean => {
+    const prev = prevById.get(p.patternId);
+    return (
+      !!prev &&
+      (prev.p99Ms !== p.p99Ms || prev.rowsExaminedPerQuery !== p.rowsExaminedPerQuery || prev.path !== p.path)
+    );
+  };
+  const playbackLanes = (): { title: string; lanes: PlaybackLane[] } | null => {
+    if (!playback) return null;
+    const cur = sim.perPattern.find((p) => p.patternId === playback.patternId);
+    if (!cur) return null;
+    if (playback.race) {
+      const prev = prevById.get(cur.patternId);
+      if (!prev) return null;
+      return {
+        title: `对比竞速：${cur.name}`,
+        lanes: [
+          { id: 'old', label: '旧 schema（上一次运行）', pattern: prev },
+          { id: 'new', label: '新 schema（本次运行）', pattern: cur },
+        ],
+      };
+    }
+    return { title: `试运行：${cur.name}`, lanes: [{ id: 'run', label: cur.name, pattern: cur }] };
+  };
+  const pb = playbackLanes();
   return (
     <div className="review-box">
       <div
@@ -78,7 +117,7 @@ export function SchemaSimView({ sim, compact }: { sim: SchemaSimDTO; compact?: b
           <thead>
             <tr>
               <th>访问模式</th><th>路径</th><th>流量</th><th>扫描行数/次</th>
-              <th>平均</th><th>P99</th><th>×{sim.growthFactor} 后 P99</th><th>判定</th><th>说明</th>
+              <th>平均</th><th>P99</th><th>×{sim.growthFactor} 后 P99</th><th>判定</th><th>说明</th><th>回放</th>
             </tr>
           </thead>
           <tbody>
@@ -97,11 +136,44 @@ export function SchemaSimView({ sim, compact }: { sim: SchemaSimDTO; compact?: b
                   </td>
                   <td style={{ color: verdictColor(p.verdict) }}>{p.verdict}</td>
                   <td style={{ color: '#94a3b8' }}>{p.note}</td>
+                  <td style={{ whiteSpace: 'nowrap' }}>
+                    <button
+                      onClick={() =>
+                        setPlayback(
+                          playback?.patternId === p.patternId && !playback.race
+                            ? null
+                            : { patternId: p.patternId, race: false },
+                        )
+                      }
+                      title="用真实语句试运行这条查询，动画回放它的扫描行数与 P99（带压缩标注）"
+                    >
+                      {playback?.patternId === p.patternId && !playback.race ? '⏹ 收起' : '▶ 试运行'}
+                    </button>
+                    {raceable(p) && (
+                      <button
+                        onClick={() =>
+                          setPlayback(
+                            playback?.patternId === p.patternId && playback.race
+                              ? null
+                              : { patternId: p.patternId, race: true },
+                          )
+                        }
+                        title="和上一次不同 schema 的运行结果并排竞速：同一压缩倍数下看旧 vs 新"
+                        style={{ marginLeft: 4 }}
+                      >
+                        {playback?.patternId === p.patternId && playback.race ? '⏹ 收起' : '⏱ 竞速 vs 上一版'}
+                      </button>
+                    )}
+                  </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
+      )}
+
+      {!compact && pb && (
+        <QueryPlaybackPanel title={pb.title} lanes={pb.lanes} onClose={() => setPlayback(null)} />
       )}
 
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: compact ? 0 : 10 }}>
@@ -280,6 +352,8 @@ interface SchemaPanelProps {
   signals: SchemaSignalsDTO | null;
   /** Latest schema-simulation run for THIS problem's draft (App state). */
   sim: SchemaSimDTO | null;
+  /** Previous run for a different draft of the same problem （对比竞速）. */
+  prevSim?: SchemaSimDTO | null;
   simBusy: boolean;
   simError: string | null;
   /** The draft changed after the shown sim run — results are the last run's. */
@@ -288,7 +362,7 @@ interface SchemaPanelProps {
   onChange: (schema: ProblemSchemaDTO) => void;
 }
 
-export function SchemaPanel({ schema, snapshot, signals, sim, simBusy, simError, simStale, onRunSim, onChange }: SchemaPanelProps) {
+export function SchemaPanel({ schema, snapshot, signals, sim, prevSim, simBusy, simError, simStale, onRunSim, onChange }: SchemaPanelProps) {
   const updateTable = (idx: number, table: SchemaTableDTO) => {
     const next = structuredClone(schema);
     next.tables[idx] = table;
@@ -496,7 +570,7 @@ export function SchemaPanel({ schema, snapshot, signals, sim, simBusy, simError,
         )}
         {sim && (
           <div style={{ marginTop: 10 }}>
-            <SchemaSimView sim={sim} />
+            <SchemaSimView sim={sim} prevSim={prevSim} />
           </div>
         )}
       </div>

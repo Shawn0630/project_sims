@@ -250,6 +250,17 @@ export interface SchemaSignalsDTO {
 // RAN the problem's requirement workload against the schema; these are
 // measurements from that run, not formula estimates.
 
+export interface SchemaSimQueryDTO {
+  /** The real statement (SQL / document idiom), from the engine. */
+  text: string;
+  /** EXPLAIN-style plan line, priced from the sim's own numbers. */
+  explain: string;
+  /** Rows returned (reads) or affected (writes / counts). */
+  resultRows: number;
+  /** Synthesized sample rows — labeled 样例数据 wherever rendered. */
+  sampleRows: Record<string, string | number>[];
+}
+
 export interface SchemaSimPatternDTO {
   patternId: string;
   name: string;
@@ -263,6 +274,7 @@ export interface SchemaSimPatternDTO {
   budgetMs: number;
   verdict: string;
   note: string;
+  query: SchemaSimQueryDTO;
 }
 
 export interface SchemaSimTableDTO {
