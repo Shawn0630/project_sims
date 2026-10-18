@@ -26,7 +26,14 @@ import { isMonotonicShardKey, MONOTONIC_SHARD_CAPACITY_SHARE } from './sharding'
  *    workers and accumulate the rest as queue depth.
  *  - util = inQps / (replicas × per-replica capacity). Latency grows
  *    super-linearly with util; above util 1 an increasing share of requests
- *    fail at that node. Flow into a killed node is lost and counted as error.
+ *    fail at that node.
+ *  - A kill takes out ONE instance of a node. For a bounded failover
+ *    window (FAILOVER_TICKS) the dead instance's share of traffic still
+ *    routes to it and fails; after that the load balancer routes around
+ *    it and the node runs on its surviving instances — so redundancy
+ *    (more replicas, more headroom) genuinely absorbs a failure. A node
+ *    whose instances are all down is dead: flow into it is lost and
+ *    counted as error.
  *
  * The model is deterministic so test-case verdicts are reproducible.
  */
@@ -35,11 +42,25 @@ interface NodeState {
   queueDepth: number;
 }
 
+/**
+ * Ticks a dead instance keeps receiving — and failing — its share of a
+ * node's traffic before health checks drain it from rotation (one tick
+ * is one simulated second; ~3s is a typical LB health-check + drain
+ * window). After the window the survivors carry the full inflow on
+ * reduced capacity, so the lasting cost of a kill is lost headroom,
+ * not a permanent error share.
+ */
+const FAILOVER_TICKS = 3;
+
 export class SimulationEngine {
   private design: Design;
   private traffic: TrafficConfig;
   private events: ActiveEvent[] = [];
-  private killed = new Set<string>();
+  /** Instances down per node id — a kill downs ONE instance, so a node
+   *  is dead only when this reaches its replica count. */
+  private down = new Map<string, number>();
+  /** Engine tick of the most recent kill per node (failover window). */
+  private lastKillTick = new Map<string, number>();
   private state = new Map<string, NodeState>();
   private tickCount = 0;
   private last: MetricsSnapshot;
@@ -57,8 +78,11 @@ export class SimulationEngine {
 
   setDesign(design: Design): void {
     this.design = structuredClone(design);
-    for (const id of [...this.killed]) {
-      if (!this.design.nodes.some((n) => n.id === id)) this.killed.delete(id);
+    for (const id of [...this.down.keys()]) {
+      if (!this.design.nodes.some((n) => n.id === id)) {
+        this.down.delete(id);
+        this.lastKillTick.delete(id);
+      }
     }
     this.last = this.computeSnapshot(this.tickCount);
   }
@@ -111,34 +135,62 @@ export class SimulationEngine {
   }
 
   // -------------------------------------------------------------- nodes ---
-  killNode(nodeId: string): boolean {
-    if (!this.design.nodes.some((n) => n.id === nodeId)) return false;
-    this.killed.add(nodeId);
+  /** Instances of this node currently down (0 when untouched). */
+  private downCount(node: DesignNode): number {
+    return this.down.get(node.id) ?? 0;
+  }
+
+  /** True when every instance of the node is down — the node is dead. */
+  private fullyDead(node: DesignNode): boolean {
+    const d = this.downCount(node);
+    return d > 0 && d >= node.settings.replicas;
+  }
+
+  private downOneInstance(node: DesignNode): boolean {
+    if (this.fullyDead(node)) return false;
+    this.down.set(node.id, this.downCount(node) + 1);
+    this.lastKillTick.set(node.id, this.tickCount);
     return true;
   }
 
-  reviveNode(nodeId: string): void {
-    this.killed.delete(nodeId);
+  /** Down one instance of the node. False when it is already fully down. */
+  killNode(nodeId: string): boolean {
+    const node = this.design.nodes.find((n) => n.id === nodeId);
+    if (!node) return false;
+    return this.downOneInstance(node);
   }
 
-  /** Kill the first alive node of a type. Returns its id, or null. */
+  reviveNode(nodeId: string): void {
+    this.down.delete(nodeId);
+    this.lastKillTick.delete(nodeId);
+  }
+
+  /**
+   * Down one instance of the first node of a type that still has a
+   * surviving instance. Returns its id, or null when every instance of
+   * that type is already down.
+   */
   killByType(type: ComponentTypeId): string | null {
-    const node = this.design.nodes.find((n) => n.type === type && !this.killed.has(n.id));
+    const node = this.design.nodes.find((n) => n.type === type && !this.fullyDead(n));
     if (!node) return null;
-    this.killed.add(node.id);
+    this.downOneInstance(node);
     return node.id;
   }
 
+  /** True when every instance of the node is down. */
   isKilled(nodeId: string): boolean {
-    return this.killed.has(nodeId);
+    const node = this.design.nodes.find((n) => n.id === nodeId);
+    return node ? this.fullyDead(node) : false;
   }
 
+  /** Ids of nodes with at least one instance down. */
   killedIds(): string[] {
-    return [...this.killed];
+    return [...this.down.keys()].filter((id) => (this.down.get(id) ?? 0) > 0);
   }
 
   reviveAll(): void {
-    this.killed.clear();
+    this.down.clear();
+    this.lastKillTick.clear();
   }
 
   // --------------------------------------------------------------- step ---
@@ -177,7 +229,7 @@ export class SimulationEngine {
   }
 
   private hasQueueInDesign(): boolean {
-    return this.design.nodes.some((n) => n.type === 'queue' && !this.killed.has(n.id));
+    return this.design.nodes.some((n) => n.type === 'queue' && !this.fullyDead(n));
   }
 
   private computeSnapshot(tick: number): MetricsSnapshot {
@@ -230,15 +282,28 @@ export class SimulationEngine {
     for (const id of order) {
       const node = byId.get(id)!;
       const def = componentDef(node.type);
-      const killed = this.killed.has(id);
+      const downCount = this.downCount(node);
+      const dead = this.fullyDead(node);
+      // Inside the failover window the load balancer has not yet drained
+      // the dead instance: it still receives its share of the node's
+      // traffic (which fails), while each survivor carries only its own
+      // share — so utilisation is judged against the full replica count.
+      // Once the window passes, traffic routes around the dead instance
+      // and the survivors carry everything on reduced capacity.
+      const killTick = this.lastKillTick.get(id);
+      const inFailover =
+        downCount > 0 &&
+        killTick !== undefined &&
+        tick - killTick >= 1 &&
+        tick - killTick <= FAILOVER_TICKS;
       let inQps = inflow.get(id) ?? 0;
       if (def.behavior === 'source') inQps += perSource;
 
       const st = this.state.get(id) ?? { queueDepth: 0 };
       this.state.set(id, st);
 
-      if (killed) {
-        // Everything routed into a dead node is lost.
+      if (dead) {
+        // Every instance is down: everything routed here is lost.
         weightedErrors += inQps;
         metrics.set(id, {
           inQps, outQps: 0, util: 0, latencyMs: 0, errorRate: 1, killed: true,
@@ -247,8 +312,11 @@ export class SimulationEngine {
         continue;
       }
 
+      const capacityReplicas = inFailover
+        ? node.settings.replicas
+        : node.settings.replicas - downCount;
       const capacity =
-        def.defaultCapacityPerReplica * node.settings.replicas * node.settings.capacityScale;
+        def.defaultCapacityPerReplica * capacityReplicas * node.settings.capacityScale;
       let outQps = inQps;
       let util = capacity > 0 ? inQps / capacity : 0;
       let latency = def.baseLatencyMs;
@@ -284,9 +352,14 @@ export class SimulationEngine {
           queueDepth = st.queueDepth;
           const drainCap = (downstream.get(id) ?? []).reduce((sum, toId) => {
             const to = byId.get(toId);
-            if (!to || this.killed.has(toId)) return sum;
+            if (!to || this.fullyDead(to)) return sum;
             const d = componentDef(to.type);
-            return sum + d.defaultCapacityPerReplica * to.settings.replicas * to.settings.capacityScale;
+            return (
+              sum +
+              d.defaultCapacityPerReplica *
+                (to.settings.replicas - this.downCount(to)) *
+                to.settings.capacityScale
+            );
           }, 0);
           const available = st.queueDepth + inQps;
           const drained = drainCap > 0 ? Math.min(available, drainCap) : inQps;
@@ -408,6 +481,15 @@ export class SimulationEngine {
         }
       }
 
+      if (inFailover) {
+        // The dead instance's share of this node's traffic still routes
+        // to it and is lost; the survivors' own error behaviour applies
+        // to the share that actually reaches them.
+        const deadShare = downCount / node.settings.replicas;
+        errorRate = deadShare + (1 - deadShare) * errorRate;
+        outQps *= 1 - deadShare;
+      }
+
       weightedErrors += inQps * errorRate * (def.behavior === 'source' ? 0 : 1);
 
       metrics.set(id, {
@@ -422,9 +504,11 @@ export class SimulationEngine {
       });
 
       // Propagate downstream: same-type targets split, different types fan out.
-      // If some same-type targets are killed, their share reroutes to the
-      // alive siblings (health-check behavior); only when every sibling is
-      // down does the flow land on dead nodes and count as errors.
+      // If some same-type targets are fully down, their share reroutes to
+      // the surviving siblings (health-check behavior); a partially-down
+      // target stays in rotation on its surviving instances. Only when
+      // every sibling is down does the flow land on dead nodes and count
+      // as errors.
       const targets = downstream.get(id) ?? [];
       const byType = new Map<string, string[]>();
       for (const t of targets) {
@@ -432,7 +516,7 @@ export class SimulationEngine {
         byType.set(tt, [...(byType.get(tt) ?? []), t]);
       }
       for (const group of byType.values()) {
-        const alive = group.filter((t) => !this.killed.has(t));
+        const alive = group.filter((t) => !this.fullyDead(byId.get(t)!));
         const effective = alive.length > 0 ? alive : group;
         const share = outQps / effective.length;
         for (const t of effective) inflow.set(t, (inflow.get(t) ?? 0) + share);
@@ -462,7 +546,10 @@ export class SimulationEngine {
     let maxStorageQps = 0;
     let hottestUtil = 0;
     for (const n of nodes) {
-      if (this.killed.has(n.id)) continue;
+      // Fully-down nodes accrue no cost and register no load (unchanged
+      // semantics); a partially-down node is still a provisioned,
+      // load-carrying fleet, so it counts on both.
+      if (this.fullyDead(n)) continue;
       cost += componentDef(n.type).costPerReplicaPerHour * n.settings.replicas;
       const m = metrics.get(n.id);
       if (!m) continue;
