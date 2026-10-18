@@ -166,6 +166,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   const [followUps, setFollowUps] = useState<FollowUpQuestionDTO[] | null>(null);
   const [assessment, setAssessment] = useState<SubmissionAssessmentDTO | null>(null);
   const [assessmentBusy, setAssessmentBusy] = useState(false);
+  const [assessmentError, setAssessmentError] = useState<string | null>(null);
   const [submitStamp, setSubmitStamp] = useState(0);
 
   const engineRef = useRef<SimulationEngine | null>(null);
@@ -289,6 +290,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setStructural([]);
     setJudgeError(null);
     setAssessment(null);
+    setAssessmentError(null);
     setFollowUps(null);
     setHighlights(new Map());
     setSelectedId(null);
@@ -362,6 +364,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setSnapshot(null);
     setSuite(null);
     setAssessment(null);
+    setAssessmentError(null);
     setHighlights(new Map());
     setReplayingId(null);
     replayRef.current = null;
@@ -394,6 +397,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setStructural(jr.structural);
     setSubmitStamp((s) => s + 1);
     setAssessment(null);
+    setAssessmentError(null);
     setPhase('report');
     setSubmissions((prev) =>
       [
@@ -407,13 +411,12 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
         ...prev,
       ].slice(0, 50),
     );
-    // When the backend has no LLM configured, its scripted assessment is
-    // instant and offline — run it automatically. With an LLM attached the
-    // assessment stays behind the button in the results panel so calls are
-    // never a surprise.
-    if (!llmConfigured) {
-      void runAssessment(result, jr.structural);
-    }
+    // Submitting always triggers the qualitative assessment as part of the
+    // submission: the backend makes its single evaluate call (cloud LLM
+    // when configured, scripted fallback otherwise) and the results panel
+    // shows a loading state until it lands. The button in the panel is
+    // only a re-run, never the sole way to get the first assessment.
+    void runAssessment(result, jr.structural);
   };
 
   /** Qualitative review of a judged submission — ONE backend evaluate call. */
@@ -422,6 +425,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     structuralOverride?: StructuralFindingDTO[],
   ) => {
     setAssessmentBusy(true);
+    setAssessmentError(null);
     try {
       const r = await evaluateOnServer<SubmissionAssessmentDTO>('submission', {
         problemName: problemRef.current.name,
@@ -436,7 +440,11 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
       setAssessorLabel(r.label);
       setAssessment(r.data);
     } catch {
-      setAssessment(null);
+      // The server already falls back to its scripted assessment when the
+      // LLM call itself fails, so reaching here means the evaluate request
+      // never completed — say so plainly instead of leaving an empty panel.
+      // (A re-run keeps any previous assessment on screen.)
+      setAssessmentError('评审调用失败：后端未返回评审结果，请确认后端在运行后点「重新评审」。');
     } finally {
       setAssessmentBusy(false);
     }
@@ -1022,18 +1030,24 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                         {assessorLabel && (
                           <span style={{ color: '#94a3b8', fontSize: 12 }}>评审：{assessorLabel}（分数本身由代码判卷）</span>
                         )}
-                        {!assessment && (
-                          <button
-                            style={{ marginLeft: 'auto' }}
-                            disabled={assessmentBusy}
-                            onClick={() => suite && void runAssessment(suite)}
-                          >
-                            {assessmentBusy ? '评审员思考中…' : '让评审员点评这次提交'}
-                          </button>
-                        )}
+                        <button
+                          style={{ marginLeft: 'auto' }}
+                          disabled={assessmentBusy}
+                          onClick={() => suite && void runAssessment(suite)}
+                        >
+                          {assessmentBusy ? '评审生成中…' : assessment ? '重新评审' : '让评审员点评这次提交'}
+                        </button>
                       </div>
                       {assessmentBusy && !assessment && (
-                        <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>正在读这份设计与判卷结果…</div>
+                        <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>
+                          评审生成中…（正在联系{llmConfigured ? '云端 LLM' : '本地脚本评审'}，马上就好）
+                        </div>
+                      )}
+                      {assessmentBusy && assessment && (
+                        <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>重新评审中…</div>
+                      )}
+                      {assessmentError && (
+                        <div style={{ color: '#fca5a5', fontSize: 13, marginTop: 6 }}>⚠️ {assessmentError}</div>
                       )}
                       {assessment && (
                         <div style={{ fontSize: 13, lineHeight: 1.7, marginTop: 4 }}>
