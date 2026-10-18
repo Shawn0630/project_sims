@@ -274,8 +274,8 @@
       "hidden": true,
       "weight": 2,
       "traffic": {
-        "rps": 2000,
-        "readRatio": 0.97
+        "rps": 5000,
+        "readRatio": 0.95
       },
       "durationTicks": 40,
       "kills": [
@@ -288,7 +288,7 @@
         "maxErrorRate": 0.02
       },
       "exposesRule": "spof",
-      "hint": "应用层至少两个节点。"
+      "hint": "应用层至少两个节点，且宕掉一台后，剩下的容量要扛得住峰值。"
     }
   ],
   "schemaTestCases": [

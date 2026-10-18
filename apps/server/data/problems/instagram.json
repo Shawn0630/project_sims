@@ -466,11 +466,11 @@
     {
       "id": "ig-nodefail",
       "name": "峰值期节点宕机",
-      "description": "隐藏用例：高峰期一个应用服务节点突然宕机。",
+      "description": "隐藏用例：高峰期两个应用服务节点接连宕机。",
       "hidden": true,
       "weight": 2,
       "traffic": {
-        "rps": 3000,
+        "rps": 4000,
         "readRatio": 0.9
       },
       "durationTicks": 40,
@@ -478,6 +478,10 @@
         {
           "componentType": "appserver",
           "atTick": 5
+        },
+        {
+          "componentType": "appserver",
+          "atTick": 6
         }
       ],
       "thresholds": {
