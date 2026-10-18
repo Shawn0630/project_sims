@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SDS 作者控制台 · Admin</title>
+<style>
+:root {
+--bg: #020617; --panel: #0b1220; --panel2: #101b31; --border: #1e293b;
+--text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8; --ok: #4ade80;
+--warn: #facc15; --bad: #f87171;
+}
+* { box-sizing: border-box;}
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;}
+header { padding: 14px 20px 10px; border-bottom: 1px solid var(--border); background: var(--panel);}
+h1 { font-size: 18px; margin: 0 0 4px;}
+.warn-banner { background: #451a03; border: 1px solid #9a3412; color: #fed7aa; border-radius: 8px; padding: 8px 12px; font-size: 13px; margin: 10px 20px 0;}
+.status { display: flex; gap: 18px; flex-wrap: wrap; color: var(--muted); font-size: 13px;}
+.status b { color: var(--text);}
+nav { display: flex; gap: 4px; padding: 10px 20px 0;}
+nav button { background: transparent; border: 1px solid var(--border); border-bottom: none; color: var(--muted); padding: 7px 16px; border-radius: 8px 8px 0 0; cursor: pointer; font-size: 13.5px;}
+nav button.active { background: var(--panel); color: var(--text); font-weight: 600;}
+main { padding: 16px 20px 40px;}
+section.page { display: none;}
+section.page.active { display: block;}
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px;}
+table { width: 100%; border-collapse: collapse; font-size: 13px;}
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top;}
+th { color: var(--muted); font-weight: 600;}
+tr.clickable { cursor: pointer;}
+tr.clickable:hover td { background: var(--panel2);}
+.badge { display: inline-block; border-radius: 10px; padding: 0 8px; font-size: 11.5px; border: 1px solid var(--border); color: var(--muted);}
+.badge.draft { color: #fde68a; border-color: #a16207;}
+.badge.ok { color: var(--ok); border-color: #166534;}
+.badge.bad { color: var(--bad); border-color: #991b1b;}
+.badge.llm { color: #7dd3fc; border-color: #0369a1;}
+button.btn { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 7px; padding: 5px 12px; cursor: pointer; font-size: 13px;}
+button.btn:hover { border-color: var(--accent);}
+button.btn.primary { background: #14532d; border-color: #166534;}
+button.btn.danger { background: #450a0a; border-color: #991b1b;}
+button.btn:disabled { opacity:.5; cursor: default;}
+input, textarea, select { background: #020617; color: var(--text); border: 1px solid var(--border); border-radius: 7px; padding: 6px 9px; font-size: 13px; width: 100%;}
+textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; line-height: 1.55;}
+label { display: block; font-size: 12.5px; color: var(--muted); margin: 8px 0 3px;}
+pre { background: #020617; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow: auto; font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; max-height: 520px;}
+.muted { color: var(--muted);}.small { font-size: 12.5px;}
+.err { color: var(--bad);}.ok-text { color: var(--ok);}
+.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center;}
+.grow { flex: 1;}
+details { margin: 6px 0;}
+summary { cursor: pointer; color: var(--accent); font-size: 13px;}
+</style>
+</head>
+<body>
+<header>
+<h1>🏛️ System Design Simulator · 作者控制台</h1>
+<div class="status" id="statusBar">正在读取后端状态…</div>
+</header>
+<div class="warn-banner">⚠️ 本控制台仅供本地 / 内网作者使用，<b>没有登录鉴权</b>（含 PUT / DELETE 写接口）。不要把后端直接暴露到公网。</div>
+
+<nav id="mainNav">
+<button data-page="problems" class="active">📚 题库</button>
+<button data-page="components">🧩 组件</button>
+<button data-page="calls">📞 LLM 调用</button>
+</nav>
+
+<main>
+<!-- ============================================================ 题库 === -->
+<section class="page active" id="page-problems">
+<div class="card">
+<div class="row"><b>题目包</b><span class="muted small" id="problemCount"></span>
+<span class="grow"></span>
+<button class="btn" id="reloadProblems">↻ 刷新</button></div>
+<table>
+<thead><tr><th>标题</th><th>id</th><th>难度</th><th>用例（可见/隐藏）</th><th>表数</th><th>标记</th><th></th></tr></thead>
+<tbody id="problemRows"></tbody>
+</table>
+</div>
+
+<div class="card" id="problemDetail" style="display:none"></div>
+
+<div class="card">
+<b>➕ 新建题目（种子）</b>
+<p class="muted small" style="margin:6px 0 0">
+LLM 生成题目系统（第四套系统）的入口将来长在这里。现在
+<code>POST /api/problems/generate</code> 仍是契约桩——可以先把种子
+<b>存为草稿 pack</b>（最小合法题目包，难度默认「中等」，空用例集），再在上方列表里用 JSON 编辑器补全。
+</p>
+<label>标题 <input id="seedTitle" placeholder="例如：Design a Rate Limiter" /></label>
+<label>题面 <textarea id="seedStatement" rows="4" placeholder="题目描述、核心流程…"></textarea></label>
+<label>规模说明 <input id="seedScale" placeholder="例如：100 万 DAU，读:写 ≈ 100:1" /></label>
+<div class="row" style="margin-top:10px">
+<button class="btn" id="seedGenerate">🤖 调用生成器</button>
+<button class="btn primary" id="seedDraft">💾 存为草稿 pack</button>
+<span class="small" id="seedMsg"></span>
+</div>
+<div id="seedGenOut"></div>
+</div>
+</section>
+
+<!-- ============================================================ 组件 === -->
+<section class="page" id="page-components">
+<div class="card" id="componentRoot">正在加载组件注册表…</div>
+</section>
+
+<!-- ======================================================== LLM 调用 === -->
+<section class="page" id="page-calls">
+<div class="card" id="callsRoot">正在加载调用日志…</div>
+</section>
+</main>
+
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+const esc = (s) => String(s?? '').replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[m]));
+const pretty = (v) => { try { return typeof v === 'string'? v: JSON.stringify(v, null, 2);} catch { return String(v);}};
+
+async function api(path, opts) {
+const res = await fetch(path, opts);
+const text = await res.text();
+let json = null;
+try { json = JSON.parse(text);} catch { /* keep null */}
+return { status: res.status, json, text};
+}
+
+// ------------------------------------------------------------- navigation --
+$('#mainNav').addEventListener('click', (e) => {
+const btn = e.target.closest('button[data-page]');
+if (!btn) return;
+document.querySelectorAll('#mainNav button').forEach((b) => b.classList.toggle('active', b === btn));
+document.querySelectorAll('section.page').forEach((s) => s.classList.toggle('active', s.id === 'page-' + btn.dataset.page));
+if (btn.dataset.page === 'components' &&!window.__componentsLoaded) loadComponents();
+if (btn.dataset.page === 'calls' &&!window.__callsLoaded) loadCalls();
+});
+
+// ----------------------------------------------------------------- status --
+async function loadStatus() {
+const { json} = await api('/api/health');
+if (!json) { $('#statusBar').innerHTML = '<span class="err">后端不可达</span>'; return;}
+$('#statusBar').innerHTML =
+`后端：<b>正常</b> · 题目总数：<b>${json.problems}</b> · 存储：<b>${esc(json.storage)}</b> · ` +
+`LLM：${json.llmConfigured? `<b class="ok-text">已配置</b>（${esc(json.llmModel)} @ ${esc(json.llmBaseUrl)}）`: '<b style="color:var(--warn)">未配置 key</b>（评审走脚本回落）'}`;
+}
+
+// --------------------------------------------------------------- problems --
+let currentPack = null;
+
+async function loadProblems(openId) {
+const { json} = await api('/api/admin/problems');
+const rows = $('#problemRows');
+if (!Array.isArray(json)) { rows.innerHTML = '<tr><td colspan="7" class="err">加载失败</td></tr>'; return;}
+$('#problemCount').textContent = `共 ${json.length} 道`;
+rows.innerHTML = json.map((p) => `
+<tr class="clickable" data-id="${esc(p.id)}">
+<td><b>${esc(p.name)}</b></td><td><code>${esc(p.id)}</code></td><td>${esc(p.difficulty)}</td>
+<td>${p.visibleCases} / ${p.hiddenCases}</td><td>${p.tables}</td>
+<td>${p.draft? '<span class="badge draft">draft</span>': ''}</td>
+<td><button class="btn danger" data-del="${esc(p.id)}">删除</button></td>
+</tr>`).join('');
+rows.querySelectorAll('tr.clickable').forEach((tr) => tr.addEventListener('click', (e) => {
+if (e.target.closest('[data-del]')) return;
+openProblem(tr.dataset.id);
+}));
+rows.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
+const id = b.dataset.del;
+if (!confirm(`确定删除题目「${id}」？此操作会删除服务端存储里的 pack 文件，不可恢复。`)) return;
+const r = await api('/api/problems/' + encodeURIComponent(id), { method: 'DELETE'});
+if (r.status === 200) {
+if (currentPack && currentPack.id === id) { currentPack = null; $('#problemDetail').style.display = 'none';}
+loadProblems(); loadStatus();
+} else {
+alert('删除失败：' + (r.json?.message || r.text || r.status));
+}
+}));
+if (openId) openProblem(openId);
+}
+
+async function openProblem(id) {
+const { json, status} = await api('/api/admin/problems/' + encodeURIComponent(id));
+const box = $('#problemDetail');
+if (status!== 200 ||!json) { box.style.display = 'block'; box.innerHTML = '<span class="err">打开失败</span>'; return;}
+currentPack = json;
+const visible = json.testCases.filter((t) =>!t.hidden).length;
+const hidden = json.testCases.length - visible;
+box.style.display = 'block';
+box.innerHTML = `
+<div class="row"><b style="font-size:15px">${esc(json.name)}</b>
+<code class="muted">${esc(json.id)}</code>
+<span class="badge">${esc(json.difficulty)}</span>
+${json.draft? '<span class="badge draft">draft</span>': ''}
+${(json.tags || []).map((t) => `<span class="badge">${esc(t)}</span>`).join('')}
+<span class="grow"></span>
+<button class="btn" id="pdEdit">✏️ 编辑 JSON</button>
+<button class="btn" id="pdClose">收起</button>
+</div>
+<p style="margin:8px 0">${esc(json.statement)}</p>
+<div class="muted small">
+量级：${esc(json.scale?.dau)} · 基线 ${json.scale?.baselineRps} req/s · 峰值 ×${json.scale?.peakMultiplier} ·
+预算 $${json.scale?.budgetCostPerHour}/h · 读写比 ${Math.round((json.workload?.readRatio?? 0) * 100)}% 读<br/>
+用例：共 ${json.testCases.length}（可见 ${visible} / 隐藏 ${hidden}）· Schema 表 ${json.schema?.tables?.length?? 0} 张 ·
+访问模式 ${json.schema?.accessPatterns?.length?? 0} 条 · 示例设计节点 ${json.sampleDesign?.nodes?.length?? 0} 个
+</div>
+<details><summary>功能需求</summary><pre>${esc((json.functionalRequirements || []).map((r) => '· ' + r).join('\n') || '（无）')}</pre></details>
+<details><summary>用例清单</summary><pre>${esc(json.testCases.map((t) => `${t.hidden? '🔒': '👁'} ${t.name}（权重 ${t.weight}）`).join('\n') || '（无用例）')}</pre></details>
+<details><summary>Schema 表</summary><pre>${esc((json.schema?.tables || []).map((t) => `${t.name}（${t.engine}，${t.rows} 行）主键 ${t.primaryKey}，分片键 ${t.shardKey?? '无'}，字段 ${(t.fields || []).length} 个`).join('\n') || '（无表）')}</pre></details>
+<div id="pdEditor" style="display:none; margin-top:10px">
+<textarea id="pdJson" rows="26" spellcheck="false"></textarea>
+<div class="row" style="margin-top:8px">
+<button class="btn primary" id="pdSave">💾 保存（PUT）</button>
+<button class="btn" id="pdCancel">取消编辑</button>
+<span class="small" id="pdMsg"></span>
+</div>
+</div>`;
+$('#pdClose').onclick = () => { box.style.display = 'none'; currentPack = null;};
+$('#pdEdit').onclick = () => {
+$('#pdEditor').style.display = 'block';
+$('#pdJson').value = JSON.stringify(currentPack, null, 2);
+$('#pdMsg').textContent = '';
+};
+$('#pdCancel').onclick = () => { $('#pdEditor').style.display = 'none';};
+$('#pdSave').onclick = async () => {
+const msg = $('#pdMsg');
+let parsed;
+try { parsed = JSON.parse($('#pdJson').value);}
+catch (err) { msg.innerHTML = `<span class="err">JSON 不合法：${esc(err.message)}</span>`; return;}
+msg.textContent = '保存中…';
+const r = await api('/api/problems/' + encodeURIComponent(id), {
+method: 'PUT', headers: { 'Content-Type': 'application/json'}, body: JSON.stringify(parsed),
+});
+if (r.status === 200) {
+msg.innerHTML = '<span class="ok-text">已保存。</span>';
+loadProblems(id); loadStatus();
+} else {
+msg.innerHTML = `<span class="err">保存失败（${r.status}）：${esc(r.json?.message || r.text)}</span>`;
+}
+};
+box.scrollIntoView({ behavior: 'smooth', block: 'start'});
+}
+
+$('#reloadProblems').onclick = () => loadProblems();
+
+// ------------------------------------------------------------------- seed --
+function seedBody() {
+return {
+title: $('#seedTitle').value.trim(),
+statement: $('#seedStatement').value.trim(),
+scaleNotes: $('#seedScale').value.trim(),
+};
+}
+
+$('#seedGenerate').onclick = async () => {
+const msg = $('#seedMsg'); const out = $('#seedGenOut');
+msg.textContent = '调用中…'; out.innerHTML = '';
+const r = await api('/api/problems/generate', {
+method: 'POST', headers: { 'Content-Type': 'application/json'}, body: JSON.stringify(seedBody()),
+});
+msg.textContent = '';
+if (r.status === 501 && r.json) {
+out.innerHTML = `<div style="margin-top:10px" class="small">
+<span class="badge bad">生成器待接入</span> <span class="muted">${esc(r.json.message || '')}</span>
+<details><summary>计划中的生成契约</summary><pre>${esc(pretty(r.json.plannedContract))}</pre></details>
+<span class="muted">现在可以点「存为草稿 pack」先把种子落盘，再用 JSON 编辑器补全。</span></div>`;
+} else if (r.json?.message) {
+out.innerHTML = `<div class="err small" style="margin-top:8px">${esc(r.json.message)}</div>`;
+} else {
+out.innerHTML = `<pre style="margin-top:10px">${esc(pretty(r.json?? r.text))}</pre>`;
+}
+};
+
+$('#seedDraft').onclick = async () => {
+const msg = $('#seedMsg');
+msg.textContent = '保存中…';
+const r = await api('/api/problems/draft', {
+method: 'POST', headers: { 'Content-Type': 'application/json'}, body: JSON.stringify(seedBody()),
+});
+if (r.status === 201 && r.json?.id) {
+msg.innerHTML = `<span class="ok-text">草稿已保存：${esc(r.json.id)}</span>`;
+loadProblems(r.json.id); loadStatus();
+} else {
+msg.innerHTML = `<span class="err">失败（${r.status}）：${esc(r.json?.message || r.text)}</span>`;
+}
+};
+
+// ------------------------------------------------------------- components --
+// (filled in by loadComponents below — see the 组件 section script)
+// --------------------------------------------------------------- llm calls --
+// (filled in by loadCalls below — see the LLM 调用 section script)
+
+loadStatus();
+loadProblems();
+</script>
+<script>
+/* ================================================= 组件（注册表 + 覆盖层）== */
+async function loadComponents() {
+window.__componentsLoaded = true;
+const root = document.getElementById('componentRoot');
+const { json, status} = await api('/api/components');
+if (status!== 200 ||!Array.isArray(json)) { root.innerHTML = '<span class="err">组件注册表加载失败</span>'; return;}
+root.innerHTML = `
+<div class="row"><b>组件注册表</b><span class="muted small">共 ${json.length} 个组件 · 定义在 <code>@sds/components</code>（代码），本页只读展示 + 数值默认参数覆盖层</span></div>
+<div style="background:#451a03;border:1px solid #9a3412;color:#fed7aa;border-radius:8px;padding:8px 12px;font-size:13px;margin:10px 0">
+⚠️ 覆盖层口径：覆盖值只保存在<b>服务端记录</b>（<code>apps/server/data/component-overrides.json</code>）。
+答题前端仿真目前用的是其 bundle 内的组件定义，<b>覆盖值尚未接入运行时</b>（待接线），不要以为改了这里仿真就会变。
+</div>
+<table><thead><tr><th>组件</th><th>类型</th><th>分类 / 行为</th><th>实验室</th><th>被引用题目</th><th>覆盖</th></tr></thead>
+<tbody>${json.map((c) => `
+<tr class="clickable" data-comp="${esc(c.type)}">
+<td><b>${esc(c.name)}</b> <span class="muted">${esc(c.nameEn)}</span></td>
+<td><code>${esc(c.type)}</code></td>
+<td>${esc(c.category)} / ${esc(c.behavior)}</td>
+<td>${esc(c.labTitle)}</td>
+<td>${(c.referencedBy || []).map(esc).join('、') || '<span class="muted">—</span>'}</td>
+<td>${c.params.some((p) => p.overridden)? '<span class="badge draft">有覆盖</span>': ''}</td>
+</tr>`).join('')}</tbody></table>
+<div id="compDetail" style="margin-top:12px"></div>`;
+root.querySelectorAll('[data-comp]').forEach((tr) => tr.addEventListener('click', () => renderComponentDetail(json.find((c) => c.type === tr.dataset.comp))));
+}
+
+function renderComponentDetail(c) {
+const box = document.getElementById('compDetail');
+if (!c) { box.innerHTML = ''; return;}
+box.innerHTML = `
+<div class="row"><b style="font-size:15px">${esc(c.name)}</b><code class="muted">${esc(c.type)}</code>
+<span class="badge">${esc(c.category)}</span><span class="badge">${esc(c.behavior)}</span>
+<span class="muted small">图标 ${esc(c.icon)} · ${esc(c.blurb)}</span></div>
+<p class="muted small" style="margin:6px 0">容量/延迟模型：单副本容量 ${c.model.defaultCapacityPerReplica} req/s · 基础延迟 ${c.model.baseLatencyMs} ms ·
+成本 $${c.model.costPerReplicaPerHour}/h${c.model.baseHitRate!= null? ` · 基础命中率 ${Math.round(c.model.baseHitRate * 100)}%`: ''}${c.model.bufferSize!= null? ` · 缓冲 ${c.model.bufferSize}`: ''}
+· 实验室：${esc(c.labTitle)}（${esc(c.lab)}）</p>
+<table><thead><tr><th>数值参数</th><th>来源</th><th>代码默认值</th><th>当前生效值（可改 = 覆盖）</th><th>状态</th></tr></thead>
+<tbody>${c.params.map((p) => `
+<tr><td><code>${esc(p.key)}</code></td><td>${p.group === 'model'? '组件模型': '实例设置'}</td>
+<td>${p.default}</td>
+<td><input type="number" step="any" data-param="${esc(p.key)}" value="${p.value}" style="width:130px" /></td>
+<td>${p.overridden? '<span class="badge draft">覆盖值</span>': '<span class="muted">默认</span>'}</td></tr>`).join('')}</tbody></table>
+<div class="row" style="margin-top:8px">
+<button class="btn primary" id="compSave">💾 保存覆盖</button>
+<button class="btn danger" id="compClear">清除全部覆盖</button>
+<span class="small" id="compMsg"></span>
+</div>
+<details><summary>内建常见设计问题（面试官追问链，${c.questions.length} 条）</summary>
+<pre>${esc(c.questions.map((q) => `${q.question}\n 要点：${(q.keyPoints || []).join('；')}`).join('\n'))}</pre></details>
+<details><summary>被哪些题目引用</summary>
+<pre>${esc((c.referencedByDetail || []).map((r) => `${r.problemId}：${r.via.join('、')}`).join('\n') || '（暂无题目引用）')}</pre></details>`;
+document.getElementById('compSave').onclick = async () => {
+const overrides = {};
+box.querySelectorAll('[data-param]').forEach((inp) => {
+const p = c.params.find((x) => x.key === inp.dataset.param);
+const v = Number(inp.value);
+if (Number.isFinite(v) && v!== p.default) overrides[p.key] = v;
+});
+const msg = document.getElementById('compMsg');
+const r = await api('/api/components/' + encodeURIComponent(c.type) + '/overrides', {
+method: 'PUT', headers: { 'Content-Type': 'application/json'}, body: JSON.stringify(overrides),
+});
+if (r.status === 200) { msg.innerHTML = '<span class="ok-text">覆盖已保存（服务端记录）。</span>'; window.__componentsLoaded = false; loadComponents();}
+else msg.innerHTML = `<span class="err">失败（${r.status}）：${esc(r.json?.message || r.text)}</span>`;
+};
+document.getElementById('compClear').onclick = async () => {
+if (!confirm(`清除组件「${c.type}」的全部覆盖值？`)) return;
+const r = await api('/api/components/' + encodeURIComponent(c.type) + '/overrides', { method: 'DELETE'});
+if (r.status === 200) { window.__componentsLoaded = false; loadComponents(); document.getElementById('compDetail').innerHTML = '';}
+else alert('清除失败：' + (r.json?.message || r.text));
+};
+box.scrollIntoView({ behavior: 'smooth', block: 'start'});
+}
+</script>
+<script>
+/* ====================================================== LLM 调用日志 ==== */
+async function loadCalls() {
+window.__callsLoaded = true;
+const root = document.getElementById('callsRoot');
+const { json, status} = await api('/api/admin/llm-calls?limit=50');
+if (status!== 200 ||!Array.isArray(json)) { root.innerHTML = '<span class="err">调用日志加载失败</span>'; return;}
+root.innerHTML = `
+<div class="row"><b>LLM 调用日志</b><span class="muted small">最近 ${json.length} 条 · 每一次经 /api/evaluate 的模型调用与脚本回落都落盘在
+<code>apps/server/data/llm-calls.jsonl</code>（本地文件，不进 repo）</span>
+<span class="grow"></span><button class="btn" id="callsReload">↻ 刷新</button></div>
+${json.length === 0? '<p class="muted">暂无记录。去答题前端提交一次设计或打开细究，就会产生调用。</p>': `
+<table><thead><tr><th>时间</th><th>kind</th><th>模型</th><th>来源</th><th>耗时</th><th>结果</th><th></th></tr></thead>
+<tbody>${json.map((r, i) => `
+<tr class="clickable" data-call="${i}">
+<td>${esc(new Date(r.ts).toLocaleString('zh-CN', { hour12: false}))}</td>
+<td>${esc(r.kind)}</td><td>${esc(r.model || '—')}</td>
+<td>${r.source === 'llm'? '<span class="badge llm">llm</span>': '<span class="badge">scripted</span>'}</td>
+<td>${r.durationMs} ms</td>
+<td>${r.ok? '<span class="badge ok">成功</span>': '<span class="badge bad">失败</span>'}</td>
+<td class="muted">展开 ▾</td></tr>
+<tr id="call-detail-${i}" style="display:none"><td colspan="7">
+${r.baseUrlHost? `<div class="muted small">端点 host：${esc(r.baseUrlHost)}${r.note? ' · ' + esc(r.note): ''}</div>`: ''}
+<details open><summary>INPUT（发给模型的 request / 脚本回落的上下文）</summary><pre>${esc(pretty(r.request))}</pre></details>
+${r.responseRaw!= null? `<details><summary>OUTPUT（模型原始返回）</summary><pre>${esc(r.responseRaw)}</pre></details>`: ''}
+${r.responseParsed!= null? `<details><summary>OUTPUT（解析后的结构化结果）</summary><pre>${esc(pretty(r.responseParsed))}</pre></details>`: ''}
+${r.usage!= null? `<details><summary>token usage</summary><pre>${esc(pretty(r.usage))}</pre></details>`: ''}
+${r.error? `<div class="err small">错误：${esc(r.error)}</div>`: ''}
+</td></tr>`).join('')}</tbody></table>`}`;
+document.getElementById('callsReload').onclick = () => loadCalls();
+root.querySelectorAll('[data-call]').forEach((tr) => tr.addEventListener('click', () => {
+const d = document.getElementById('call-detail-' + tr.dataset.call);
+d.style.display = d.style.display === 'none'? '': 'none';
+}));
+}
+</script>
+</body>
+</html>

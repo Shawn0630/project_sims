@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ProblemDef } from '@sds/problems';
@@ -9,13 +9,14 @@ import type { ProblemDef } from '@sds/problems';
  * The four-system architecture keeps ALL problem data (statements, workload
  * profiles, test cases INCLUDING hidden ones) behind this interface on the
  * server. Swapping the JSON files below for Postgres later means writing a
- * second implementation of these three methods — no route or judging code
- * changes.
+ * second implementation of these methods — no route or judging code changes.
  */
 export interface ProblemStorage {
   listProblems(): Promise<ProblemDef[]>;
   getProblem(id: string): Promise<ProblemDef | null>;
   saveProblem(pack: ProblemDef): Promise<void>;
+  /** Remove a pack. Returns true when a pack actually existed. */
+  deleteProblem(id: string): Promise<boolean>;
 }
 
 /**
@@ -58,5 +59,15 @@ export class JsonProblemStorage implements ProblemStorage {
       `${JSON.stringify(pack, null, 2)}\n`,
       'utf8',
     );
+  }
+
+  async deleteProblem(id: string): Promise<boolean> {
+    if (!SAFE_ID.test(id)) return false;
+    try {
+      await unlink(path.join(this.dir, `${id}.json`));
+      return true;
+    } catch {
+      return false;
+    }
   }
 }

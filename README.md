@@ -112,6 +112,28 @@ npm run dev:server   # 或 npm run start -w @sds/server；tsx 直接跑 TS 源�
 | `POST /api/submissions/judge` | `{ problemId, design, schema?, schemaLoadFactor? }` → 在服务端跑既有 checker 判卷，返回逐例结果 + 结构检查 + Schema 信号 |
 | `POST /api/evaluate` | `{ kind: submission \| schema \| followups, context }` → 后端组装 prompt、做**一次** LLM 调用、防御性解析结构化 JSON 返回；无 key 或调用失败回落 ScriptedDriver 同形状结果。`kind=schema` 可直接传 `{ problemName, schema, loadFactor }`，信号由服务端计算并随响应返回 |
 | `POST /api/problems/generate` | **桩**：校验题目种子 `{ title, statement, scaleNotes? }` 后返回 501 与计划中的题目包生成契约——这是第四套系统（LLM 生成题目）的接缝 |
+| `GET /admin` | 作者控制台（见下方「作者控制台」） |
+| `PUT /api/problems/:id` / `DELETE /api/problems/:id` | 作者写接口：整包替换 / 删除题目包（经 `ProblemStorage` 落盘）。**仅限本地/内网作者使用，本轮无登录鉴权，不要暴露公网** |
+
+### 作者控制台（Admin）
+
+`GET /admin` 是后端自带的单页控制台（原生 JS，无前端构建，页面直接调上面的 API），
+是题库作者的工作台，也是将来 LLM 生成题目系统的入口。它分三区：
+
+- **题库**：题目包列表（标题 / id / 难度 / 可见·隐藏用例数 / 草稿标记）；点开看整包概要，
+  可在 JSON 文本域里编辑整包（校验合法性后 `PUT` 保存）、删除（confirm 后 `DELETE`）。
+  「新建题目」是种子表单：调生成器会如实返回 501「生成器待接入」；也可以
+  **把种子存为草稿 pack**（`POST /api/problems/draft`：id 由标题 slug 化、难度默认「中等」、
+  空用例集的最小合法包，草稿标记存在服务端 `data/drafts.json` 旁车文件里），作者流程先跑通。
+- **组件**：`@sds/components` 注册表的只读展示（模型参数 / 实验室 / 内建追问链 / 被哪些题引用），
+  外加一层**数值默认参数覆盖**（存 `data/component-overrides.json`）。⚠️ 覆盖层目前只是
+  服务端记录：答题前端仿真用的是它 bundle 内的组件定义，**覆盖值尚未接入运行时**（待接线）。
+- **LLM 调用**：每一次经 `/api/evaluate` 的模型调用（及脚本回落）都落盘一条记录到
+  `apps/server/data/llm-calls.jsonl`（时间 / kind / 模型 / 完整 input / 完整 output / 耗时 /
+  usage / 成败），admin 里可逐条展开看原文。日志可能含用户设计数据，**只留本地、不进 repo**
+  （已 gitignore）。
+
+⚠️ **安全口径**：admin 与 PUT/DELETE 接口本轮不加登录鉴权，**仅限本地/内网使用，不要直接暴露公网**。
 
 **隐藏用例为什么必须在服务端**：早期浏览器直连形态下，隐藏 edge cases 的场景与
 阈值就在前端 bundle 里，打开 DevTools 就能看光——那不叫隐藏。现在它们只存在于

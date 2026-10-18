@@ -16,6 +16,7 @@ import {
 } from './llm';
 import { toClientPack } from './packs';
 import { JsonProblemStorage, type ProblemStorage } from './storage';
+import { registerAdminRoutes } from './admin';
 
 /**
  * System Design Simulator — backend.
@@ -30,6 +31,9 @@ import { JsonProblemStorage, type ProblemStorage } from './storage';
  *   POST /api/evaluate            ONE LLM call (or scripted fallback) →
  *                                 structured assessment / follow-ups
  *   POST /api/problems/generate   STUB — the future problem-generation system
+ *   GET  /admin + /api/admin/*     author console (see admin.ts) — pack CRUD,
+ *                                 component registry + overrides, LLM call log.
+ *                                 LOCAL USE ONLY: no auth in this round.
  *
  * Hidden test cases exist only in storage on this server; that is what makes
  * them actually secret (in the old browser-direct build they shipped inside
@@ -47,6 +51,7 @@ try {
 const storage: ProblemStorage = new JsonProblemStorage();
 const app = new Hono();
 app.use('/api/*', cors());
+registerAdminRoutes(app, storage);
 
 const badRequest = (message: string) => ({ error: 'bad_request', message }) as const;
 
