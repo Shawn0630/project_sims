@@ -5,3 +5,5 @@ dist/
 !.env.example
 *.local
 .DS_Store
+# LLM call log: may contain user design data — local only, never committed.
+apps/server/data/llm-calls.jsonl
