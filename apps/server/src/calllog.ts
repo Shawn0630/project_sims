@@ -25,6 +25,14 @@ export interface LlmCallRecord {
   /** Host of the configured endpoint (never the key). */
   baseUrlHost: string;
   model: string;
+  /** Name of the model profile this call resolved to (admin-given label). */
+  profileName?: string;
+  /**
+   * True when an end user picked this profile for this one call via
+   * /api/evaluate's profileId (only admin-opened, userSelectable profiles
+   * can be picked); false/absent = the server's active default was used.
+   */
+  viaUserChoice?: boolean;
   durationMs: number;
   /** Token usage exactly as the upstream returned it, when it returned any. */
   usage?: unknown;

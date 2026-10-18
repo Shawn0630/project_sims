@@ -387,7 +387,7 @@ ${json.length === 0? '<p class="muted">暂无记录。去答题前端提交一�
 <tbody>${json.map((r, i) => `
 <tr class="clickable" data-call="${i}">
 <td>${esc(new Date(r.ts).toLocaleString('zh-CN', { hour12: false}))}</td>
-<td>${esc(r.kind)}</td><td>${esc(r.model || '—')}</td>
+<td>${esc(r.kind)}</td><td>${esc(r.model || '—')}${r.profileName? `<div class="muted small">档案「${esc(r.profileName)}」${r.viaUserChoice? ' <span class="badge llm">用户选</span>': ''}</div>`: ''}</td>
 <td>${r.source === 'llm'? '<span class="badge llm">llm</span>': '<span class="badge">scripted</span>'}</td>
 <td>${r.durationMs} ms</td>
 <td>${r.ok? '<span class="badge ok">成功</span>': '<span class="badge bad">失败</span>'}${r.attempts > 1? ` <span class="muted small">${r.attempts} 次尝试</span>`: ''}</td>
@@ -422,7 +422,7 @@ const PROVIDER_PRESETS = [
 ];
 
 function hostOf(u) { try { return new URL(u).host; } catch { return String(u); } }
-const plainProfiles = () => (modelCfg?.profiles ?? []).map(({ id, name, baseUrl, model }) => ({ id, name, baseUrl, model }));
+const plainProfiles = () => (modelCfg?.profiles ?? []).map(({ id, name, baseUrl, model, userSelectable }) => ({ id, name, baseUrl, model, userSelectable: userSelectable === true }));
 
 async function loadModels() {
 window.__modelsLoaded = true;
@@ -437,7 +437,7 @@ function renderModels() {
 const root = document.getElementById('modelsRoot');
 const rows = modelCfg.profiles.map((p) => `
 <tr>
-<td><b>${esc(p.name)}</b>${p.id === modelCfg.activeProfileId? ' <span class="badge ok">当前启用</span>': ''}</td>
+<td><b>${esc(p.name)}</b>${p.id === modelCfg.activeProfileId? ' <span class="badge ok">当前启用</span>': ''}${p.userSelectable? ' <span class="badge llm">用户端可选</span>': ''}</td>
 <td>${esc(hostOf(p.baseUrl))}</td>
 <td><code>${esc(p.model)}</code></td>
 <td>${p.hasKey? `<code>${esc(p.keyMasked)}</code>`: '<span class="muted">（无 key）</span>'}</td>
@@ -498,6 +498,7 @@ box.innerHTML = `
 <label>模型（可手填，或先拉取列表再选）
 <div class="row"><input id="pfModel" value="${esc(p?.model ?? '')}" placeholder="模型 id" style="flex:1" />
 <select id="pfModelList" style="flex:1; display:none"></select></div></label>
+<label><input id="pfUserSelectable" type="checkbox" style="width:auto" ${p?.userSelectable? 'checked': ''} /> 允许用户端选择（答题前端的用户可在 ⚙ 设置里选用这份档案做评审；不勾选则只有服务端默认能用到它）</label>
 <div class="row" style="margin-top:8px">
 <button class="btn" id="pfFetchModels">⬇ 拉取可用模型</button>
 <button class="btn" id="pfTest">🔌 测试连接</button>
@@ -561,6 +562,7 @@ const entry = {
 ...(editingProfileId && editingProfileId !== 'new'? { id: editingProfileId }: {}),
 name, baseUrl, model,
 ...(typedKey? { apiKey: typedKey }: {}),
+userSelectable: document.getElementById('pfUserSelectable').checked,
 };
 if (entry.id) {
 const ix = plain.findIndex((x) => x.id === entry.id);

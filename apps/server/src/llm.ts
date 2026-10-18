@@ -21,7 +21,7 @@ import {
 } from '@sds/driver';
 import type { ProblemSchema } from '@sds/problems';
 import { appendCall } from './calllog';
-import { resolveActiveProfile } from './llmconfig';
+import { resolveProfileForCall } from './llmconfig';
 
 /**
  * The LLM eval system's server half.
@@ -30,13 +30,18 @@ import { resolveActiveProfile } from './llmconfig';
  * per request: the prompt is assembled by the SAME builders the driver
  * contract defines (@sds/driver), the reply is parsed by the contract's
  * defensive parsers, and the structured result goes back to the frontend,
- * which only renders it. Configuration comes from the server's active
- * model PROFILE (llmconfig.ts — admin-editable, resolved per call); the
- * browser never holds an LLM key:
+ * which only renders it. Configuration comes from model PROFILES
+ * (llmconfig.ts — admin-editable, resolved per call); the browser never
+ * holds an LLM key:
  *
- *   data/llm-config.json   switchable profiles; the active one wins
+ *   data/llm-config.json   switchable profiles; the active one is the default
  *   (no file)              env LLM_BASE_URL / LLM_API_KEY / LLM_MODEL,
  *                          exactly the original behavior
+ *
+ * An evaluation may carry a `profileId` picked by the END USER in the
+ * solver app: it is honored for that call only, and only when the admin
+ * marked that profile userSelectable (resolveProfileForCall). The global
+ * active profile is never changed by a user's pick.
  *
  * Any LLM failure (no key, network, bad JSON) falls back to ScriptedDriver,
  * which produces the same shapes from the deterministic judging signals.
@@ -66,6 +71,13 @@ export interface EvaluateOutcome<T> {
   /** Attribution label the UI renders next to the assessment. */
   label: string;
   data: T;
+  /** The model the effective profile names — what actually judged (or
+   *  would have judged, on the scripted fallback path). */
+  model: string;
+  /** Name of the profile this call resolved to. */
+  profileName: string;
+  /** True when the end user picked this profile for this call. */
+  viaUserChoice: boolean;
 }
 
 const scripted = new ScriptedDriver();
@@ -190,10 +202,13 @@ async function runLogged<T>(
   build: () => { system: string; user: string },
   parse: (json: unknown) => T,
   scriptedFn: () => Promise<T>,
+  profileId?: string,
 ): Promise<EvaluateOutcome<T>> {
-  // Resolve the active model profile fresh for THIS call — an admin
-  // profile switch takes effect on the next evaluation, no restart.
-  const cfg = await resolveActiveProfile();
+  // Resolve the model profile fresh for THIS call: normally the server's
+  // active profile; when the end user picked one of the admin-opened
+  // (userSelectable) profiles, that one — for this call only. An admin
+  // switch or a user pick both take effect with no restart.
+  const { profile: cfg, viaUserChoice } = await resolveProfileForCall(profileId);
   let fellBackFromError: string | null = null;
 
   if (cfg.apiKey) {
@@ -226,6 +241,8 @@ async function runLogged<T>(
           ok: true,
           baseUrlHost: hostOf(cfg.baseUrl),
           model: cfg.model,
+          profileName: cfg.name,
+          viaUserChoice,
           durationMs: Date.now() - t0,
           usage: result.usage,
           request: requestBody,
@@ -235,7 +252,14 @@ async function runLogged<T>(
           ...(attemptErrors.length ? { attemptErrors } : {}),
           ...(retrySummary ? { note: retrySummary } : {}),
         });
-        return { source: 'llm', label: LLM_LABEL, data };
+        return {
+          source: 'llm',
+          label: `${LLM_LABEL} · ${cfg.model}`,
+          data,
+          model: cfg.model,
+          profileName: cfg.name,
+          viaUserChoice,
+        };
       } catch (err) {
         // The call succeeded but its content did not parse — resending the
         // identical request is not the fix, so no retry happened for this.
@@ -246,6 +270,8 @@ async function runLogged<T>(
           ok: false,
           baseUrlHost: hostOf(cfg.baseUrl),
           model: cfg.model,
+          profileName: cfg.name,
+          viaUserChoice,
           durationMs: Date.now() - t0,
           request: requestBody,
           responseRaw: raw,
@@ -263,6 +289,8 @@ async function runLogged<T>(
         ok: false,
         baseUrlHost: hostOf(cfg.baseUrl),
         model: cfg.model,
+        profileName: cfg.name,
+        viaUserChoice,
         durationMs: Date.now() - t0,
         request: requestBody,
         error: fellBackFromError,
@@ -281,6 +309,8 @@ async function runLogged<T>(
     ok: true,
     baseUrlHost: hostOf(cfg.baseUrl),
     model: cfg.model,
+    profileName: cfg.name,
+    viaUserChoice,
     durationMs: Date.now() - t0,
     request: { context: ctx },
     responseParsed: data,
@@ -288,11 +318,19 @@ async function runLogged<T>(
       ? `LLM 调用失败后的回落（错误见上一条记录）：${fellBackFromError}`
       : '未配置 LLM_API_KEY，离线脚本评审',
   });
-  return { source: 'scripted', label: scripted.label, data };
+  return {
+    source: 'scripted',
+    label: scripted.label,
+    data,
+    model: cfg.model,
+    profileName: cfg.name,
+    viaUserChoice,
+  };
 }
 
 export async function evaluateSubmission(
   ctx: SubmissionAssessmentContext,
+  profileId?: string,
 ): Promise<EvaluateOutcome<SubmissionAssessment>> {
   return runLogged(
     'submission',
@@ -300,11 +338,13 @@ export async function evaluateSubmission(
     () => buildSubmissionPrompt(ctx),
     parseSubmissionAssessment,
     () => scripted.assessSubmission(ctx),
+    profileId,
   );
 }
 
 export async function evaluateFollowUps(
   ctx: FollowUpContext,
+  profileId?: string,
 ): Promise<EvaluateOutcome<FollowUpQuestion[]>> {
   return runLogged(
     'followups',
@@ -312,6 +352,7 @@ export async function evaluateFollowUps(
     () => buildFollowUpPrompt(ctx),
     parseFollowUps,
     () => scripted.generateFollowUps(ctx),
+    profileId,
   );
 }
 
@@ -323,6 +364,7 @@ export async function evaluateFollowUps(
  */
 export async function evaluateProbes(
   ctx: ProbeContext,
+  profileId?: string,
 ): Promise<EvaluateOutcome<ProbeCase[]>> {
   return runLogged(
     'probe',
@@ -330,11 +372,13 @@ export async function evaluateProbes(
     () => buildProbePrompt(ctx),
     parseProbeCases,
     () => scripted.generateProbes(ctx),
+    profileId,
   );
 }
 
 export async function evaluateSchema(
   ctx: SchemaAssessmentContext,
+  profileId?: string,
 ): Promise<EvaluateOutcome<SchemaAssessment>> {
   return runLogged(
     'schema',
@@ -342,6 +386,7 @@ export async function evaluateSchema(
     () => buildSchemaPrompt(ctx),
     parseSchemaAssessment,
     () => scripted.assessSchema(ctx),
+    profileId,
   );
 }
 

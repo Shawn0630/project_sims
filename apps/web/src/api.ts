@@ -345,8 +345,33 @@ export interface EvaluateResponseDTO<T> {
   source: 'llm' | 'scripted';
   label: string;
   data: T;
+  /** The model the server's effective profile used for this call. */
+  model?: string;
+  /** Name of the profile the call resolved to (server-side label). */
+  profileName?: string;
+  /** True when the call ran on the profile the user picked below. */
+  viaUserChoice?: boolean;
   /** Present on schema evaluations where the server computed the signals. */
   schemaSignals?: SchemaSignalsDTO;
+}
+
+// ------------------------------------------------------- user model choice -
+// The admin may open some model profiles to end users (their userSelectable
+// flag, set in the backend admin). GET /api/models lists ONLY those, with
+// name + model — keys and endpoints never reach the browser. The user's
+// pick is a bare profile id in localStorage; the server re-validates it on
+// every call and silently falls back to its default when it is not (or no
+// longer) selectable.
+
+/** localStorage key holding the user-chosen evaluation profile id. */
+export const EVAL_PROFILE_KEY = 'sds-eval-profile-id';
+
+export interface UserModelDTO {
+  profileId: string;
+  name: string;
+  model: string;
+  /** True when this profile is also the server's active default. */
+  isDefault: boolean;
 }
 
 export interface HealthDTO {
@@ -373,6 +398,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function fetchHealth(): Promise<HealthDTO> {
   return request<HealthDTO>('/api/health');
+}
+
+/** Model profiles the admin opened to end users (empty when none are). */
+export function fetchUserModels(): Promise<UserModelDTO[]> {
+  return request<UserModelDTO[]>('/api/models');
+}
+
+/** The profile id the user picked in ⚙ 设置 ('' = follow the server default). */
+export function chosenEvalProfileId(): string {
+  try {
+    return localStorage.getItem(EVAL_PROFILE_KEY) ?? '';
+  } catch {
+    return '';
+  }
 }
 
 export function fetchProblems(): Promise<ProblemPack[]> {
@@ -412,9 +451,12 @@ export function evaluateOnServer<T>(
   kind: 'submission' | 'schema' | 'followups' | 'probe',
   context: unknown,
 ): Promise<EvaluateResponseDTO<T>> {
+  // The user's model pick rides along as a bare profile id; the server
+  // honors it only if the admin opened that profile to end users.
+  const profileId = chosenEvalProfileId();
   return request<EvaluateResponseDTO<T>>('/api/evaluate', {
     method: 'POST',
-    body: JSON.stringify({ kind, context }),
+    body: JSON.stringify({ kind, context, ...(profileId ? { profileId } : {}) }),
   });
 }
 

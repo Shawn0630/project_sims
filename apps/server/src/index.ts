@@ -14,7 +14,7 @@ import {
   toSchemaReviewLike,
   type EvaluateKind,
 } from './llm';
-import { resolveActiveProfile } from './llmconfig';
+import { listUserSelectableProfiles, resolveActiveProfile } from './llmconfig';
 import { verifyProbes } from './probe';
 import { toClientPack } from './packs';
 import { JsonProblemStorage, type ProblemStorage } from './storage';
@@ -34,7 +34,12 @@ import { registerAdminRoutes } from './admin';
  *                                 run LLM-proposed probe cases through the
  *                                 simulator and grade their predictions
  *   POST /api/evaluate            ONE LLM call (or scripted fallback) →
- *                                 structured assessment / follow-ups / probes
+ *                                 structured assessment / follow-ups / probes.
+ *                                 Optional body.profileId: an end user's pick
+ *                                 among admin-opened (userSelectable) model
+ *                                 profiles — honored for that call only
+ *   GET  /api/models              the userSelectable model profiles (name +
+ *                                 model only — no keys, no endpoints)
  *   POST /api/problems/generate   STUB — the future problem-generation system
  *   GET  /admin + /api/admin/*     author console (see admin.ts) — pack CRUD,
  *                                 component registry + overrides, LLM call log.
@@ -98,6 +103,15 @@ app.get('/api/problems/:id', async (c) => {
   return c.json(toClientPack(pack));
 });
 
+// ------------------------------------------------- user-selectable models -
+// End users may pick which model evaluates their work, but only among the
+// profiles the admin explicitly opened (userSelectable in llm-config.json).
+// This projection carries name + model + a default marker — keys and
+// baseUrls never leave the server.
+app.get('/api/models', async (c) => {
+  return c.json(await listUserSelectableProfiles());
+});
+
 // ------------------------------------------------------------------- judge -
 app.post('/api/submissions/judge', async (c) => {
   const body = (await c.req.json().catch(() => null)) as {
@@ -156,9 +170,14 @@ app.post('/api/evaluate', async (c) => {
   const body = (await c.req.json().catch(() => null)) as {
     kind?: unknown;
     context?: Record<string, unknown>;
+    profileId?: unknown;
   } | null;
   const kind = body?.kind as EvaluateKind | undefined;
   const ctx = body?.context;
+  // Optional end-user model pick: honored only for profiles the admin
+  // marked userSelectable (enforced in llmconfig.resolveProfileForCall);
+  // anything else silently resolves to the server default.
+  const profileId = typeof body?.profileId === 'string' ? body.profileId : undefined;
   if (!kind || !['submission', 'schema', 'followups', 'probe'].includes(kind) || !ctx) {
     return c.json(
       badRequest("需要 { kind: 'submission' | 'schema' | 'followups' | 'probe', context }"),
@@ -169,18 +188,21 @@ app.post('/api/evaluate', async (c) => {
   if (kind === 'probe') {
     const outcome = await evaluateProbes(
       ctx as unknown as Parameters<typeof evaluateProbes>[0],
+      profileId,
     );
     return c.json({ kind, ...outcome });
   }
   if (kind === 'submission') {
     const outcome = await evaluateSubmission(
       ctx as unknown as Parameters<typeof evaluateSubmission>[0],
+      profileId,
     );
     return c.json({ kind, ...outcome });
   }
   if (kind === 'followups') {
     const outcome = await evaluateFollowUps(
       ctx as unknown as Parameters<typeof evaluateFollowUps>[0],
+      profileId,
     );
     return c.json({ kind, ...outcome });
   }
@@ -204,12 +226,15 @@ app.post('/api/evaluate', async (c) => {
   if (!signals) {
     return c.json(badRequest('schema 评定需要 context.signals 或 context.schema'), 400);
   }
-  const outcome = await evaluateSchema({
-    problemName: raw.problemName ?? '',
-    schemaSummary:
-      raw.schemaSummary ?? (raw.schema ? buildSchemaSummary(raw.schema) : ''),
-    signals: signals as Parameters<typeof evaluateSchema>[0]['signals'],
-  });
+  const outcome = await evaluateSchema(
+    {
+      problemName: raw.problemName ?? '',
+      schemaSummary:
+        raw.schemaSummary ?? (raw.schema ? buildSchemaSummary(raw.schema) : ''),
+      signals: signals as Parameters<typeof evaluateSchema>[0]['signals'],
+    },
+    profileId,
+  );
   // When the server computed the signals, return the full checker report too
   // so the client can render the per-pattern table without judging locally.
   return c.json({ kind, ...outcome, ...(report ? { schemaSignals: report } : {}) });

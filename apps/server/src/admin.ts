@@ -431,7 +431,16 @@ export function registerAdminRoutes(app: Hono, storage: ProblemStorage): void {
       ) {
         apiKey = p.apiKey;
       }
-      profiles.push({ id, name: p.name.trim(), baseUrl, apiKey, model: p.model.trim() });
+      profiles.push({
+        id,
+        name: p.name.trim(),
+        baseUrl,
+        apiKey,
+        model: p.model.trim(),
+        // Admin opt-in only: end users of the solver app may pick profiles
+        // carrying this flag (GET /api/models). Absent/false = server-only.
+        ...(p.userSelectable === true ? { userSelectable: true } : {}),
+      });
     }
     const ids = new Set(profiles.map((p) => p.id));
     if (ids.size !== profiles.length) {

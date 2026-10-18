@@ -19,6 +19,13 @@ import { fileURLToPath } from 'node:url';
  *
  * Resolution is PER CALL (resolveActiveProfile reads the file every time),
  * so an admin edit takes effect on the very next evaluation.
+ *
+ * A profile may carry `userSelectable: true` — the admin explicitly opening
+ * that profile to END USERS of the solver app. User-selectable profiles are
+ * listed (name + model only, never key or baseUrl) by GET /api/models, and
+ * a single evaluation may name one via `profileId` to override the active
+ * profile for that call only (resolveProfileForCall). The global active
+ * profile never changes because of a user's pick.
  */
 
 export interface LlmProfile {
@@ -27,6 +34,12 @@ export interface LlmProfile {
   baseUrl: string;
   apiKey: string;
   model: string;
+  /**
+   * Admin opt-in: may end users of the solver app pick this profile for
+   * their own evaluations? Absent/false = server-side only (the default,
+   * and the only possibility for the synthesized env profile).
+   */
+  userSelectable?: boolean;
 }
 
 export interface LlmConfigFile {
@@ -123,6 +136,59 @@ export async function resolveProfileById(
   return resolveActiveProfile();
 }
 
+export interface CallProfileResolution {
+  profile: ResolvedLlmProfile;
+  /** True when this call's profile was explicitly picked by an end user. */
+  viaUserChoice: boolean;
+}
+
+/**
+ * Resolve the profile for ONE evaluation call. A requested profileId is
+ * honored only when that profile is stored AND the admin marked it
+ * userSelectable — the per-call override end users get through
+ * POST /api/evaluate. An unknown or non-selectable id is silently ignored
+ * (the server default applies): the field can never be used to reach a
+ * profile the admin did not open up, and it never mutates global config.
+ */
+export async function resolveProfileForCall(
+  profileId: string | undefined,
+): Promise<CallProfileResolution> {
+  if (profileId) {
+    const file = await readConfigFile();
+    const found = file?.profiles.find((p) => p.id === profileId);
+    if (found && found.userSelectable === true) {
+      return { profile: { ...found, source: 'admin-config' }, viaUserChoice: true };
+    }
+  }
+  return { profile: await resolveActiveProfile(), viaUserChoice: false };
+}
+
+export interface UserSelectableProfile {
+  profileId: string;
+  name: string;
+  model: string;
+  /** True when this profile is also the server's active default. */
+  isDefault: boolean;
+}
+
+/**
+ * What GET /api/models may show end users: admin-opened profiles only,
+ * name + model — NO keys and NO baseUrl ever leave the server here.
+ */
+export async function listUserSelectableProfiles(): Promise<UserSelectableProfile[]> {
+  const file = await readConfigFile();
+  if (!file) return [];
+  const active = await resolveActiveProfile();
+  return file.profiles
+    .filter((p) => p.userSelectable === true)
+    .map((p) => ({
+      profileId: p.id,
+      name: p.name,
+      model: p.model,
+      isDefault: p.id === active.id,
+    }));
+}
+
 /** Browser-safe rendering of a key: last 4 characters only. */
 export function maskKey(apiKey: string): string {
   if (!apiKey) return '';
@@ -138,5 +204,6 @@ export function maskedProfile(p: LlmProfile) {
     model: p.model,
     hasKey: p.apiKey.length > 0,
     keyMasked: maskKey(p.apiKey),
+    userSelectable: p.userSelectable === true,
   };
 }
