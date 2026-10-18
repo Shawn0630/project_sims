@@ -34,6 +34,7 @@ tr.clickable:hover td { background: var(--panel2);}
 .badge.ok { color: var(--ok); border-color: #166534;}
 .badge.bad { color: var(--bad); border-color: #991b1b;}
 .badge.llm { color: #7dd3fc; border-color: #0369a1;}
+.badge.warn { color: var(--warn); border-color: #a16207;}
 button.btn { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 7px; padding: 5px 12px; cursor: pointer; font-size: 13px;}
 button.btn:hover { border-color: var(--accent);}
 button.btn.primary { background: #14532d; border-color: #166534;}
@@ -422,7 +423,11 @@ const PROVIDER_PRESETS = [
 ];
 
 function hostOf(u) { try { return new URL(u).host; } catch { return String(u); } }
-const plainProfiles = () => (modelCfg?.profiles ?? []).map(({ id, name, baseUrl, model, userSelectable }) => ({ id, name, baseUrl, model, userSelectable: userSelectable === true }));
+// Only STORED profiles round-trip through saves — the built-in .env entry
+// (readonly) is synthesized server-side and must never be sent back as an
+// editable record. Its activation travels as activeProfileId, its
+// userSelectable opt-in as the dedicated envProfileUserSelectable field.
+const plainProfiles = () => (modelCfg?.profiles ?? []).filter((p) => !p.readonly).map(({ id, name, baseUrl, model, userSelectable }) => ({ id, name, baseUrl, model, userSelectable: userSelectable === true }));
 
 async function loadModels() {
 window.__modelsLoaded = true;
@@ -435,20 +440,30 @@ renderModels();
 
 function renderModels() {
 const root = document.getElementById('modelsRoot');
-const rows = modelCfg.profiles.map((p) => `
+const keyCell = (p) => p.hasKey? `<code>${esc(p.keyMasked)}</code>`: '<span class="badge warn">⚠ 未填 key</span>';
+const rows = modelCfg.profiles.map((p) => p.readonly? `
+<tr>
+<td><b>${esc(p.name)}</b> <span class="badge">.env · 只读</span>${p.id === modelCfg.activeProfileId? ' <span class="badge ok">当前启用</span>': ''}${p.userSelectable? ' <span class="badge llm">用户端可选</span>': ''}</td>
+<td>${esc(hostOf(p.baseUrl))}</td>
+<td><code>${esc(p.model)}</code></td>
+<td>${keyCell(p)}</td>
+<td>${p.id === modelCfg.activeProfileId? '': `<button class="btn" data-activate="${esc(p.id)}">启用</button> `}
+<label class="small"><input type="checkbox" data-envsel style="width:auto" ${p.userSelectable? 'checked': ''} /> 允许用户端选择</label></td>
+</tr>`: `
 <tr>
 <td><b>${esc(p.name)}</b>${p.id === modelCfg.activeProfileId? ' <span class="badge ok">当前启用</span>': ''}${p.userSelectable? ' <span class="badge llm">用户端可选</span>': ''}</td>
 <td>${esc(hostOf(p.baseUrl))}</td>
 <td><code>${esc(p.model)}</code></td>
-<td>${p.hasKey? `<code>${esc(p.keyMasked)}</code>`: '<span class="muted">（无 key）</span>'}</td>
+<td>${keyCell(p)}</td>
 <td>${p.id === modelCfg.activeProfileId? '': `<button class="btn" data-activate="${esc(p.id)}">启用</button> `}
 <button class="btn" data-edit="${esc(p.id)}">编辑</button>
 <button class="btn danger" data-delprofile="${esc(p.id)}">删除</button></td>
 </tr>`).join('');
 root.innerHTML = `
-<div class="row"><b>模型档案</b><span class="muted small">配置来源：${modelCfg.source === 'admin-config'? 'admin 档案文件': 'env（尚未保存过档案）'} · 切换启用后，下一次 evaluate 立即生效、无需重启</span>
+<div class="row"><b>模型档案</b><span class="muted small">配置来源：${modelCfg.source === 'admin-config'? 'admin 档案文件': '.env 配置（内置只读档案）'} · 切换启用后，下一次 evaluate 立即生效、无需重启</span>
 <span class="grow"></span><button class="btn" id="modelsReload">↻ 刷新</button></div>
 <p class="muted small" style="margin:6px 0 0">档案存服务端本地文件 <code>apps/server/data/llm-config.json</code>（含 key，已 gitignore，<b>不进 repo</b>）。key 在浏览器里永远只显示掩码（末 4 位）。<br>
+第一行「.env 配置」是<b>内置只读档案</b>：直接读取服务端 <code>apps/server/.env</code>，不能在这里编辑或删除，任何时候点「启用」即可切回它兜底；要改它的值，改 .env 后重启后端。<br>
 ⚠️ 「拉取可用模型」给出的列表<b>不等于每个都能调</b>（免费层 / 新用户限制）——以「测试连接」的实际结果为准。</p>
 <table><thead><tr><th>名称</th><th>端点 host</th><th>模型</th><th>key</th><th></th></tr></thead>
 <tbody>${rows || '<tr><td colspan="5" class="muted">暂无档案</td></tr>'}</tbody></table>
@@ -456,20 +471,21 @@ root.innerHTML = `
 document.getElementById('modelsReload').onclick = () => loadModels();
 document.getElementById('profileNew').onclick = () => openProfileEditor(null);
 root.querySelectorAll('[data-activate]').forEach((b) => b.onclick = () => saveModelCfg(plainProfiles(), b.dataset.activate));
+root.querySelectorAll('[data-envsel]').forEach((cb) => cb.onchange = () => saveModelCfg(plainProfiles(), modelCfg.activeProfileId, cb.checked));
 root.querySelectorAll('[data-edit]').forEach((b) => b.onclick = () => openProfileEditor(b.dataset.edit));
 root.querySelectorAll('[data-delprofile]').forEach((b) => b.onclick = async () => {
 const p = modelCfg.profiles.find((x) => x.id === b.dataset.delprofile);
 if (!confirm(`确定删除档案「${p? p.name: b.dataset.delprofile}」？`)) return;
 const rest = plainProfiles().filter((x) => x.id !== b.dataset.delprofile);
-const active = modelCfg.activeProfileId === b.dataset.delprofile? (rest[0]?.id ?? null): modelCfg.activeProfileId;
+const active = modelCfg.activeProfileId === b.dataset.delprofile? (rest[0]?.id ?? 'env-default'): modelCfg.activeProfileId;
 saveModelCfg(rest, active);
 });
 }
 
-async function saveModelCfg(profiles, activeProfileId) {
+async function saveModelCfg(profiles, activeProfileId, envSel) {
 const r = await api('/api/admin/llm-config', {
 method: 'PUT', headers: { 'Content-Type': 'application/json' },
-body: JSON.stringify({ profiles, activeProfileId }),
+body: JSON.stringify({ profiles, activeProfileId, envProfileUserSelectable: envSel ?? modelCfg.envProfileUserSelectable === true }),
 });
 if (r.status === 200 && r.json) {
 modelCfg = r.json;
@@ -484,8 +500,10 @@ return false;
 }
 
 function openProfileEditor(id) {
+const target = id? modelCfg.profiles.find((x) => x.id === id): null;
+if (target?.readonly) return; // the built-in .env entry has no editor — enforced server-side too
 editingProfileId = id ?? 'new';
-const p = id? modelCfg.profiles.find((x) => x.id === id): null;
+const p = target;
 const box = document.getElementById('profileEditor');
 box.innerHTML = `
 <div class="card">

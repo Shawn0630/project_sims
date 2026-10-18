@@ -5,20 +5,30 @@ import { fileURLToPath } from 'node:url';
 
 /**
  * Dynamic LLM configuration — switchable model PROFILES, so the author can
- * compare how different models judge the same design without touching env
- * or restarting the server.
+ * compare how different models judge the same design without restarting
+ * the server.
  *
  * Storage: `apps/server/data/llm-config.json` (gitignored — it holds API
  * keys; local only, never committed):
  *
- *   { profiles: [{ id, name, baseUrl, apiKey, model }], activeProfileId }
+ *   { profiles: [{ id, name, baseUrl, apiKey, model }],
+ *     activeProfileId,
+ *     envProfileUserSelectable?: boolean }
  *
- * When that file does not exist, a single implicit profile is synthesized
- * from the process env (LLM_BASE_URL / LLM_API_KEY / LLM_MODEL) and labeled
- * 'env 默认' — behavior identical to the original env-only setup.
+ * Built on top of the stored profiles sits ONE built-in entry that is not
+ * stored at all: the env profile (id 'env-default', name '.env 配置'),
+ * synthesized LIVE from the process env (LLM_BASE_URL / LLM_API_KEY /
+ * LLM_MODEL) at every read. It is ALWAYS listed in admin, is READ-ONLY
+ * there (no stored copy can be created, edited or deleted — a stored
+ * record with the reserved id is ignored on load), and exists so the
+ * author always has an uncorruptible fallback: whatever happens to the
+ * stored profiles, activating the env entry restores exactly the .env
+ * values. The stored config may still point activeProfileId at it, and
+ * its userSelectable opt-in is persisted as the dedicated file field
+ * `envProfileUserSelectable` (default false) — the only mutable bit.
  *
- * Resolution is PER CALL (resolveActiveProfile reads the file every time),
- * so an admin edit takes effect on the very next evaluation.
+ * Resolution is PER CALL (the file is read every time), so an admin edit
+ * takes effect on the very next evaluation.
  *
  * A profile may carry `userSelectable: true` — the admin explicitly opening
  * that profile to END USERS of the solver app. User-selectable profiles are
@@ -36,15 +46,26 @@ export interface LlmProfile {
   model: string;
   /**
    * Admin opt-in: may end users of the solver app pick this profile for
-   * their own evaluations? Absent/false = server-side only (the default,
-   * and the only possibility for the synthesized env profile).
+   * their own evaluations? Absent/false = server-side only (the default).
+   * For the built-in env profile this field is never set on the profile
+   * itself — its opt-in lives in the config file (envProfileUserSelectable)
+   * and is composed onto the profile at resolution time.
    */
   userSelectable?: boolean;
 }
 
 export interface LlmConfigFile {
+  /** Stored (admin-editable) profiles. The built-in env profile is NEVER
+   *  among them — it is synthesized at read time (see the header). */
   profiles: LlmProfile[];
+  /** May legally be 'env-default' — the built-in env entry is activatable. */
   activeProfileId: string | null;
+  /**
+   * The ONLY mutable setting of the read-only env profile: may end users
+   * pick it for their own evaluations? Default false. It lives here (not
+   * on the env profile itself) because the env profile is never stored.
+   */
+  envProfileUserSelectable?: boolean;
 }
 
 export type LlmConfigSource = 'admin-config' | 'env';
@@ -57,15 +78,19 @@ export const LLM_CONFIG_FILE = fileURLToPath(
   new URL('../data/llm-config.json', import.meta.url),
 );
 
+/** Reserved id of the built-in, read-only env profile. */
+export const ENV_PROFILE_ID = 'env-default';
+export const ENV_PROFILE_NAME = '.env 配置';
+
 const trimUrl = (u: string) => u.replace(/\/$/, '');
 
-/** The implicit profile built from env — the pre-profiles behavior. */
+/** The built-in profile, resolved LIVE from env — the pre-profiles behavior. */
 export function envProfile(
   env: Record<string, string | undefined> = process.env,
 ): LlmProfile {
   return {
-    id: 'env-default',
-    name: 'env 默认',
+    id: ENV_PROFILE_ID,
+    name: ENV_PROFILE_NAME,
     baseUrl: trimUrl(env.LLM_BASE_URL ?? 'https://api.openai.com/v1'),
     apiKey: env.LLM_API_KEY ?? '',
     model: env.LLM_MODEL ?? 'gpt-4o-mini',
@@ -90,15 +115,25 @@ export async function readConfigFile(): Promise<LlmConfigFile | null> {
     const raw = await readFile(LLM_CONFIG_FILE, 'utf8');
     const parsed = JSON.parse(raw) as Partial<LlmConfigFile> | null;
     if (!parsed || !Array.isArray(parsed.profiles)) return null;
-    const profiles = parsed.profiles.filter(isProfile).map((p) => ({
-      ...p,
-      apiKey: p.apiKey ?? '',
-      baseUrl: trimUrl(p.baseUrl),
-    }));
+    const profiles = parsed.profiles
+      .filter(isProfile)
+      // The reserved env id is synthesized, never stored: a record with
+      // that id inside the file (e.g. a masked copy an old admin build
+      // round-tripped back) is ignored — it must never shadow the real
+      // .env values with a stale, possibly key-less, copy.
+      .filter((p) => p.id !== ENV_PROFILE_ID)
+      .map((p) => ({
+        ...p,
+        apiKey: p.apiKey ?? '',
+        baseUrl: trimUrl(p.baseUrl),
+      }));
     return {
       profiles,
       activeProfileId:
         typeof parsed.activeProfileId === 'string' ? parsed.activeProfileId : null,
+      ...(parsed.envProfileUserSelectable === true
+        ? { envProfileUserSelectable: true }
+        : {}),
     };
   } catch {
     return null;
@@ -110,24 +145,44 @@ export async function writeConfigFile(cfg: LlmConfigFile): Promise<void> {
   await writeFile(LLM_CONFIG_FILE, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
 }
 
+/** The env profile as a resolution result: live values + its stored opt-in. */
+function resolvedEnvProfile(file: LlmConfigFile | null): ResolvedLlmProfile {
+  return {
+    ...envProfile(),
+    userSelectable: file?.envProfileUserSelectable === true,
+    source: 'env',
+  };
+}
+
 /**
- * The profile evaluation calls use RIGHT NOW: the file's active profile
- * when a config file exists, otherwise the env profile.
+ * The profile evaluation calls use RIGHT NOW. Precedence: when a config
+ * file exists, its activeProfileId decides — 'env-default' selects the
+ * built-in env profile (source 'env', env values drive calls even though
+ * a file exists); otherwise the named stored profile (or the first one).
+ * Without a file — or with a file that selects nothing usable — the env
+ * profile is the default, exactly as before profiles existed.
  */
 export async function resolveActiveProfile(): Promise<ResolvedLlmProfile> {
   const file = await readConfigFile();
-  if (file && file.profiles.length > 0) {
-    const active =
-      file.profiles.find((p) => p.id === file.activeProfileId) ?? file.profiles[0];
-    return { ...active, source: 'admin-config' };
+  if (file) {
+    if (file.activeProfileId === ENV_PROFILE_ID) return resolvedEnvProfile(file);
+    if (file.profiles.length > 0) {
+      const active =
+        file.profiles.find((p) => p.id === file.activeProfileId) ?? file.profiles[0];
+      return { ...active, source: 'admin-config' };
+    }
   }
-  return { ...envProfile(), source: 'env' };
+  return resolvedEnvProfile(file);
 }
 
-/** A stored profile by id (admin probe endpoints), else the active one. */
+/** A profile by id (admin probe endpoints), else the active one. The
+ *  built-in env profile resolves by its reserved id like any other. */
 export async function resolveProfileById(
   id: string | undefined,
 ): Promise<ResolvedLlmProfile> {
+  if (id === ENV_PROFILE_ID) {
+    return resolvedEnvProfile(await readConfigFile());
+  }
   if (id) {
     const file = await readConfigFile();
     const found = file?.profiles.find((p) => p.id === id);
@@ -144,8 +199,9 @@ export interface CallProfileResolution {
 
 /**
  * Resolve the profile for ONE evaluation call. A requested profileId is
- * honored only when that profile is stored AND the admin marked it
- * userSelectable — the per-call override end users get through
+ * honored only when the admin marked that profile userSelectable (stored
+ * profiles via their flag; the built-in env profile via the config file's
+ * envProfileUserSelectable) — the per-call override end users get through
  * POST /api/evaluate. An unknown or non-selectable id is silently ignored
  * (the server default applies): the field can never be used to reach a
  * profile the admin did not open up, and it never mutates global config.
@@ -155,9 +211,17 @@ export async function resolveProfileForCall(
 ): Promise<CallProfileResolution> {
   if (profileId) {
     const file = await readConfigFile();
-    const found = file?.profiles.find((p) => p.id === profileId);
-    if (found && found.userSelectable === true) {
-      return { profile: { ...found, source: 'admin-config' }, viaUserChoice: true };
+    // The built-in env profile is pickable under the same rule as any
+    // profile: only when the admin opted it in (envProfileUserSelectable).
+    if (profileId === ENV_PROFILE_ID) {
+      if (file?.envProfileUserSelectable === true) {
+        return { profile: resolvedEnvProfile(file), viaUserChoice: true };
+      }
+    } else {
+      const found = file?.profiles.find((p) => p.id === profileId);
+      if (found && found.userSelectable === true) {
+        return { profile: { ...found, source: 'admin-config' }, viaUserChoice: true };
+      }
     }
   }
   return { profile: await resolveActiveProfile(), viaUserChoice: false };
@@ -173,13 +237,13 @@ export interface UserSelectableProfile {
 
 /**
  * What GET /api/models may show end users: admin-opened profiles only,
- * name + model — NO keys and NO baseUrl ever leave the server here.
+ * name + model — NO keys and NO baseUrl ever leave the server here. The
+ * built-in env profile joins the list when its dedicated opt-in is on.
  */
 export async function listUserSelectableProfiles(): Promise<UserSelectableProfile[]> {
   const file = await readConfigFile();
-  if (!file) return [];
   const active = await resolveActiveProfile();
-  return file.profiles
+  const out: UserSelectableProfile[] = (file?.profiles ?? [])
     .filter((p) => p.userSelectable === true)
     .map((p) => ({
       profileId: p.id,
@@ -187,6 +251,16 @@ export async function listUserSelectableProfiles(): Promise<UserSelectableProfil
       model: p.model,
       isDefault: p.id === active.id,
     }));
+  if (file?.envProfileUserSelectable === true) {
+    const env = envProfile();
+    out.push({
+      profileId: env.id,
+      name: env.name,
+      model: env.model,
+      isDefault: active.id === env.id,
+    });
+  }
+  return out;
 }
 
 /** Browser-safe rendering of a key: last 4 characters only. */
@@ -196,7 +270,10 @@ export function maskKey(apiKey: string): string {
 }
 
 /** The shape GET /api/admin/llm-config returns — keys never leave masked. */
-export function maskedProfile(p: LlmProfile) {
+export function maskedProfile(
+  p: LlmProfile,
+  opts?: { readonly?: boolean; source?: LlmConfigSource },
+) {
   return {
     id: p.id,
     name: p.name,
@@ -205,5 +282,19 @@ export function maskedProfile(p: LlmProfile) {
     hasKey: p.apiKey.length > 0,
     keyMasked: maskKey(p.apiKey),
     userSelectable: p.userSelectable === true,
+    readonly: opts?.readonly === true,
+    source: opts?.source ?? 'admin-config',
   };
+}
+
+/**
+ * The built-in env entry as the admin list renders it: live env values,
+ * masked, flagged read-only, its userSelectable taken from the config
+ * file's dedicated field.
+ */
+export function maskedEnvProfile(file: LlmConfigFile | null) {
+  return maskedProfile(
+    { ...envProfile(), userSelectable: file?.envProfileUserSelectable === true },
+    { readonly: true, source: 'env' },
+  );
 }

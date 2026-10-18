@@ -9,8 +9,10 @@ import { defaultSettings } from '@sds/sim-core';
 import type { ProblemStorage } from './storage';
 import { listCalls } from './calllog';
 import {
+  ENV_PROFILE_ID,
   envProfile,
   maskKey,
+  maskedEnvProfile,
   maskedProfile,
   readConfigFile,
   resolveActiveProfile,
@@ -47,6 +49,11 @@ import {
  * keys). Evaluation resolves the ACTIVE profile per call, so a switch in
  * this console takes effect on the next /api/evaluate with no restart.
  * Keys are only ever returned to the browser masked (last 4 chars).
+ * The profile list ALWAYS starts with the built-in 「.env 配置」 entry:
+ * synthesized live from the server's .env, READ-ONLY (the PUT below
+ * refuses to store/modify/delete a record with its reserved id; only its
+ * activation and its userSelectable opt-in persist), so the author keeps
+ * an uncorruptible fallback next to the editable profiles.
  * Component definitions themselves are code (@sds/components) — the console
  * never edits code. The ONLY writable layer is numeric default-parameter
  * overrides, stored server-side in data/component-overrides.json. HONEST
@@ -376,21 +383,36 @@ export function registerAdminRoutes(app: Hono, storage: ProblemStorage): void {
   });
 
   // ------------------------------------------------- LLM 配置（模型档案）-
-  app.get('/api/admin/llm-config', async (c) => {
+  /**
+   * The admin console's view of the LLM configuration: the built-in env
+   * entry FIRST (live values, masked, readonly — it is synthesized from
+   * .env and can never be edited or deleted here), then the stored file
+   * profiles. `source`/`activeProfileId` mirror the real resolution, so
+   * an active env entry reports source 'env' even when a file exists.
+   */
+  async function llmConfigView() {
     const file = await readConfigFile();
     const resolved = await resolveActiveProfile();
-    const profiles = file && file.profiles.length ? file.profiles : [envProfile()];
-    return c.json({
+    return {
       source: resolved.source,
       activeProfileId: resolved.id,
-      profiles: profiles.map(maskedProfile),
-    });
+      envProfileUserSelectable: file?.envProfileUserSelectable === true,
+      profiles: [
+        maskedEnvProfile(file),
+        ...(file?.profiles ?? []).map((p) => maskedProfile(p)),
+      ],
+    };
+  }
+
+  app.get('/api/admin/llm-config', async (c) => {
+    return c.json(await llmConfigView());
   });
 
   app.put('/api/admin/llm-config', async (c) => {
     const body = (await c.req.json().catch(() => null)) as {
       profiles?: unknown;
       activeProfileId?: unknown;
+      envProfileUserSelectable?: unknown;
     } | null;
     if (!body || !Array.isArray(body.profiles)) {
       return c.json(badRequest('需要 { profiles: [...], activeProfileId }'), 400);
@@ -400,6 +422,31 @@ export function registerAdminRoutes(app: Hono, storage: ProblemStorage): void {
     const profiles: LlmProfile[] = [];
     for (let i = 0; i < body.profiles.length; i += 1) {
       const p = body.profiles[i] as Partial<LlmProfile> | null;
+      // The built-in env profile is READ-ONLY: it is synthesized from
+      // .env at read time and never persisted. An entry carrying the
+      // reserved id is dropped — UNLESS it tries to substantively change
+      // the env values (different endpoint/model, or a foreign key),
+      // which is rejected outright so the attempt is never silent.
+      if (p && p.id === ENV_PROFILE_ID) {
+        const env = envProfile();
+        const foreignKey =
+          typeof p.apiKey === 'string' &&
+          p.apiKey !== '' &&
+          p.apiKey !== env.apiKey &&
+          p.apiKey !== maskKey(env.apiKey);
+        const changedTarget =
+          (typeof p.baseUrl === 'string' && p.baseUrl.replace(/\/$/, '') !== env.baseUrl) ||
+          (typeof p.model === 'string' && p.model !== env.model);
+        if (foreignKey || changedTarget) {
+          return c.json(
+            badRequest(
+              '内置「.env 配置」档案只读：它直接读取服务端 .env，不能通过 admin 修改或覆盖；如需改值请编辑 apps/server/.env 后重启',
+            ),
+            400,
+          );
+        }
+        continue;
+      }
       if (
         !p ||
         typeof p.name !== 'string' ||
@@ -446,18 +493,26 @@ export function registerAdminRoutes(app: Hono, storage: ProblemStorage): void {
     if (ids.size !== profiles.length) {
       return c.json(badRequest('profiles 里有重复 id'), 400);
     }
+    // 'env-default' is a legal active id: the built-in env entry is
+    // activatable even though it is never stored as a profile record.
     const activeProfileId =
-      typeof body.activeProfileId === 'string' && ids.has(body.activeProfileId)
-        ? body.activeProfileId
-        : (profiles[0]?.id ?? null);
-    const file: LlmConfigFile = { profiles, activeProfileId };
-    await writeConfigFile(file);
-    return c.json({
-      ok: true,
-      source: 'admin-config',
+      body.activeProfileId === ENV_PROFILE_ID
+        ? ENV_PROFILE_ID
+        : typeof body.activeProfileId === 'string' && ids.has(body.activeProfileId)
+          ? body.activeProfileId
+          : (profiles[0]?.id ?? null);
+    // The env profile's only mutable bit — preserved when the body omits it.
+    const envProfileUserSelectable =
+      typeof body.envProfileUserSelectable === 'boolean'
+        ? body.envProfileUserSelectable
+        : existing?.envProfileUserSelectable === true;
+    const file: LlmConfigFile = {
+      profiles,
       activeProfileId,
-      profiles: profiles.map(maskedProfile),
-    });
+      ...(envProfileUserSelectable ? { envProfileUserSelectable: true } : {}),
+    };
+    await writeConfigFile(file);
+    return c.json({ ok: true, ...(await llmConfigView()) });
   });
 
   // -------------------------------------------- 模型发现 / 连接测试（探针）-
