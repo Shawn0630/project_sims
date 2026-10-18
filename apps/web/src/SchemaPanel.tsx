@@ -1,4 +1,3 @@
-import { useState } from 'react';
 import type { MetricsSnapshot } from '@sds/sim-core';
 import type {
   ProblemSchemaDTO,
@@ -9,59 +8,131 @@ import type {
 
 const ROW_PRESETS = [100_000, 10_000_000, 1_000_000_000, 50_000_000_000];
 
+/**
+ * The deterministic schema checker display: score, requirement coverage,
+ * per-access-pattern path/latency verdicts and the rule findings grouped
+ * by dimension. Pure rendering of backend-computed signals — used both as
+ * design-time feedback inside the 数据库设计 view and as the evidence block
+ * of the results page's 「数据库评审」 tab.
+ */
+export function SchemaSignalsView({ signals }: { signals: SchemaSignalsDTO }) {
+  return (
+    <div className="review-box">
+      <div style={{ display: 'flex', gap: 18, alignItems: 'baseline' }}>
+        <span style={{ fontSize: 30, fontWeight: 800, color: signals.score >= 80 ? '#4ade80' : signals.score >= 55 ? '#facc15' : '#f87171' }}>
+          {signals.score} 分
+        </span>
+        <span>{signals.coverage}</span>
+      </div>
+      <table className="mini-table">
+        <thead>
+          <tr><th>访问模式</th><th>路径</th><th>延迟估算</th><th>判定</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          {signals.perPattern.map((p) => (
+            <tr key={p.patternId}>
+              <td>{p.name}</td>
+              <td>{p.path}</td>
+              <td>≈{p.latencyMs}ms</td>
+              <td style={{ color: p.verdict === '通过' ? '#4ade80' : p.verdict === '风险' ? '#facc15' : '#f87171' }}>
+                {p.verdict}
+              </td>
+              <td style={{ color: '#94a3b8' }}>{p.note}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {(['需求覆盖', '延迟风险', '扩展性'] as const).map((dim) => {
+        const items = signals.findings.filter((f) => f.dimension === dim);
+        if (!items.length) return null;
+        return (
+          <div key={dim} style={{ marginTop: 8 }}>
+            <b>{dim} · 规则信号</b>
+            <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
+              {items.map((f, i) => (
+                <li key={i} style={{ color: f.severity === 'high' ? '#fca5a5' : '#e2e8f0' }}>
+                  {f.text}
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * The qualitative schema conclusions — produced by the backend's unified
+ * submit (one evaluate call), rendered ONLY in the results page's
+ * 「数据库评审」 tab. This panel holds no review logic of its own.
+ */
+export function SchemaAssessmentView({
+  assessment,
+  label,
+}: {
+  assessment: SchemaAssessmentDTO;
+  /** Source attribution （评审：云端 LLM · <model>), when available. */
+  label?: string;
+}) {
+  return (
+    <div style={{ border: '1px solid #1e293b', borderRadius: 8, padding: '10px 12px', background: '#0b1220' }}>
+      <b>🧑‍⚖️ 评审员结论</b>
+      {label && (
+        <span style={{ color: '#94a3b8', fontSize: 12, marginLeft: 8 }}>评审：{label}</span>
+      )}
+      <div style={{ fontSize: 13, lineHeight: 1.7, marginTop: 4 }}>
+        <div>{assessment.conclusion}</div>
+        {assessment.dimensionNotes.map((d) => (
+          <div key={d.dimension} style={{ marginTop: 6 }}>
+            <b>{d.dimension}</b>
+            <div style={{ color: '#cbd5e1' }}>{d.note}</div>
+          </div>
+        ))}
+        {assessment.suggestions.length > 0 && (
+          <>
+            <b style={{ display: 'block', marginTop: 8 }}>改进建议（按优先级）</b>
+            <ul style={{ margin: '4px 0', paddingLeft: 18, color: '#cbd5e1' }}>
+              {assessment.suggestions.map((s, i) => (
+                <li key={i}>{s}</li>
+              ))}
+            </ul>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 interface SchemaPanelProps {
   schema: ProblemSchemaDTO;
   snapshot: MetricsSnapshot | null;
-  onChange: (schema: ProblemSchemaDTO) => void;
   /**
-   * One backend review round-trip: the server computes the deterministic
-   * signals (paths / latencies / rule findings) AND the qualitative
-   * conclusions (LLM call, or scripted fallback) and returns both. This
-   * panel holds no judging or review logic of its own — it only renders.
+   * Deterministic checker signals for the CURRENT draft, computed by the
+   * backend (they ride along with every judge response) and refreshed as
+   * the user designs. Design-time feedback only — the AI assessment is
+   * NOT produced here anymore: it is part of the unified submit and lives
+   * in the results page's 「数据库评审」 tab.
    */
-  onReview: (
-    schema: ProblemSchemaDTO,
-    loadFactor: number,
-  ) => Promise<{ signals: SchemaSignalsDTO; assessment: SchemaAssessmentDTO | null }>;
-  /** Who produced the current conclusions (backend label), for attribution. */
-  assessorNote?: string;
+  signals: SchemaSignalsDTO | null;
+  onChange: (schema: ProblemSchemaDTO) => void;
 }
 
-export function SchemaPanel({ schema, snapshot, onChange, onReview, assessorNote }: SchemaPanelProps) {
-  const [report, setReport] = useState<SchemaSignalsDTO | null>(null);
-  const [assessment, setAssessment] = useState<SchemaAssessmentDTO | null>(null);
-  const [assessing, setAssessing] = useState(false);
-
+export function SchemaPanel({ schema, snapshot, signals, onChange }: SchemaPanelProps) {
   const updateTable = (idx: number, table: SchemaTableDTO) => {
     const next = structuredClone(schema);
     next.tables[idx] = table;
     onChange(next);
-    setReport(null);
-    setAssessment(null);
-  };
-
-  const runReview = async () => {
-    const loadFactor = snapshot ? Math.min(1.5, snapshot.hottestUtil) : 0;
-    setAssessing(true);
-    try {
-      const { signals, assessment: a } = await onReview(schema, loadFactor);
-      setReport(signals);
-      setAssessment(a);
-    } catch {
-      setReport(null);
-      setAssessment(null);
-    } finally {
-      setAssessing(false);
-    }
   };
 
   return (
     <div>
       <p style={{ color: '#94a3b8', fontSize: 13, marginTop: 0 }}>
         架构之外，数据库本身也要交卷：表结构、分片键、索引决定每条核心查询走什么路径。
-        点「让评审员检查」：后端先用代码规则算出每条访问模式的路径与延迟（确定性信号），
-        再做一次评审调用（LLM 或后端脚本回落）按 <b>需求覆盖 / 延迟风险 / 扩展性</b> 给结论与改进建议——
+        下方的覆盖 / 路径 / 延迟 / 规则信号由后端判卷实时计算，改表结构后自动刷新——
         延迟估算还会接入画布上 DB 此刻的真实利用率{ snapshot ? `（当前最热利用率 ${Math.round(snapshot.hottestUtil * 100)}%）` : ''}。
+        数据库的 AI 评审不在这里单独触发：点右上角「提交设计」后，结论会出现在结果页的
+        「数据库评审」页签里，和其他评审放在一起。
       </p>
 
       {schema.tables.map((table, ti) => (
@@ -135,8 +206,6 @@ export function SchemaPanel({ schema, snapshot, onChange, onReview, assessorNote
                 const next = structuredClone(schema);
                 next.tables.splice(ti, 1);
                 onChange(next);
-                setReport(null);
-                setAssessment(null);
               }}
             >
               删表
@@ -230,95 +299,18 @@ export function SchemaPanel({ schema, snapshot, onChange, onReview, assessorNote
               fields: [{ name: 'id', type: 'bigint', indexed: true }],
             });
             onChange(next);
-            setReport(null);
-            setAssessment(null);
           }}
         >
           ＋ 加一张表
         </button>
-        <button className="primary" onClick={runReview} disabled={assessing}>
-          {assessing ? '评审员思考中…' : '🔍 让评审员检查这份设计'}
-        </button>
       </div>
 
-      {report && (
-        <div className="review-box">
-          <div style={{ display: 'flex', gap: 18, alignItems: 'baseline' }}>
-            <span style={{ fontSize: 30, fontWeight: 800, color: report.score >= 80 ? '#4ade80' : report.score >= 55 ? '#facc15' : '#f87171' }}>
-              {report.score} 分
-            </span>
-            <span>{report.coverage}</span>
-          </div>
-          <table className="mini-table">
-            <thead>
-              <tr><th>访问模式</th><th>路径</th><th>延迟估算</th><th>判定</th><th>说明</th></tr>
-            </thead>
-            <tbody>
-              {report.perPattern.map((p) => (
-                <tr key={p.patternId}>
-                  <td>{p.name}</td>
-                  <td>{p.path}</td>
-                  <td>≈{p.latencyMs}ms</td>
-                  <td style={{ color: p.verdict === '通过' ? '#4ade80' : p.verdict === '风险' ? '#facc15' : '#f87171' }}>
-                    {p.verdict}
-                  </td>
-                  <td style={{ color: '#94a3b8' }}>{p.note}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {(['需求覆盖', '延迟风险', '扩展性'] as const).map((dim) => {
-            const items = report.findings.filter((f) => f.dimension === dim);
-            if (!items.length) return null;
-            return (
-              <div key={dim} style={{ marginTop: 8 }}>
-                <b>{dim} · 规则信号</b>
-                <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
-                  {items.map((f, i) => (
-                    <li key={i} style={{ color: f.severity === 'high' ? '#fca5a5' : '#e2e8f0' }}>
-                      {f.text}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            );
-          })}
-
-          {/* Qualitative conclusions — produced by the backend eval call. */}
-          <div style={{ marginTop: 12, borderTop: '1px solid #1e293b', paddingTop: 10 }}>
-            <b>🧑‍⚖️ 评审员结论</b>
-            {assessorNote && (
-              <span style={{ color: '#94a3b8', fontSize: 12, marginLeft: 8 }}>{assessorNote}</span>
-            )}
-            {assessing ? (
-              <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>评审员正在看这份设计…</div>
-            ) : assessment ? (
-              <div style={{ fontSize: 13, lineHeight: 1.7, marginTop: 4 }}>
-                <div>{assessment.conclusion}</div>
-                {assessment.dimensionNotes.map((d) => (
-                  <div key={d.dimension} style={{ marginTop: 6 }}>
-                    <b>{d.dimension}</b>
-                    <div style={{ color: '#cbd5e1' }}>{d.note}</div>
-                  </div>
-                ))}
-                {assessment.suggestions.length > 0 && (
-                  <>
-                    <b style={{ display: 'block', marginTop: 8 }}>改进建议（按优先级）</b>
-                    <ul style={{ margin: '4px 0', paddingLeft: 18, color: '#cbd5e1' }}>
-                      {assessment.suggestions.map((s, i) => (
-                        <li key={i}>{s}</li>
-                      ))}
-                    </ul>
-                  </>
-                )}
-              </div>
-            ) : (
-              <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>
-                结论生成失败或未配置评审员——上方规则信号仍然有效。
-              </div>
-            )}
-          </div>
-        </div>
+      {signals ? (
+        <SchemaSignalsView signals={signals} />
+      ) : (
+        <p className="hint">
+          规则信号由后端判卷计算——稍等片刻自动出现；连不上后端时这里为空，但表结构草稿照常保存。
+        </p>
       )}
     </div>
   );

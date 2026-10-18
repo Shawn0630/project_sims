@@ -27,6 +27,7 @@ import {
   type ProblemPack,
   type ProblemSchemaDTO,
   type SchemaAssessmentDTO,
+  type SchemaSignalsDTO,
   type StructuralFindingDTO,
   type SubmissionAssessmentDTO,
   type SuiteResultDTO,
@@ -47,12 +48,16 @@ import { Canvas } from './Canvas';
 import { DeepDive } from './DeepDive';
 import { SettingsPanel } from './SettingsPanel';
 import { CaseList, ProbeSection, StructuralList, scoreColor } from './ReportPanel';
-import { SchemaPanel } from './SchemaPanel';
+import { SchemaPanel, SchemaAssessmentView, SchemaSignalsView } from './SchemaPanel';
 import { IconGlyph } from './icons';
 
 type Phase = 'design' | 'run' | 'report';
 type LeftTab = 'desc' | 'cases' | 'subs';
 type RightView = 'arch' | 'schema';
+/** Top-level screens: design workspace vs the post-submit results page. */
+type AppView = 'design' | 'results';
+/** The results page's left column, one tab per evaluation section. */
+type ResultsTab = 'judge' | 'review' | 'probe' | 'schema';
 
 interface SubmissionRecord {
   problemId: string;
@@ -89,6 +94,13 @@ const LEFT_TABS: { id: LeftTab; label: string }[] = [
 const RIGHT_VIEWS: { id: RightView; label: string }[] = [
   { id: 'arch', label: '架构设计' },
   { id: 'schema', label: '数据库设计' },
+];
+
+const RESULTS_TABS: { id: ResultsTab; label: string }[] = [
+  { id: 'judge', label: '判卷结果' },
+  { id: 'review', label: 'AI 评审' },
+  { id: 'probe', label: '探测用例' },
+  { id: 'schema', label: '数据库评审' },
 ];
 
 /** Live measured-vs-threshold rows for the quick-sim readout strip. */
@@ -200,7 +212,11 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   const [activeTab, setActiveTab] = useState<LeftTab>('desc');
   const [rightView, setRightView] = useState<RightView>('arch');
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [bottomOpen, setBottomOpen] = useState(true);
+  // Top-level screen. The right workspace (canvas + schema editor) is a
+  // single shared subtree that stays mounted in BOTH screens — only the
+  // left column swaps between the problem panel and the results tabs.
+  const [view, setView] = useState<AppView>('design');
+  const [resultsTab, setResultsTab] = useState<ResultsTab>('judge');
   const [submissions, setSubmissions] = useState<SubmissionRecord[]>(loadSubmissions);
 
   // --------------------------------------- qualitative assessment layer ---
@@ -225,6 +241,24 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   const [probeBusy, setProbeBusy] = useState(false);
   const [probeNote, setProbeNote] = useState<string | null>(null);
   const [probeLabel, setProbeLabel] = useState('');
+
+  // --------------------------------------------- schema evaluation layer -
+  // There is NO standalone schema review anymore: the AI assessment is
+  // produced by the unified submit (one evaluate call for the submitted
+  // schema) and rendered only in the results page's 「数据库评审」 tab.
+  // The deterministic signals travel separately (they ride every judge
+  // response) and also feed the schema view's design-time checker display.
+  const [schemaSignals, setSchemaSignals] = useState<SchemaSignalsDTO | null>(null);
+  const [schemaAssessment, setSchemaAssessment] = useState<SchemaAssessmentDTO | null>(null);
+  const [schemaLabel, setSchemaLabel] = useState('');
+  const [schemaBusy, setSchemaBusy] = useState(false);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
+  // The exact design + schema the on-screen results belong to. Editing
+  // either beside the results marks them stale until the next submit.
+  const [submittedSnapshot, setSubmittedSnapshot] = useState<{
+    design: string;
+    schema: string;
+  } | null>(null);
 
   // ---------------------------------------------------------- fix loop ---
   // Findings may carry server-validated fix actions. Applying one is a
@@ -308,24 +342,32 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     return () => window.removeEventListener('keydown', h);
   }, [preview]);
 
-  // Structural findings are computed by the backend, not here. While
-  // designing, refresh them (debounced) through the judge endpoint and
-  // consume only its structural slice; a real submission re-judges
-  // everything and replaces both suite and structural state.
+  // Structural findings and schema signals are computed by the backend,
+  // not here. While designing, refresh them (debounced) through the judge
+  // endpoint and consume only those two slices; a real submission
+  // re-judges everything and replaces suite, structural and signals.
   useEffect(() => {
     if (phase !== 'design') return;
     const seq = ++structuralSeq.current;
     const t = window.setTimeout(() => {
-      judgeOnServer({ problemId: problem.id, design })
+      judgeOnServer({
+        problemId: problem.id,
+        design,
+        schema: schemasRef.current[problem.id]!,
+        schemaLoadFactor: snapshot ? Math.min(1.5, snapshot.hottestUtil) : 0,
+      })
         .then((jr) => {
-          if (structuralSeq.current === seq) setStructural(jr.structural);
+          if (structuralSeq.current !== seq) return;
+          setStructural(jr.structural);
+          setSchemaSignals(jr.schemaSignals);
         })
         .catch(() => {
           /* backend hiccup — keep the last known findings */
         });
     }, 700);
     return () => window.clearTimeout(t);
-  }, [design, problem, phase]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [design, schemas, problem, phase]);
 
   useEffect(() => {
     if (!running) return;
@@ -391,6 +433,12 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setSuite(null);
     setStructural([]);
     setJudgeError(null);
+    setView('design');
+    setSchemaAssessment(null);
+    setSchemaLabel('');
+    setSchemaError(null);
+    setSchemaSignals(null);
+    setSubmittedSnapshot(null);
     setAssessment(null);
     setAssessmentError(null);
     setProbeResults(null);
@@ -473,11 +521,16 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
 
   const backToDesign = () => {
     setPhase('design');
+    setView('design');
     setRunning(false);
     setSnapshot(null);
     setSuite(null);
     setAssessment(null);
     setAssessmentError(null);
+    setSchemaAssessment(null);
+    setSchemaLabel('');
+    setSchemaError(null);
+    setSubmittedSnapshot(null);
     setProbeResults(null);
     setProbeNote(null);
     setProbeLabel('');
@@ -492,19 +545,38 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   };
 
   /**
+   * Unlock the design for fixing WITHOUT discarding the results: used on
+   * the results page, where the user reads the verdicts on the left and
+   * repairs the design on the right. The results stay on screen (marked
+   * stale once the design actually diverges) until the next submit.
+   */
+  const unlockForFix = () => {
+    setPreview(null);
+    finishQuickSim();
+    setSimReadout(null);
+    setPhase('design');
+    setRunning(false);
+    setSnapshot(null);
+    simRef.current = null;
+    engine.reviveAll();
+    engine.clearEvents();
+  };
+
+  /**
    * Judging happens on the backend: POST the design (and current schema
    * draft) and render what comes back — suite results, structural findings,
    * schema signals. Hidden cases are judged there, where their data lives.
    */
   const runSuiteNow = async () => {
     const p = problemRef.current;
+    const loadFactor = snapshot ? Math.min(1.5, snapshot.hottestUtil) : 0;
     let jr: JudgeResponseDTO;
     try {
       jr = await judgeOnServer({
         problemId: p.id,
         design: designRef.current,
         schema: schemasRef.current[p.id]!,
-        schemaLoadFactor: snapshot ? Math.min(1.5, snapshot.hottestUtil) : 0,
+        schemaLoadFactor: loadFactor,
       });
     } catch {
       setJudgeError('判卷失败：后端不可达。请确认后端已启动（npm run dev:server）后，再点一次「提交设计」。');
@@ -514,9 +586,17 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     const result = jr.suite;
     setSuite(result);
     setStructural(jr.structural);
+    setSchemaSignals(jr.schemaSignals);
+    setSubmittedSnapshot({
+      design: JSON.stringify(designRef.current),
+      schema: JSON.stringify(schemasRef.current[p.id]!),
+    });
     setSubmitStamp((s) => s + 1);
     setAssessment(null);
     setAssessmentError(null);
+    setSchemaAssessment(null);
+    setSchemaError(null);
+    setSchemaLabel('');
     setProbeResults(null);
     setProbeNote(null);
     setProbeLabel('');
@@ -533,13 +613,21 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
         ...prev,
       ].slice(0, 50),
     );
-    // Submission pipeline: code judging (done above, it owns the score) →
-    // LLM probe (the model proposes failure cases for THIS design from the
-    // criteria alone) → simulator verification of every prediction → the
+    // Judging is done (it owns the score) — land on the results page. The
+    // qualitative sections fill in there, each behind its own busy state.
+    setResultsTab('judge');
+    setView('results');
+    // Submission pipeline: code judging (done above) → LLM probe (the
+    // model proposes failure cases for THIS design from the criteria
+    // alone) → simulator verification of every prediction → the
     // qualitative review, grounded on the verified probe results. The
     // static suite remains the fairness baseline for the score and is no
     // longer briefed to the LLM.
     void runProbeThenAssessment(result, jr.structural);
+    // The schema AI assessment rides the SAME unified submit — there is
+    // no separate schema-review trigger anymore. Its conclusions render
+    // only in the results page's 「数据库评审」 tab.
+    void runSchemaAssessment(loadFactor);
   };
 
   /**
@@ -598,6 +686,34 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     void runAssessment(s, structuralFindings, verified);
   };
 
+  /**
+   * The schema half of the unified submit: ONE backend evaluate call for
+   * the submitted schema draft. The deterministic signals already came
+   * back with the judge response; this call adds the qualitative
+   * conclusions shown in the results page's 「数据库评审」 tab.
+   */
+  const runSchemaAssessment = async (loadFactor: number) => {
+    const p = problemRef.current;
+    setSchemaBusy(true);
+    setSchemaError(null);
+    try {
+      const r = await evaluateOnServer<SchemaAssessmentDTO>('schema', {
+        problemName: p.name,
+        schema: schemasRef.current[p.id]!,
+        loadFactor,
+      });
+      setSchemaLabel(r.label);
+      setSchemaAssessment(r.data);
+      if (r.schemaSignals) setSchemaSignals(r.schemaSignals);
+    } catch {
+      // Same honesty rule as the submission review: the evaluate request
+      // itself never completed — say so instead of an empty tab.
+      setSchemaError('数据库评审调用失败：后端未返回结论，请确认后端在运行后重新提交。');
+    } finally {
+      setSchemaBusy(false);
+    }
+  };
+
   /** Qualitative review of a judged submission — ONE backend evaluate call. */
   const runAssessment = async (
     s: SuiteResultDTO,
@@ -644,7 +760,6 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
     setUndoFix(null);
     if (phase === 'design') submitDesign();
     void runSuiteNow();
-    setBottomOpen(true);
   };
 
   /** LeetCode's Run: start the live simulation (or pause/resume it). */
@@ -935,13 +1050,25 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
   // During a fix preview the canvas renders the WOULD-BE design; the
   // committed design state (and the engine) stay untouched until confirm.
   const displayDesign = preview ? preview.plan.design : design;
-  const stepIndex = phase === 'design' ? 0 : phase === 'run' ? 1 : 2;
+  // The results page owns step 3; within the design screen the sim phase
+  // drives the indicator as before.
+  const stepIndex = view === 'results' ? 2 : phase === 'design' ? 0 : 1;
+  // The on-screen results belong to submittedSnapshot; any later edit of
+  // the design or the schema (possible right here on the results page)
+  // makes them stale until the next submit re-judges.
+  const resultsStale =
+    !!suite &&
+    !!submittedSnapshot &&
+    (submittedSnapshot.design !== JSON.stringify(design) ||
+      submittedSnapshot.schema !== JSON.stringify(schemas[problemId] ?? problem.schema));
   const nextHint =
-    phase === 'design'
-      ? '下一步：在右侧「架构设计」画布上完成设计（表结构在右侧「数据库设计」视图里交卷），然后点「提交设计」判卷——或先点「▶ 运行」看它跑起来。'
-      : phase === 'run'
-        ? '下一步：设计已锁定、模拟运行中。可以注入场景、杀节点观察现象，或点「提交设计」跑全部用例判卷。'
-        : '下一步：在下方结果面板看每个用例的判定，点失败用例看缺陷说明并回放；改设计就「返回设计」后重新提交。';
+    view === 'results'
+      ? '下一步：在左侧按页签看判卷结果、AI 点评、探测用例与数据库评审；想改设计，点左侧「✏️ 解锁修改」或直接应用某条改进，改完重新提交。'
+      : phase === 'design'
+        ? '下一步：在右侧「架构设计」画布上完成设计（表结构在右侧「数据库设计」视图里交卷），然后点「提交设计」判卷——或先点「▶ 运行」看它跑起来。'
+        : phase === 'run'
+          ? '下一步：设计已锁定、模拟运行中。可以注入场景、杀节点观察现象，或点「提交设计」跑全部用例判卷。'
+          : '下一步：本轮结果还在——点上方「📊 查看结果」回结果页，或点「↩ 返回设计」解锁画布重做一轮。';
 
   return (
     <div className="app lc-app">
@@ -998,16 +1125,35 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
       {/* --------------------------------------------- 3-step progress --- */}
       <div className="lc-steps">
         {['设计', '提交', '看结果'].map((label, i) => (
-          <span key={label} className={`lc-step ${i === stepIndex ? 'active' : i < stepIndex ? 'done' : ''}`}>
+          <span
+            key={label}
+            className={`lc-step ${i === stepIndex ? 'active' : i < stepIndex ? 'done' : ''} ${i < 2 || suite ? 'clickable' : ''}`}
+            onClick={() => {
+              if (i < 2) setView('design');
+              else if (suite) setView('results');
+            }}
+            title={i < 2 ? '回设计页' : suite ? '看本轮结果' : '提交后可看'}
+          >
             {i + 1} {label}
             {i < 2 && <span className="lc-step-arrow">→</span>}
           </span>
         ))}
+        {suite && view === 'design' && (
+          <button className="lc-goto-results" onClick={() => setView('results')}>
+            📊 查看结果 →
+          </button>
+        )}
+        {view === 'results' && (
+          <button className="lc-goto-results" onClick={() => setView('design')}>
+            ← 返回设计
+          </button>
+        )}
         <span className="lc-next-hint">{nextHint}</span>
       </div>
 
       <div className="lc-body">
-        {/* ------------------------------------------------ left panel --- */}
+        {/* ------------------------- left column: problem (design view) --- */}
+        {view === 'design' ? (
         <aside className="lc-left">
           <div className="lc-tabs">
             {LEFT_TABS.map((t) => (
@@ -1065,7 +1211,7 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                 <p className="hint" style={{ marginTop: 0 }}>
                   可见用例先亮出来（像 LeetCode 的样例），隐藏 edge cases 提交后才揭示。
                   {suite
-                    ? ' 已判卷：结果同步显示在下方结果面板。'
+                    ? ' 已判卷：点上方「📊 查看结果」到结果页逐例看判定。'
                     : ' 点右上角「提交设计」跑全部用例。'}
                 </p>
                 <CaseList
@@ -1096,7 +1242,15 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                 ) : (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                     {mySubmissions.map((s, i) => (
-                      <div key={i} className="case-row">
+                      <div
+                        key={i}
+                        className="case-row sub-clickable"
+                        onClick={() => {
+                          setResultsTab('judge');
+                          setView('results');
+                        }}
+                        title="打开结果页（展示最近一次提交的完整结果）"
+                      >
                         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                           <b style={{ color: scoreColor(s.scorePct) }}>{s.scorePct} 分</b>
                           <span style={{ fontSize: 13 }}>
@@ -1108,6 +1262,9 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
                         </div>
                       </div>
                     ))}
+                    <p className="hint" style={{ margin: 0 }}>
+                      点任意一条打开结果页（记录只存分数，页面展示最近一次提交的完整结果）。
+                    </p>
                   </div>
                 )}
               </div>
@@ -1115,9 +1272,227 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
 
           </div>
         </aside>
+        ) : (
+        /* ------------------------- left column: results (results view) -- */
+        <aside className="lc-left lc-left-results">
+          <div className="res-head">
+            <button onClick={() => setView('design')}>← 返回设计</button>
+            <b>📊 提交结果</b>
+            {suite && (
+              <span style={{ marginLeft: 'auto', fontSize: 13 }}>
+                <b style={{ color: scoreColor(suite.scorePct), fontSize: 15 }}>{suite.scorePct} 分</b>
+                <span style={{ color: '#94a3b8' }}>
+                  （{suite.passedCount}/{suite.totalCount}）
+                </span>
+              </span>
+            )}
+          </div>
+          {(probeBusy || assessmentBusy || schemaBusy) && (
+            <div className="res-progress">
+              ⏳ 评审流程进行中：
+              {[
+                probeBusy && '探测用例生成 + 仿真验证',
+                assessmentBusy && '提交点评',
+                schemaBusy && '数据库评审',
+              ]
+                .filter(Boolean)
+                .join(' · ')}
+              …
+            </div>
+          )}
+          {resultsStale && (
+            <div className="res-stale">
+              ⚠️ 设计已修改，下方结果为上次提交的——重新提交后才会刷新。
+            </div>
+          )}
+          {suite && phase !== 'design' && (
+            <button className="res-unlock" onClick={unlockForFix}>
+              ✏️ 解锁右侧设计来修改（结果保留在左侧，改完重新提交）
+            </button>
+          )}
+          <div className="lc-tabs">
+            {RESULTS_TABS.map((t) => (
+              <button
+                key={t.id}
+                className={`lc-tab ${resultsTab === t.id ? 'active' : ''}`}
+                onClick={() => setResultsTab(t.id)}
+              >
+                {t.label}
+                {t.id === 'judge' && suite && (
+                  <span className="lc-tab-badge">
+                    {suite.passedCount}/{suite.totalCount}
+                  </span>
+                )}
+                {t.id === 'probe' && probeResults && (
+                  <span className="lc-tab-badge">{probeResults.length}</span>
+                )}
+              </button>
+            ))}
+          </div>
+
+          <div className="lc-tab-body">
+            {resultsTab === 'judge' && (
+              <div>
+                {suite ? (
+                  <>
+                    <div className="res-score-strip">
+                      <span>
+                        本轮成绩：
+                        <b style={{ color: scoreColor(suite.scorePct) }}>{suite.scorePct} 分</b>
+                        （{suite.passedCount}/{suite.totalCount} 个用例通过）
+                      </span>
+                      <button onClick={onSubmit}>⟳ 重新判卷</button>
+                    </div>
+                    <CaseList
+                      problem={problem}
+                      suite={suite}
+                      quickSimId={activeSim?.id ?? null}
+                      pinnedIds={pinnedIds}
+                      onQuickSim={(tc) => void quickSimCase(tc)}
+                      onStopSim={stopQuickSim}
+                      onPinToggle={(tc) => void pinCase(tc)}
+                      onApplyFix={enterPreview}
+                    />
+                  </>
+                ) : (
+                  <p className="hint" style={{ marginTop: 0 }}>
+                    尚未提交。回设计页完成设计后点「提交设计」，逐例判卷结果会出现在这里。
+                  </p>
+                )}
+              </div>
+            )}
+
+            {resultsTab === 'review' && (
+              <div>
+                {/* Qualitative review — backend evaluate call only. */}
+                <div style={{ border: '1px solid #1e293b', borderRadius: 8, padding: '10px 12px', background: '#0b1220' }}>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <b>🧑‍⚖️ 评审员点评</b>
+                    {assessorLabel && (
+                      <span style={{ color: '#94a3b8', fontSize: 12 }}>评审：{assessorLabel}（分数本身由代码判卷）</span>
+                    )}
+                    <button
+                      style={{ marginLeft: 'auto' }}
+                      disabled={!suite || assessmentBusy || probeBusy}
+                      onClick={() => suite && void runAssessment(suite)}
+                    >
+                      {assessmentBusy || probeBusy ? '评审生成中…' : assessment ? '重新评审' : '让评审员点评这次提交'}
+                    </button>
+                  </div>
+                  {!suite && (
+                    <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>
+                      尚未提交——提交后，评审员点评会出现在这里。
+                    </div>
+                  )}
+                  {(assessmentBusy || probeBusy) && !assessment && suite && (
+                    <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>
+                      {probeBusy
+                        ? '评审流程进行中：先完成 LLM 探测与仿真验证，再生成点评…'
+                        : `评审生成中…（正在联系${llmConfigured ? '云端 LLM' : '本地脚本评审'}，马上就好）`}
+                    </div>
+                  )}
+                  {assessmentBusy && assessment && (
+                    <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>重新评审中…</div>
+                  )}
+                  {assessmentError && (
+                    <div style={{ color: '#fca5a5', fontSize: 13, marginTop: 6 }}>⚠️ {assessmentError}</div>
+                  )}
+                  {assessment && (
+                    <div style={{ fontSize: 13, lineHeight: 1.7, marginTop: 4 }}>
+                      <div>{assessment.summary}</div>
+                      {assessment.scoreRationale && (
+                        <div style={{ color: '#cbd5e1', marginTop: 4 }}>
+                          <b>分数理由：</b>
+                          {assessment.scoreRationale}
+                        </div>
+                      )}
+                      {assessment.findings.length > 0 && (
+                        <ul style={{ margin: '6px 0 2px', paddingLeft: 18 }}>
+                          {assessment.findings.map((f, i) => (
+                            <li key={i}>
+                              <b style={{ color: f.severity === 'high' ? '#fca5a5' : f.severity === 'medium' ? '#fde68a' : '#e2e8f0' }}>
+                                {f.title}
+                              </b>
+                              <span style={{ color: '#cbd5e1' }}> — {f.detail}</span>
+                              {f.actions && f.actions.length > 0 && (
+                                <button
+                                  style={{ marginLeft: 8 }}
+                                  onClick={() => enterPreview(f.title, f.actions!)}
+                                >
+                                  ✨ 应用此改进
+                                </button>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  )}
+                </div>
+                <h4 style={{ margin: '16px 0 8px' }}>🧱 结构检查（确定性规则，不依赖 LLM）</h4>
+                <StructuralList
+                  structural={structural}
+                  onSelectNode={(id) => setSelectedId(id)}
+                  onApplyFix={enterPreview}
+                />
+              </div>
+            )}
+
+            {resultsTab === 'probe' && (
+              <ProbeSection
+                busy={probeBusy}
+                note={
+                  suite
+                    ? probeNote
+                    : '尚未提交——提交后，LLM 针对这份设计提出的探测用例会在这里经仿真验证后呈现。'
+                }
+                results={probeResults}
+                sourceLabel={probeLabel}
+                quickSimId={activeSim?.id ?? null}
+                pinnedIds={pinnedIds}
+                onQuickSim={quickSimProbe}
+                onStopSim={stopQuickSim}
+                onPinToggle={pinProbe}
+                onApplyFix={enterPreview}
+              />
+            )}
+
+            {resultsTab === 'schema' && (
+              <div>
+                {schemaBusy && (
+                  <div style={{ color: '#94a3b8', fontSize: 13, marginBottom: 8 }}>
+                    数据库评审生成中…（和提交是同一次评审，稍等）
+                  </div>
+                )}
+                {schemaError && (
+                  <div style={{ color: '#fca5a5', fontSize: 13, marginBottom: 8 }}>⚠️ {schemaError}</div>
+                )}
+                {schemaAssessment ? (
+                  <SchemaAssessmentView assessment={schemaAssessment} label={schemaLabel || undefined} />
+                ) : (
+                  !schemaBusy && (
+                    <p className="hint" style={{ marginTop: 0 }}>
+                      {suite
+                        ? '本轮没有产出数据库评审结论——下方确定性信号仍然有效。'
+                        : '尚未提交——提交后，数据库的 AI 评审结论会出现在这里，和其他评审放在一起。'}
+                    </p>
+                  )
+                )}
+                {schemaSignals && (
+                  <>
+                    <h4 style={{ margin: '16px 0 8px' }}>🧮 确定性信号（代码规则，不依赖 LLM）</h4>
+                    <SchemaSignalsView signals={schemaSignals} />
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        </aside>
+        )}
 
         {/* ------------------------------------------------- workspace --- */}
         <section className="lc-workspace">
+          {judgeError && <div className="judge-error-strip">⚠️ {judgeError}</div>}
           {/* right-pane view tabs: the two main work surfaces live here —
               架构设计 (canvas) and 数据库设计 (schema editor). Both stay
               mounted; switching only toggles visibility so in-progress
@@ -1386,7 +1761,9 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
           {/* -------- 数据库设计 view: the schema editor as a full
               right-pane surface. Kept mounted alongside the canvas view —
               drafts live in App state per problem, switching views loses
-              nothing. Review output renders inside the panel, as before. */}
+              nothing. The panel shows the editor + deterministic checker
+              signals only; the AI schema review lives in the results
+              page's 「数据库评审」 tab. */}
           <div
             className="ws-view ws-view-schema"
             style={{ display: rightView === 'schema' ? 'flex' : 'none' }}
@@ -1394,18 +1771,8 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
             <SchemaPanel
               schema={schemas[problem.id]!}
               snapshot={snapshot}
+              signals={schemaSignals}
               onChange={(s) => setSchemas({ ...schemas, [problem.id]: s })}
-              assessorNote={assessorLabel ? `评审：${assessorLabel}` : undefined}
-              onReview={async (sch, loadFactor) => {
-                const r = await evaluateOnServer<SchemaAssessmentDTO>('schema', {
-                  problemName: problem.name,
-                  schema: sch,
-                  loadFactor,
-                });
-                setAssessorLabel(r.label);
-                if (!r.schemaSignals) throw new Error('后端未返回 schema 信号');
-                return { signals: r.schemaSignals, assessment: r.data };
-              }}
             />
           </div>
 
@@ -1419,145 +1786,6 @@ function Simulator({ problems, llmConfigured }: { problems: ProblemPack[]; llmCo
             </div>
           )}
 
-          {/* ------------------------- bottom results panel (collapsible) --- */}
-          <div className="lc-bottom panel">
-            <button className="lc-bottom-head" onClick={() => setBottomOpen(!bottomOpen)}>
-              <span>{bottomOpen ? '▾' : '▸'} 测试结果</span>
-              {suite ? (
-                <span style={{ fontSize: 13 }}>
-                  本轮成绩：<b style={{ color: scoreColor(suite.scorePct) }}>{suite.scorePct} 分</b>
-                  （{suite.passedCount}/{suite.totalCount} 个用例通过）
-                </span>
-              ) : (
-                <span style={{ color: '#94a3b8', fontSize: 12.5 }}>
-                  {phase === 'design'
-                    ? '尚未运行——先完成设计，再点「提交设计」。'
-                    : '模拟运行中——点「提交设计」跑全部用例判卷。'}
-                </span>
-              )}
-              {suite && (
-                <span
-                  role="button"
-                  tabIndex={0}
-                  className="lc-bottom-rerun"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onSubmit();
-                  }}
-                >
-                  ⟳ 重新判卷
-                </span>
-              )}
-            </button>
-            {bottomOpen && (
-              <div className="lc-bottom-body">
-                {judgeError && (
-                  <div style={{ color: '#fca5a5', fontSize: 13, marginBottom: 8 }}>
-                    ⚠️ {judgeError}
-                  </div>
-                )}
-                {suite ? (
-                  <>
-                    <CaseList
-                      problem={problem}
-                      suite={suite}
-                      quickSimId={activeSim?.id ?? null}
-                      pinnedIds={pinnedIds}
-                      onQuickSim={(tc) => void quickSimCase(tc)}
-                      onStopSim={stopQuickSim}
-                      onPinToggle={(tc) => void pinCase(tc)}
-                      onApplyFix={enterPreview}
-                    />
-                    {/* Probe step: LLM-proposed cases, simulator-verified. */}
-                    <ProbeSection
-                      busy={probeBusy}
-                      note={probeNote}
-                      results={probeResults}
-                      sourceLabel={probeLabel}
-                      quickSimId={activeSim?.id ?? null}
-                      pinnedIds={pinnedIds}
-                      onQuickSim={quickSimProbe}
-                      onStopSim={stopQuickSim}
-                      onPinToggle={pinProbe}
-                      onApplyFix={enterPreview}
-                    />
-                    {/* Qualitative review — backend evaluate call only. */}
-                    <div style={{ marginTop: 14, border: '1px solid #1e293b', borderRadius: 8, padding: '10px 12px', background: '#0b1220' }}>
-                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                        <b>🧑‍⚖️ 评审员点评</b>
-                        {assessorLabel && (
-                          <span style={{ color: '#94a3b8', fontSize: 12 }}>评审：{assessorLabel}（分数本身由代码判卷）</span>
-                        )}
-                        <button
-                          style={{ marginLeft: 'auto' }}
-                          disabled={assessmentBusy || probeBusy}
-                          onClick={() => suite && void runAssessment(suite)}
-                        >
-                          {assessmentBusy || probeBusy ? '评审生成中…' : assessment ? '重新评审' : '让评审员点评这次提交'}
-                        </button>
-                      </div>
-                      {(assessmentBusy || probeBusy) && !assessment && (
-                        <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>
-                          {probeBusy
-                            ? '评审流程进行中：先完成 LLM 探测与仿真验证，再生成点评…'
-                            : `评审生成中…（正在联系${llmConfigured ? '云端 LLM' : '本地脚本评审'}，马上就好）`}
-                        </div>
-                      )}
-                      {assessmentBusy && assessment && (
-                        <div style={{ color: '#94a3b8', fontSize: 13, marginTop: 6 }}>重新评审中…</div>
-                      )}
-                      {assessmentError && (
-                        <div style={{ color: '#fca5a5', fontSize: 13, marginTop: 6 }}>⚠️ {assessmentError}</div>
-                      )}
-                      {assessment && (
-                        <div style={{ fontSize: 13, lineHeight: 1.7, marginTop: 4 }}>
-                          <div>{assessment.summary}</div>
-                          {assessment.scoreRationale && (
-                            <div style={{ color: '#cbd5e1', marginTop: 4 }}>
-                              <b>分数理由：</b>
-                              {assessment.scoreRationale}
-                            </div>
-                          )}
-                          {assessment.findings.length > 0 && (
-                            <ul style={{ margin: '6px 0 2px', paddingLeft: 18 }}>
-                              {assessment.findings.map((f, i) => (
-                                <li key={i}>
-                                  <b style={{ color: f.severity === 'high' ? '#fca5a5' : f.severity === 'medium' ? '#fde68a' : '#e2e8f0' }}>
-                                    {f.title}
-                                  </b>
-                                  <span style={{ color: '#cbd5e1' }}> — {f.detail}</span>
-                                  {f.actions && f.actions.length > 0 && (
-                                    <button
-                                      style={{ marginLeft: 8 }}
-                                      onClick={() => enterPreview(f.title, f.actions!)}
-                                    >
-                                      ✨ 应用此改进
-                                    </button>
-                                  )}
-                                </li>
-                              ))}
-                            </ul>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                    <h4 style={{ margin: '16px 0 8px' }}>🧱 结构检查（确定性规则，不依赖 LLM）</h4>
-                    <StructuralList
-                      structural={structural}
-                      onSelectNode={(id) => setSelectedId(id)}
-                      onApplyFix={enterPreview}
-                    />
-                  </>
-                ) : (
-                  <div className="lc-bottom-hint">
-                    {phase === 'design'
-                      ? '👉 下一步：在画布上完成设计，然后点右上角绿色的「提交设计」——判卷结果会出现在这里，失败用例可点开回放。'
-                      : '👉 下一步：点右上角绿色的「提交设计」跑全部用例——每个用例的实测值 vs 阈值会出现在这里。'}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
 
           {/* -------------------- deep dive: slide-over, not a section --- */}
           {selectedNode && (
