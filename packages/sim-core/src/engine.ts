@@ -9,6 +9,7 @@ import type {
   TrafficConfig,
 } from './types';
 import { newId } from './types';
+import { isMonotonicShardKey, MONOTONIC_SHARD_CAPACITY_SHARE } from './sharding';
 
 /**
  * SimulationEngine — a deterministic, analytic (not packet-level) model of
@@ -29,8 +30,6 @@ import { newId } from './types';
  *
  * The model is deterministic so test-case verdicts are reproducible.
  */
-
-const BAD_SHARD_KEYS = new Set(['created_at', 'timestamp', 'id', 'auto_id', 'seq']);
 
 interface NodeState {
   queueDepth: number;
@@ -345,13 +344,14 @@ export class SimulationEngine {
           // write to the newest shard while the rest idle; a high-
           // cardinality key (user_id…) spreads writes evenly.
           const shardKey = node.settings.shardKey ?? '';
-          const monotonicSharding = !!node.settings.sharded && BAD_SHARD_KEYS.has(shardKey);
+          const monotonicSharding =
+            !!node.settings.sharded && isMonotonicShardKey(shardKey);
           if (hotKeyTargeted) {
             // Storm concentration, as calibrated: the storm's targeted
             // store collapses to a fraction of its capacity — hardest for
             // a monotonic key (one shard takes the storm), mildest for
             // an evenly-sharded one.
-            if (monotonicSharding) effectiveCapacity *= 0.3;
+            if (monotonicSharding) effectiveCapacity *= MONOTONIC_SHARD_CAPACITY_SHARE;
             else if (node.settings.sharded) effectiveCapacity *= 0.75;
             else effectiveCapacity *= 0.5;
           }
@@ -368,7 +368,8 @@ export class SimulationEngine {
           // multiplier above already prices the concentration in — the
           // write share is not charged twice.)
           const writeShare = 1 - traffic.readRatio;
-          const shardWriteFactor = monotonicSharding && !hotKeyTargeted ? 0.3 : 1;
+          const shardWriteFactor =
+            monotonicSharding && !hotKeyTargeted ? MONOTONIC_SHARD_CAPACITY_SHARE : 1;
           const loadFactor =
             0.8 * traffic.readRatio + (1.8 * writeShare) / shardWriteFactor;
           util = effectiveCapacity > 0 ? (inQps * loadFactor) / effectiveCapacity : 0;
